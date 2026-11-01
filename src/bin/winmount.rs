@@ -32,6 +32,7 @@ fn main() {
 mod imp {
     use cloak::{names, Metadata, Store};
     use std::sync::Mutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use widestring::U16CStr;
     use winfsp::filesystem::{
         DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
@@ -67,6 +68,13 @@ mod imp {
     impl CloakWinFs {
         fn meta(&self, path: &str) -> Option<Metadata> {
             self.store.lock().unwrap().metadata(path).ok().flatten()
+        }
+
+        /// Fill `info` with the current state of `path`.
+        fn info(&self, path: &str, info: &mut FileInfo) -> FspResult<()> {
+            let m = self.meta(path).ok_or_else(not_found)?;
+            fill_file_info(info, &m);
+            Ok(())
         }
 
         /// `path` with each component in its stored case, falling back to the
@@ -165,10 +173,38 @@ mod imp {
         s.encode_utf16().collect()
     }
 
-    fn fill_file_info(info: &mut FileInfo, size: u64, is_dir: bool) {
-        info.file_attributes = if is_dir { ATTR_DIRECTORY } else { ATTR_NORMAL };
+    /// 100 ns ticks between 1601-01-01 (FILETIME's epoch) and 1970-01-01.
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+    fn filetime(t: SystemTime) -> u64 {
+        match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => FILETIME_UNIX_EPOCH + (d.as_nanos() / 100) as u64,
+            Err(e) => FILETIME_UNIX_EPOCH.saturating_sub((e.duration().as_nanos() / 100) as u64),
+        }
+    }
+
+    /// A FILETIME from SetFileInformationByHandle. 0 means "leave unchanged",
+    /// and -1/-2 are the "stop/resume automatic updates" sentinels, which the
+    /// disk underneath handles by itself.
+    fn systime(ft: u64) -> Option<SystemTime> {
+        if ft == 0 || ft >= u64::MAX - 1 {
+            return None;
+        }
+        Some(match ft.checked_sub(FILETIME_UNIX_EPOCH) {
+            Some(after) => UNIX_EPOCH + Duration::from_nanos(after.saturating_mul(100)),
+            None => UNIX_EPOCH - Duration::from_nanos((FILETIME_UNIX_EPOCH - ft) * 100),
+        })
+    }
+
+    fn fill_file_info(info: &mut FileInfo, m: &Metadata) {
+        let size = if m.is_dir { 0 } else { m.size };
+        info.file_attributes = if m.is_dir { ATTR_DIRECTORY } else { ATTR_NORMAL };
         info.file_size = size;
         info.allocation_size = (size + 4095) / 4096 * 4096;
+        info.creation_time = filetime(m.created);
+        info.last_access_time = filetime(m.accessed);
+        info.last_write_time = filetime(m.modified);
+        info.change_time = filetime(m.modified);
     }
 
     impl FileSystemContext for CloakWinFs {
@@ -205,20 +241,14 @@ mod imp {
             file_info: &mut OpenFileInfo,
         ) -> FspResult<Self::FileContext> {
             let path = path_of(file_name);
+            let m = self.meta(&path).ok_or_else(not_found)?;
+            fill_file_info(file_info.as_mut(), &m);
             if path.is_empty() {
-                fill_file_info(file_info.as_mut(), 0, true);
                 return Ok(Handle::Root);
             }
-            let m = self.meta(&path).ok_or_else(not_found)?;
             let path = self.canonical(&path);
             set_normalized_name(file_info, &path, file_name);
-            if m.is_dir {
-                fill_file_info(file_info.as_mut(), 0, true);
-                Ok(Handle::Dir(path))
-            } else {
-                fill_file_info(file_info.as_mut(), m.size, false);
-                Ok(Handle::File(path))
-            }
+            Ok(if m.is_dir { Handle::Dir(path) } else { Handle::File(path) })
         }
 
         fn close(&self, _context: Self::FileContext) {}
@@ -229,20 +259,17 @@ mod imp {
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
             match context {
-                Handle::Root | Handle::Dir(_) => fill_file_info(file_info, 0, true),
-                Handle::File(path) => {
-                    let size = self.meta(path).ok_or_else(not_found)?.size;
-                    fill_file_info(file_info, size, false);
-                }
+                Handle::Root => self.info("", file_info),
+                Handle::Dir(path) | Handle::File(path) => self.info(path, file_info),
             }
-            Ok(())
         }
 
         // The next three are accepted as no-ops rather than left at the crate's
         // default (STATUS_INVALID_DEVICE_REQUEST, "Incorrect function"), which
         // broke ReplaceFile, FlushFileBuffers (Office, SQLite, most editors) and
         // copies that preserve dates/attributes. Writes reach disk immediately,
-        // and the store keeps no timestamps, attributes or ACLs to update.
+        // and the store keeps no attributes or ACLs to update (times go to the
+        // boring file on disk).
 
         fn flush(
             &self,
@@ -259,12 +286,25 @@ mod imp {
             &self,
             context: &Self::FileContext,
             _file_attributes: u32,
-            _creation_time: u64,
-            _last_access_time: u64,
-            _last_write_time: u64,
+            creation_time: u64,
+            last_access_time: u64,
+            last_write_time: u64,
             _last_change_time: u64,
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
+            let path = match context {
+                Handle::Root => "",
+                Handle::Dir(p) | Handle::File(p) => p.as_str(),
+            };
+            let (accessed, modified, created) =
+                (systime(last_access_time), systime(last_write_time), systime(creation_time));
+            if accessed.is_some() || modified.is_some() || created.is_some() {
+                self.store
+                    .lock()
+                    .unwrap()
+                    .set_times(path, accessed, modified, created)
+                    .map_err(fsp)?;
+            }
             self.get_file_info(context, file_info)
         }
 
@@ -303,49 +343,51 @@ mod imp {
                 Handle::Dir(p) => p.clone(),
                 Handle::File(_) => return Err(not_found()),
             };
-            let mut children: Vec<(String, bool, u64)> = self
-                .store
-                .lock()
-                .unwrap()
-                .list_dir(&dir)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(name, is_dir, size)| (names::to_windows(&name), is_dir, size))
-                .collect();
+            let (this, mut children) = {
+                let store = self.store.lock().unwrap();
+                let this = store.metadata(&dir).ok().flatten().ok_or_else(not_found)?;
+                let children: Vec<(String, Metadata)> = store
+                    .list_dir_meta(&dir)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, m)| (names::to_windows(&name), m))
+                    .collect();
+                (this, children)
+            };
             // Case-insensitive order (as NTFS lists), so a resume marker can be
             // located by comparison even if that entry was deleted meanwhile.
-            children.sort_by_cached_key(|(name, _, _)| names::fold(name));
+            children.sort_by_cached_key(|(name, _)| names::fold(name));
 
             let resume_after = marker.inner_as_cstr().map(|c| c.to_string_lossy());
-            let mut entries: Vec<(String, bool, u64)> = Vec::new();
+            let mut entries: Vec<(String, Metadata)> = Vec::new();
             match resume_after.as_deref() {
                 None => {
-                    entries.push((".".to_string(), true, 0));
-                    entries.push(("..".to_string(), true, 0));
+                    entries.push((".".to_string(), this));
+                    entries.push(("..".to_string(), this));
                     entries.extend(children);
                 }
                 Some(".") => {
-                    entries.push(("..".to_string(), true, 0));
+                    entries.push(("..".to_string(), this));
                     entries.extend(children);
                 }
                 Some("..") => entries.extend(children),
                 Some(after) => {
                     let after = names::fold(after);
-                    entries.extend(children.into_iter().filter(|(n, _, _)| names::fold(n) > after));
+                    entries.extend(children.into_iter().filter(|(n, _)| names::fold(n) > after));
                 }
             }
 
             let mut cursor = 0u32;
             let mut dir_info = DirInfo::<255>::new();
 
-            for (name, is_dir, size) in entries {
+            for (name, m) in entries {
                 dir_info.reset();
                 // A legacy name too long for Windows (over 255 UTF-16 units) is
                 // skipped rather than failing the whole listing.
                 if dir_info.set_name_raw(wide(&name).as_slice()).is_err() {
                     continue;
                 }
-                fill_file_info(dir_info.file_info_mut(), size, is_dir);
+                fill_file_info(dir_info.file_info_mut(), &m);
                 if !dir_info.append_to_buffer(buffer, &mut cursor) {
                     return Ok(cursor); // buffer full; WinFsp will resume with a marker
                 }
@@ -376,7 +418,7 @@ mod imp {
             let real = canonical.rsplit('/').next().unwrap_or(&canonical);
             out_dir_info.reset();
             out_dir_info.set_name_raw(wide(&names::to_windows(real)).as_slice())?;
-            fill_file_info(out_dir_info.file_info_mut(), m.size, m.is_dir);
+            fill_file_info(out_dir_info.file_info_mut(), &m);
             Ok(())
         }
 
@@ -403,14 +445,14 @@ mod imp {
                 drop(store);
                 let path = self.canonical(&path);
                 set_normalized_name(file_info, &path, file_name);
-                fill_file_info(file_info.as_mut(), 0, true);
+                self.info(&path, file_info.as_mut())?;
                 Ok(Handle::Dir(path))
             } else {
                 store.create(&path).map_err(fsp)?;
                 drop(store);
                 let path = self.canonical(&path);
                 set_normalized_name(file_info, &path, file_name);
-                fill_file_info(file_info.as_mut(), 0, false);
+                self.info(&path, file_info.as_mut())?;
                 Ok(Handle::File(path))
             }
         }
@@ -434,9 +476,8 @@ mod imp {
                 offset
             };
             store.write_at(path, at, buffer).map_err(fsp)?;
-            let size = store.metadata(path).ok().flatten().map(|m| m.size).unwrap_or(0);
             drop(store);
-            fill_file_info(file_info, size, false);
+            self.info(path, file_info)?;
             Ok(buffer.len() as u32)
         }
 
@@ -451,8 +492,7 @@ mod imp {
                 return Err(not_found());
             };
             self.store.lock().unwrap().truncate(path, new_size).map_err(fsp)?;
-            fill_file_info(file_info, new_size, false);
-            Ok(())
+            self.info(path, file_info)
         }
 
         fn overwrite(
@@ -468,8 +508,7 @@ mod imp {
                 return Err(not_found());
             };
             self.store.lock().unwrap().truncate(path, 0).map_err(fsp)?;
-            fill_file_info(file_info, 0, false);
-            Ok(())
+            self.info(path, file_info)
         }
 
         fn rename(
