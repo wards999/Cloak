@@ -39,7 +39,7 @@ mod imp {
     };
     use std::ffi::OsStr;
     use std::io;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime};
 
     const TTL: Duration = Duration::from_secs(1);
     const BLOCK: u64 = 4096;
@@ -103,11 +103,10 @@ mod imp {
                 ino,
                 size: m.size,
                 blocks: m.size.div_ceil(512),
-                // The store keeps no timestamps (Windows shows them as 1601).
-                atime: UNIX_EPOCH,
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
+                atime: m.accessed,
+                mtime: m.modified,
+                ctime: m.modified,
+                crtime: m.created,
                 kind: if m.is_dir { FileType::Directory } else { FileType::RegularFile },
                 perm: if m.is_dir { 0o755 } else { 0o644 },
                 nlink: if m.is_dir { 2 } else { 1 },
@@ -187,11 +186,11 @@ mod imp {
             _uid: Option<u32>,
             _gid: Option<u32>,
             size: Option<u64>,
-            _atime: Option<TimeOrNow>,
-            _mtime: Option<TimeOrNow>,
+            atime: Option<TimeOrNow>,
+            mtime: Option<TimeOrNow>,
             _ctime: Option<SystemTime>,
             _fh: Option<u64>,
-            _crtime: Option<SystemTime>,
+            crtime: Option<SystemTime>,
             _chgtime: Option<SystemTime>,
             _bkuptime: Option<SystemTime>,
             _flags: Option<u32>,
@@ -201,13 +200,22 @@ mod imp {
                 Ok(n) => n,
                 Err(e) => return reply.error(e),
             };
-            // Size is the one attribute stored; mode/owner/times are accepted
-            // and ignored so `cp -p`, `touch` and Finder copies succeed.
+            // Size and times are applied; mode/owner are accepted and ignored
+            // so `cp -p`, `touch` and Finder copies succeed.
             if let Some(new_size) = size {
                 if m.is_dir {
                     return reply.error(libc::EISDIR);
                 }
                 if let Err(e) = self.store.truncate(&path, new_size) {
+                    return reply.error(errno(&e));
+                }
+            }
+            let when = |t: TimeOrNow| match t {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => SystemTime::now(),
+            };
+            if atime.is_some() || mtime.is_some() || crtime.is_some() {
+                if let Err(e) = self.store.set_times(&path, atime.map(when), mtime.map(when), crtime) {
                     return reply.error(errno(&e));
                 }
             }

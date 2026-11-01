@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Known token encrypted under the derived key at create time; decrypting it on
 /// open is how we tell a correct password from a wrong one. This is a
@@ -44,11 +45,54 @@ struct StoreMeta {
     verifier: Vec<u8>,
 }
 
-/// What a path points at.
+/// What a path points at. The times are those of its boring file or directory
+/// on disk: the store records none of its own, and the disk already shows them
+/// to anyone looking at the backing folder, so passing them through reveals
+/// nothing new.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Metadata {
     pub is_dir: bool,
     pub size: u64,
+    pub accessed: SystemTime,
+    pub modified: SystemTime,
+    pub created: SystemTime,
+}
+
+impl Metadata {
+    fn new(is_dir: bool, size: u64, disk: &Path) -> Self {
+        let (accessed, modified, created) = match std::fs::metadata(disk) {
+            Ok(d) => {
+                let modified = d.modified().unwrap_or(UNIX_EPOCH);
+                (
+                    d.accessed().unwrap_or(modified),
+                    modified,
+                    // Not every filesystem records a birth time (some Linux ones).
+                    d.created().unwrap_or(modified),
+                )
+            }
+            Err(_) => (UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH),
+        };
+        Self { is_dir, size, accessed, modified, created }
+    }
+}
+
+/// Open a boring file or directory just to change its times.
+fn open_for_times(disk: &Path) -> io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        // Needed to open a directory at all.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(disk)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(disk)
+    }
 }
 
 pub struct Store {
@@ -176,10 +220,7 @@ impl Store {
     pub fn metadata(&self, path: &str) -> io::Result<Option<Metadata>> {
         let comps = components(path);
         if comps.is_empty() {
-            return Ok(Some(Metadata {
-                is_dir: true,
-                size: 0,
-            }));
+            return Ok(Some(Metadata::new(true, 0, &self.backing_dir)));
         }
         let (parent, name) = (comps[..comps.len() - 1].to_vec(), comps[comps.len() - 1].clone());
         let parent_disk = match self.resolve_dir(&parent) {
@@ -187,10 +228,65 @@ impl Store {
             Err(_) => return Ok(None),
         };
         let manifest = Manifest::load(&parent_disk, &self.key)?;
-        Ok(manifest.find(&name).map(|c| Metadata {
-            is_dir: c.is_dir(),
-            size: c.size,
-        }))
+        Ok(manifest
+            .find(&name)
+            .map(|c| Metadata::new(c.is_dir(), c.size, &parent_disk.join(&c.boring))))
+    }
+
+    /// The boring file or directory behind a path (the backing root for `""`).
+    fn disk_path(&self, path: &str) -> io::Result<PathBuf> {
+        let comps = components(path);
+        let Some((name, parent)) = comps.split_last() else {
+            return Ok(self.backing_dir.clone());
+        };
+        let parent_disk = self.resolve_dir(parent)?;
+        let manifest = Manifest::load(&parent_disk, &self.key)?;
+        let child = manifest.find(name).ok_or_else(not_found)?;
+        Ok(parent_disk.join(&child.boring))
+    }
+
+    /// Set a path's times; `None` leaves that time as it is. The creation time
+    /// can be set on Windows and macOS only and is ignored elsewhere.
+    pub fn set_times(
+        &self,
+        path: &str,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+        created: Option<SystemTime>,
+    ) -> io::Result<()> {
+        let mut times = std::fs::FileTimes::new();
+        if let Some(t) = accessed {
+            times = times.set_accessed(t);
+        }
+        if let Some(t) = modified {
+            times = times.set_modified(t);
+        }
+        if let Some(t) = created {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileTimesExt;
+                times = times.set_created(t);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::macos::fs::FileTimesExt;
+                times = times.set_created(t);
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let _ = t;
+        }
+        open_for_times(&self.disk_path(path)?)?.set_times(times)
+    }
+
+    /// List a directory with each child's metadata.
+    pub fn list_dir_meta(&self, path: &str) -> io::Result<Vec<(String, Metadata)>> {
+        let disk = self.resolve_dir(&components(path))?;
+        let manifest = Manifest::load(&disk, &self.key)?;
+        Ok(manifest
+            .children
+            .iter()
+            .map(|c| (c.real.clone(), Metadata::new(c.is_dir(), c.size, &disk.join(&c.boring))))
+            .collect())
     }
 
     /// The path with each component in its stored case (lookups are
@@ -804,5 +900,38 @@ mod tests {
         let mut names: Vec<String> = s.list();
         names.sort();
         assert_eq!(names, vec!["empty", "file.txt", "full"]);
+    }
+
+    #[test]
+    fn times_come_from_disk_and_can_be_set() {
+        use std::time::Duration;
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("dir").unwrap();
+        s.create("dir/a.txt").unwrap();
+        s.write_at("dir/a.txt", 0, b"hello").unwrap();
+
+        // A fresh file carries a real, recent time rather than the epoch.
+        let m = s.metadata("dir/a.txt").unwrap().unwrap();
+        let age = SystemTime::now().duration_since(m.modified).unwrap_or_default();
+        assert!(age < Duration::from_secs(60), "modified time should be now");
+        assert!(s.metadata("").unwrap().unwrap().modified > UNIX_EPOCH);
+
+        // Dates set through the store stick, on files and on directories, and
+        // show in listings too.
+        let then = UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        let earlier = UNIX_EPOCH + Duration::from_secs(1_400_000_000);
+        s.set_times("DIR/A.TXT", Some(then), Some(then), Some(earlier)).unwrap();
+        s.set_times("dir", None, Some(earlier), None).unwrap();
+        let m = s.metadata("dir/a.txt").unwrap().unwrap();
+        assert_eq!(m.modified, then);
+        assert_eq!(m.accessed, then);
+        #[cfg(any(windows, target_os = "macos"))]
+        assert_eq!(m.created, earlier);
+        assert_eq!(s.metadata("dir").unwrap().unwrap().modified, earlier);
+        assert_eq!(s.list_dir_meta("dir").unwrap()[0].1, m);
+
+        // A missing path is an error, not a silent no-op.
+        assert!(s.set_times("dir/nope", None, Some(then), None).is_err());
     }
 }
