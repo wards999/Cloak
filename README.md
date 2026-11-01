@@ -52,6 +52,8 @@ src/boring.rs   boring decoy-name generator
 src/manifest.rs per-directory encrypted boring<->real mapping (the tree)
 src/key.rs      Argon2id passphrase -> master key (key never stored)
 src/engine.rs   Store: path/tree ops (mkdir / create / write_at / rename / move / remove)
+src/names.rs    cross-platform name rules (NFC, case folding, limits, Windows mapping)
+src/inodes.rs   inode <-> path table for the fuser adapter
 src/bin/mount.rs     read-write fuser mount adapter (macOS/Linux)
 src/bin/winmount.rs  read-write WinFsp mount adapter (Windows, MSVC)
 src/bin/gui.rs       cross-platform eframe GUI (mount/unmount + passphrase)
@@ -60,6 +62,28 @@ benches/crypto_bench.rs  full-file vs ends-only timing
 
 The engine and all leaf modules are platform-independent and fully unit-tested
 with **no FUSE driver required**.
+
+## One drive, Windows and macOS
+
+A store folder (synced or copied) mounts the same on both systems. The on-disk
+format is OS-neutral (lowercase-ASCII boring names, JSON manifests), and real
+names follow one set of rules (`src/names.rs`):
+
+- **Unicode form:** names are stored and compared in NFC, so a name a Mac app
+  hands over decomposed (`e` + accent) is the same file as Windows' `é`.
+- **Case:** case-insensitive and case-preserving on both, with Unicode folding
+  (`Ä.txt` = `ä.txt`, like NTFS/APFS).
+- **Limits:** a name must fit both OSes — at most 255 UTF-8 bytes (macOS),
+  no `/` or NUL. Longer names are refused at creation.
+- **Mac-only characters:** `" * : < > ? \ |`, control characters, a trailing
+  space/dot and device names (`CON`, `aux.txt`) are legal on macOS but not on
+  Windows. The Windows adapter shows them through the Services-for-Macintosh
+  mapping macOS's own SMB client uses (private-use look-alikes such as U+F022
+  for `:`); nothing is renamed on disk and the mapping round-trips.
+- **Mac litter:** the macOS adapter mounts with `noappledouble`/`noapplexattr`
+  and refuses `._*`/`.DS_Store`, so Finder metadata never lands in the store.
+- **Saving:** both adapters support rename-over-existing (how most editors
+  save) and case-only renames.
 
 ## Build & run
 
@@ -73,7 +97,8 @@ cargo bench
 # the GUI (cross-platform): pick a store folder, mount point, passphrase
 cargo run --features gui --bin cloak-gui
 
-# mount via CLI (macOS: install macFUSE/FUSE-T first; Linux: libfuse3)
+# mount via CLI (macOS: install macFUSE first; Linux: libfuse3)
+# Holds the mount until Enter / stdin closes, then unmounts.
 CLOAK_PASSPHRASE=... cargo run --features mount --bin cloak-mount -- ./store ./mnt
 ```
 
