@@ -1,0 +1,101 @@
+name: Release
+
+# Push a tag like `v0.1.0` to build the Windows and macOS binaries and publish
+# a GitHub release with them attached. Release notes come from
+# .github/release-notes/<tag>.md when present.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows binaries
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable # x86_64-pc-windows-msvc
+      - name: Install WinFsp (runtime + SDK headers)
+        run: choco install winfsp -y --no-progress
+      - name: Point bindgen at libclang
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --features "winfsp gui" --bin cloak --bin cloak-winmount --bin cloak-gui
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "cloak-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/cloak.exe, target/release/cloak-winmount.exe, target/release/cloak-gui.exe, README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: cloak-${{ github.ref_name }}-windows-x64.zip
+
+  macos:
+    name: macOS binaries (universal)
+    runs-on: macos-latest
+    env:
+      # macFUSE installs libfuse + fuse.pc under /usr/local on both Intel and
+      # Apple Silicon; it's a universal library, so one install serves both
+      # targets (hence allowing pkg-config to answer for the cross target).
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+      PKG_CONFIG_ALLOW_CROSS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install macFUSE (headers + libfuse for linking)
+        run: |
+          brew install --cask macfuse
+          brew list pkgconf >/dev/null 2>&1 || brew install pkgconf
+      - name: Build
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$t" --bin cloak
+            cargo build --release --target "$t" --features gui --bin cloak-gui
+            cargo build --release --target "$t" --features mount --bin cloak-mount
+          done
+      - name: Package (universal binaries)
+        run: |
+          dir="cloak-${{ github.ref_name }}-macos-universal"
+          mkdir "$dir"
+          for b in cloak cloak-gui cloak-mount; do
+            lipo -create -output "$dir/$b" \
+              "target/aarch64-apple-darwin/release/$b" \
+              "target/x86_64-apple-darwin/release/$b"
+            lipo -info "$dir/$b"
+          done
+          cp README.md "$dir/"
+          ditto -c -k --keepParent "$dir" "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: cloak-${{ github.ref_name }}-macos-universal.zip
+
+  publish:
+    name: Publish release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes=".github/release-notes/$TAG.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          gh release create "$TAG" dist/*.zip --title "cloak $TAG" --verify-tag "$@"
