@@ -18,6 +18,7 @@ use crate::boring::generate_unique;
 use crate::crypto::{protected_ranges, transform_region, Key, Nonce, NONCE_LEN};
 use crate::key::{self, SALT_LEN};
 use crate::manifest::{Child, Kind, Manifest};
+use crate::names;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
@@ -56,11 +57,13 @@ pub struct Store {
     region: u64,
 }
 
-/// Split a logical path into non-empty components (accepts `/` or `\`).
+/// Split a logical path into non-empty components, each in NFC. Only `/`
+/// separates: `\` is an ordinary character in a macOS name (the Windows adapter
+/// converts its own `\` separators before calling in).
 fn components(path: &str) -> Vec<String> {
-    path.split(['/', '\\'])
+    path.split('/')
         .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+        .map(names::normalize)
         .collect()
 }
 
@@ -190,6 +193,29 @@ impl Store {
         }))
     }
 
+    /// The path with each component in its stored case (lookups are
+    /// case-insensitive, so `photos/A.JPG` may name `Photos/a.jpg`). `None` if
+    /// any component is missing. The root is `""`.
+    pub fn canonical_path(&self, path: &str) -> io::Result<Option<String>> {
+        let comps = components(path);
+        let mut cur = self.backing_dir.clone();
+        let mut out = Vec::with_capacity(comps.len());
+        for (i, name) in comps.iter().enumerate() {
+            let manifest = Manifest::load(&cur, &self.key)?;
+            let Some(child) = manifest.find(name) else {
+                return Ok(None);
+            };
+            out.push(child.real.clone());
+            if i + 1 < comps.len() {
+                if !child.is_dir() {
+                    return Ok(None);
+                }
+                cur = cur.join(&child.boring);
+            }
+        }
+        Ok(Some(out.join("/")))
+    }
+
     /// List a directory: (name, is_dir, size) for each immediate child.
     pub fn list_dir(&self, path: &str) -> io::Result<Vec<(String, bool, u64)>> {
         let disk = self.resolve_dir(&components(path))?;
@@ -213,6 +239,7 @@ impl Store {
     /// Create a new directory at `path`. Its parent must already exist.
     pub fn mkdir(&mut self, path: &str) -> io::Result<()> {
         let (parent, name) = parent_and_name(path)?;
+        names::validate(&name)?;
         let parent_disk = self.resolve_dir(&parent)?;
         let mut manifest = Manifest::load(&parent_disk, &self.key)?;
         if manifest.find(&name).is_some() {
@@ -237,9 +264,13 @@ impl Store {
     /// name; if the name already exists, returns the existing boring name.
     pub fn create(&mut self, path: &str) -> io::Result<String> {
         let (parent, name) = parent_and_name(path)?;
+        names::validate(&name)?;
         let parent_disk = self.resolve_dir(&parent)?;
         let mut manifest = Manifest::load(&parent_disk, &self.key)?;
         if let Some(existing) = manifest.find(&name) {
+            if existing.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+            }
             return Ok(existing.boring.clone());
         }
         let mut nonce = [0u8; NONCE_LEN];
@@ -357,34 +388,78 @@ impl Store {
     /// Rename or move a path. Same parent => rename in place (no disk move, the
     /// boring name is untouched). Different parent => a single cheap on-disk
     /// `rename` of the boring entry (moving a whole subtree in one metadata op).
+    /// Errors with `AlreadyExists` if `new` names a different existing entry; a
+    /// rename to the same entry in another case or Unicode form (`a.txt` ->
+    /// `A.txt`) just updates the stored name.
     pub fn rename_path(&mut self, old: &str, new: &str) -> io::Result<()> {
+        self.rename_inner(old, new, false)
+    }
+
+    /// Like [`rename_path`](Self::rename_path), but an existing file or empty
+    /// directory at `new` is replaced (POSIX `rename`, Windows
+    /// `MoveFileEx(REPLACE_EXISTING)`). This is how most editors save: write a
+    /// temp file, then rename it over the original. A non-empty directory at
+    /// `new` is never replaced (`DirectoryNotEmpty`), and a file never replaces
+    /// a directory or vice versa.
+    pub fn rename_replace(&mut self, old: &str, new: &str) -> io::Result<()> {
+        self.rename_inner(old, new, true)
+    }
+
+    fn rename_inner(&mut self, old: &str, new: &str, replace: bool) -> io::Result<()> {
         let (old_parent, old_name) = parent_and_name(old)?;
         let (new_parent, new_name) = parent_and_name(new)?;
+        names::validate(&new_name)?;
 
         let old_parent_disk = self.resolve_dir(&old_parent)?;
         let mut old_manifest = Manifest::load(&old_parent_disk, &self.key)?;
         let pos = old_manifest.position(&old_name).ok_or_else(not_found)?;
+        let moving_dir = old_manifest.children[pos].is_dir();
+        let new_parent_disk = self.resolve_dir(&new_parent)?;
+        let same_parent = old_parent_disk == new_parent_disk;
 
-        if old_parent == new_parent {
-            if old_name != new_name && old_manifest.find(&new_name).is_some() {
+        // An existing *different* entry at the destination: replace or refuse.
+        let target = if same_parent {
+            old_manifest.position(&new_name).filter(|&p| p != pos)
+        } else {
+            Manifest::load(&new_parent_disk, &self.key)?.position(&new_name)
+        };
+        if target.is_some() {
+            if !replace {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "destination exists",
                 ));
             }
+            let dest = self
+                .metadata(new)?
+                .ok_or_else(not_found)?;
+            if dest.is_dir != moving_dir {
+                let kind = if dest.is_dir {
+                    io::ErrorKind::IsADirectory
+                } else {
+                    io::ErrorKind::NotADirectory
+                };
+                return Err(io::Error::new(kind, "destination is a different kind"));
+            }
+            if dest.is_dir && !self.list_dir(new)?.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::DirectoryNotEmpty,
+                    "destination directory not empty",
+                ));
+            }
+            self.remove(new)?;
+            // `remove` rewrote the manifest; reload so our copy isn't stale.
+            old_manifest = Manifest::load(&old_parent_disk, &self.key)?;
+        }
+        let pos = old_manifest.position(&old_name).ok_or_else(not_found)?;
+
+        if same_parent {
             old_manifest.children[pos].real = new_name;
             return old_manifest.save(&old_parent_disk, &self.key);
         }
 
         // Move across directories.
-        let new_parent_disk = self.resolve_dir(&new_parent)?;
         let mut new_manifest = Manifest::load(&new_parent_disk, &self.key)?;
-        if new_manifest.find(&new_name).is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination exists",
-            ));
-        }
         let mut moved = old_manifest.children.remove(pos);
         let new_boring = generate_unique(&mut rand::thread_rng(), &new_manifest.used_boring_names());
         std::fs::rename(
@@ -623,5 +698,111 @@ mod tests {
             Store::open_with_passphrase(empty.path(), "x").err().map(|e| e.kind()),
             Some(io::ErrorKind::NotFound)
         );
+    }
+
+    // ---- cross-platform names ---------------------------------------------
+
+    #[test]
+    fn macos_nfd_and_windows_nfc_are_one_file() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        // Created from macOS (decomposed é)...
+        s.mkdir("Caf\u{65}\u{301}").unwrap();
+        s.create("Caf\u{65}\u{301}/r\u{e9}sum\u{65}\u{301}.txt").unwrap();
+        s.write_at("Cafe\u{301}/re\u{301}sume\u{301}.txt", 0, b"x").unwrap();
+        // ...is stored composed, and found by the composed (Windows) spelling.
+        assert_eq!(s.list(), vec!["Caf\u{e9}".to_string()]);
+        assert_eq!(s.read_all("Caf\u{e9}/r\u{e9}sum\u{e9}.txt").unwrap(), b"x");
+        // And it can't be created a second time in the other form.
+        assert!(s.mkdir("Caf\u{e9}").is_err());
+        assert_eq!(s.list_dir("Café").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unicode_case_insensitive_lookup() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("Ärger.txt").unwrap();
+        assert!(s.metadata("ärger.TXT").unwrap().is_some());
+        assert_eq!(s.canonical_path("ÄRGER.txt").unwrap().unwrap(), "Ärger.txt");
+    }
+
+    #[test]
+    fn backslash_is_part_of_a_name() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create(r"a\b.txt").unwrap();
+        assert_eq!(s.list(), vec![r"a\b.txt".to_string()]);
+        assert!(s.metadata("a").unwrap().is_none());
+    }
+
+    #[test]
+    fn non_portable_names_are_refused() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        assert!(s.create(&"x".repeat(256)).is_err());
+        assert!(s.mkdir(&"漢".repeat(100)).is_err()); // 300 bytes: too long for macOS
+        assert!(s.create("ok.txt").is_ok());
+        assert!(s.rename_path("ok.txt", &"y".repeat(300)).is_err());
+        assert!(s.create("..").is_err());
+    }
+
+    #[test]
+    fn case_only_rename() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("dir").unwrap();
+        s.create("dir/report.txt").unwrap();
+        s.rename_path("dir/report.txt", "dir/Report.TXT").unwrap();
+        s.rename_path("dir", "DIR").unwrap();
+        assert_eq!(s.list(), vec!["DIR".to_string()]);
+        assert_eq!(s.list_dir("dir").unwrap()[0].0, "Report.TXT");
+    }
+
+    #[test]
+    fn save_by_rename_over_existing_file() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("doc.txt").unwrap();
+        s.write_at("doc.txt", 0, b"old").unwrap();
+        s.create("doc.txt.tmp").unwrap();
+        s.write_at("doc.txt.tmp", 0, b"new contents").unwrap();
+
+        assert_eq!(
+            s.rename_path("doc.txt.tmp", "doc.txt").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        s.rename_replace("doc.txt.tmp", "doc.txt").unwrap();
+        assert_eq!(s.list(), vec!["doc.txt".to_string()]);
+        assert_eq!(s.read_all("doc.txt").unwrap(), b"new contents");
+
+        // Across directories too.
+        s.mkdir("sub").unwrap();
+        s.create("sub/doc.txt").unwrap();
+        s.rename_replace("doc.txt", "sub/doc.txt").unwrap();
+        assert!(s.list().iter().all(|n| n != "doc.txt"));
+        assert_eq!(s.read_all("sub/doc.txt").unwrap(), b"new contents");
+    }
+
+    #[test]
+    fn rename_replace_guards_directories() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("full").unwrap();
+        s.create("full/keep.txt").unwrap();
+        s.mkdir("empty").unwrap();
+        s.mkdir("src").unwrap();
+        s.create("file.txt").unwrap();
+
+        let kind = |r: io::Result<()>| r.unwrap_err().kind();
+        assert_eq!(kind(s.rename_replace("src", "full")), io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(kind(s.rename_replace("file.txt", "empty")), io::ErrorKind::IsADirectory);
+        assert_eq!(kind(s.rename_replace("src", "file.txt")), io::ErrorKind::NotADirectory);
+        assert!(s.metadata("full/keep.txt").unwrap().is_some());
+
+        s.rename_replace("src", "empty").unwrap();
+        let mut names: Vec<String> = s.list();
+        names.sort();
+        assert_eq!(names, vec!["empty", "file.txt", "full"]);
     }
 }

@@ -30,15 +30,14 @@ fn main() {
 
 #[cfg(all(feature = "winfsp", windows))]
 mod imp {
-    use cloak::{Metadata, Store};
+    use cloak::{names, Metadata, Store};
     use std::sync::Mutex;
     use widestring::U16CStr;
     use winfsp::filesystem::{
-        DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
-        WideNameInfo,
+        DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
+        OpenFileInfo, VolumeInfo, WideNameInfo,
     };
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
-    use winfsp::notify::{NotifyInfo, Notifier, NotifyingFileSystemContext};
     use winfsp::{winfsp_init_or_die, FspError, Result as FspResult};
     use winfsp_sys::{FspCleanupDelete, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
@@ -46,34 +45,11 @@ mod imp {
     const ATTR_NORMAL: u32 = 0x80; // FILE_ATTRIBUTE_NORMAL
     const FILE_DIRECTORY_FILE: u32 = 0x0000_0001; // create_options bit = "make a directory"
 
-    // Change-notification filters/actions (winnt.h). We publish these to WinFsp so
-    // that file managers watching a directory (Explorer, Directory Opus) refresh
-    // the instant something is created/renamed/deleted, instead of only on a manual
-    // refresh or Explorer's slow fallback poll.
-    const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
-    const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
-    const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
-    const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
-
-    const FILE_ACTION_ADDED: u32 = 0x0000_0001;
-    const FILE_ACTION_REMOVED: u32 = 0x0000_0002;
-    const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
-    const FILE_ACTION_RENAMED_OLD_NAME: u32 = 0x0000_0004;
-    const FILE_ACTION_RENAMED_NEW_NAME: u32 = 0x0000_0005;
-
-    // How often (ms) the notify timer drains queued change events. WinFsp forbids
-    // sending notifications from inside an operation callback, so operations queue
-    // events and this timer flushes them from outside any operation. 100ms reads as
-    // instant while keeping timer wakeups cheap.
-    const NOTIFY_INTERVAL_MS: u32 = 100;
-
-    /// One queued filesystem-change notification: the mount-relative path in WinFsp
-    /// form (`\name`, `\dir\sub`), plus the change filter and action.
-    struct NotifyEvent {
-        path: String,
-        filter: u32,
-        action: u32,
-    }
+    // Change notifications (what Explorer / Directory Opus watch to refresh live)
+    // come from WinFsp's driver itself for every create/rename/delete made through
+    // the mount, so the adapter sends none of its own; doing so duplicated every
+    // event. The driver needs two things from us for them to be usable: true-case
+    // names (`set_normalized_name`) and NUL-free entry names (`wide`).
 
     /// An open handle, carrying the logical path it refers to.
     enum Handle {
@@ -86,8 +62,6 @@ mod imp {
         // WinFsp calls back on many threads with only &self, so the mutable Store
         // lives behind a Mutex (engine ops are quick; simple and safe).
         store: Mutex<Store>,
-        // Change events produced by operations, drained by the notify timer.
-        pending: Mutex<Vec<NotifyEvent>>,
     }
 
     impl CloakWinFs {
@@ -95,54 +69,100 @@ mod imp {
             self.store.lock().unwrap().metadata(path).ok().flatten()
         }
 
-        /// Queue a change event for the notify timer. `path` is a logical store
-        /// path (`name`, `dir/sub`); it is converted to WinFsp's mount-relative
-        /// form (`\name`, `\dir\sub`).
-        fn enqueue(&self, path: &str, filter: u32, action: u32) {
-            let winfsp_path = format!("\\{}", path.replace('/', "\\"));
-            self.pending.lock().unwrap().push(NotifyEvent {
-                path: winfsp_path,
-                filter,
-                action,
-            });
+        /// `path` with each component in its stored case, falling back to the
+        /// path as given.
+        fn canonical(&self, path: &str) -> String {
+            self.store
+                .lock()
+                .unwrap()
+                .canonical_path(path)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| path.to_string())
         }
     }
 
-    // WinFsp calls `should_notify`/`notify` from a timer thread, outside any file
-    // operation, which is the only safe place to publish notifications.
-    impl NotifyingFileSystemContext<Vec<NotifyEvent>> for CloakWinFs {
-        fn should_notify(&self) -> Option<Vec<NotifyEvent>> {
-            let mut q = self.pending.lock().unwrap();
-            if q.is_empty() {
-                None
-            } else {
-                Some(std::mem::take(&mut *q))
-            }
-        }
-
-        fn notify(&self, events: Vec<NotifyEvent>, notifier: &Notifier) {
-            for ev in events {
-                let mut info = NotifyInfo::<255>::new();
-                info.filter = ev.filter;
-                info.action = ev.action;
-                if info.set_name(&ev.path).is_ok() {
-                    notifier.notify(&info);
-                }
-            }
-        }
-    }
+    // Win32 error codes (winerror.h) for `fsp`.
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    const ERROR_DISK_FULL: u32 = 112;
+    const ERROR_INVALID_NAME: u32 = 123;
+    const ERROR_DIR_NOT_EMPTY: u32 = 145;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const ERROR_DIRECTORY: u32 = 267;
+    const ERROR_IO_DEVICE: u32 = 1117;
 
     fn not_found() -> FspError {
-        FspError::IO(std::io::ErrorKind::NotFound)
+        FspError::WIN32(ERROR_FILE_NOT_FOUND)
+    }
+
+    /// Map an engine error to a Win32 code. Done explicitly because the winfsp
+    /// crate's own `From<io::Error>` panics on any ErrorKind it doesn't list
+    /// (DirectoryNotEmpty, StorageFull, InvalidData from a corrupt manifest…).
+    fn fsp(e: std::io::Error) -> FspError {
+        use std::io::ErrorKind::*;
+        if let Some(code) = e.raw_os_error() {
+            return FspError::WIN32(code as u32);
+        }
+        FspError::WIN32(match e.kind() {
+            NotFound => ERROR_FILE_NOT_FOUND,
+            // Windows reports moving a file onto a directory as access denied.
+            PermissionDenied | IsADirectory => ERROR_ACCESS_DENIED,
+            AlreadyExists => ERROR_ALREADY_EXISTS,
+            InvalidInput => ERROR_INVALID_PARAMETER,
+            InvalidFilename => ERROR_INVALID_NAME,
+            NotADirectory => ERROR_DIRECTORY,
+            DirectoryNotEmpty => ERROR_DIR_NOT_EMPTY,
+            StorageFull => ERROR_DISK_FULL,
+            _ => ERROR_IO_DEVICE,
+        })
     }
 
     /// Convert a WinFsp path (`\`, `\name`, `\a\b`) to a logical store path
-    /// (`""`, `name`, `a/b`).
+    /// (`""`, `name`, `a/b`), undoing the display mapping of each component.
     fn path_of(file_name: &U16CStr) -> String {
         file_name
             .to_string_lossy()
-            .trim_start_matches('\\')
-            .replace('\\', "/")
+            .split('\\')
+            .filter(|c| !c.is_empty())
+            .map(names::from_windows)
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// A logical store path as Windows sees it (`a/b` -> `a\b`), with each
+    /// component mapped by `names::to_windows`.
+    fn windows_path(path: &str) -> String {
+        path.split('/').map(names::to_windows).collect::<Vec<_>>().join("\\")
+    }
+
+    /// Report the true-case name of an opened/created file. On a case-insensitive
+    /// volume WinFsp otherwise keys its file node by an UPPERCASED copy of the
+    /// name and uses that in change notifications (`NEW FOLDER` for `New folder`),
+    /// which Directory Opus can't match against its listing, so new items never
+    /// appear there. `path` is a logical store path in its stored case;
+    /// `requested` is the name the caller opened.
+    ///
+    /// WinFsp rejects a normalized name that differs from the requested one by
+    /// more than case (STATUS_OBJECT_NAME_INVALID), so when they differ in length
+    /// (an NFD name from a Mac-style app vs the stored NFC) we report nothing and
+    /// WinFsp keeps the requested spelling.
+    fn set_normalized_name(file_info: &mut OpenFileInfo, path: &str, requested: &U16CStr) {
+        let mut name = wide(&windows_path(path));
+        name.insert(0, b'\\' as u16);
+        if name.len() == requested.len() {
+            file_info.set_normalized_name(&name, None);
+        }
+    }
+
+    /// A name as UTF-16 *without* a trailing NUL, for `set_name_raw`. The crate's
+    /// `set_name` appends a NUL and counts it in the entry's name length, so every
+    /// listed name and notification became `name\0`: `*` listings still matched,
+    /// but exact-name lookups (FindFirstFile on one path, which Directory Opus
+    /// does for each notified item) all failed with "file not found".
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
     }
 
     fn fill_file_info(info: &mut FileInfo, size: u64, is_dir: bool) {
@@ -189,16 +209,15 @@ mod imp {
                 fill_file_info(file_info.as_mut(), 0, true);
                 return Ok(Handle::Root);
             }
-            match self.meta(&path) {
-                Some(m) if m.is_dir => {
-                    fill_file_info(file_info.as_mut(), 0, true);
-                    Ok(Handle::Dir(path))
-                }
-                Some(m) => {
-                    fill_file_info(file_info.as_mut(), m.size, false);
-                    Ok(Handle::File(path))
-                }
-                None => Err(not_found()),
+            let m = self.meta(&path).ok_or_else(not_found)?;
+            let path = self.canonical(&path);
+            set_normalized_name(file_info, &path, file_name);
+            if m.is_dir {
+                fill_file_info(file_info.as_mut(), 0, true);
+                Ok(Handle::Dir(path))
+            } else {
+                fill_file_info(file_info.as_mut(), m.size, false);
+                Ok(Handle::File(path))
             }
         }
 
@@ -219,6 +238,45 @@ mod imp {
             Ok(())
         }
 
+        // The next three are accepted as no-ops rather than left at the crate's
+        // default (STATUS_INVALID_DEVICE_REQUEST, "Incorrect function"), which
+        // broke ReplaceFile, FlushFileBuffers (Office, SQLite, most editors) and
+        // copies that preserve dates/attributes. Writes reach disk immediately,
+        // and the store keeps no timestamps, attributes or ACLs to update.
+
+        fn flush(
+            &self,
+            context: Option<&Self::FileContext>,
+            file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            match context {
+                Some(c) => self.get_file_info(c, file_info),
+                None => Ok(()),
+            }
+        }
+
+        fn set_basic_info(
+            &self,
+            context: &Self::FileContext,
+            _file_attributes: u32,
+            _creation_time: u64,
+            _last_access_time: u64,
+            _last_write_time: u64,
+            _last_change_time: u64,
+            file_info: &mut FileInfo,
+        ) -> FspResult<()> {
+            self.get_file_info(context, file_info)
+        }
+
+        fn set_security(
+            &self,
+            _context: &Self::FileContext,
+            _security_information: u32,
+            _modification_descriptor: ModificationDescriptor,
+        ) -> FspResult<()> {
+            Ok(())
+        }
+
         fn read(
             &self,
             context: &Self::FileContext,
@@ -228,7 +286,7 @@ mod imp {
             let Handle::File(path) = context else {
                 return Err(not_found());
             };
-            let data = self.store.lock().unwrap().read_at(path, offset, buffer.len())?;
+            let data = self.store.lock().unwrap().read_at(path, offset, buffer.len()).map_err(fsp)?;
             buffer[..data.len()].copy_from_slice(&data);
             Ok(data.len() as u32)
         }
@@ -245,27 +303,48 @@ mod imp {
                 Handle::Dir(p) => p.clone(),
                 Handle::File(_) => return Err(not_found()),
             };
-            let children = self.store.lock().unwrap().list_dir(&dir).unwrap_or_default();
-            let mut entries: Vec<(String, bool, u64)> = vec![
-                (".".to_string(), true, 0),
-                ("..".to_string(), true, 0),
-            ];
-            entries.extend(children);
+            let mut children: Vec<(String, bool, u64)> = self
+                .store
+                .lock()
+                .unwrap()
+                .list_dir(&dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, is_dir, size)| (names::to_windows(&name), is_dir, size))
+                .collect();
+            // Case-insensitive order (as NTFS lists), so a resume marker can be
+            // located by comparison even if that entry was deleted meanwhile.
+            children.sort_by_cached_key(|(name, _, _)| names::fold(name));
 
             let resume_after = marker.inner_as_cstr().map(|c| c.to_string_lossy());
-            let mut began = resume_after.is_none();
+            let mut entries: Vec<(String, bool, u64)> = Vec::new();
+            match resume_after.as_deref() {
+                None => {
+                    entries.push((".".to_string(), true, 0));
+                    entries.push(("..".to_string(), true, 0));
+                    entries.extend(children);
+                }
+                Some(".") => {
+                    entries.push(("..".to_string(), true, 0));
+                    entries.extend(children);
+                }
+                Some("..") => entries.extend(children),
+                Some(after) => {
+                    let after = names::fold(after);
+                    entries.extend(children.into_iter().filter(|(n, _, _)| names::fold(n) > after));
+                }
+            }
+
             let mut cursor = 0u32;
             let mut dir_info = DirInfo::<255>::new();
 
             for (name, is_dir, size) in entries {
-                if !began {
-                    if Some(&name) == resume_after.as_ref() {
-                        began = true;
-                    }
+                dir_info.reset();
+                // A legacy name too long for Windows (over 255 UTF-16 units) is
+                // skipped rather than failing the whole listing.
+                if dir_info.set_name_raw(wide(&name).as_slice()).is_err() {
                     continue;
                 }
-                dir_info.reset();
-                dir_info.set_name(&name)?;
                 fill_file_info(dir_info.file_info_mut(), size, is_dir);
                 if !dir_info.append_to_buffer(buffer, &mut cursor) {
                     return Ok(cursor); // buffer full; WinFsp will resume with a marker
@@ -273,6 +352,32 @@ mod imp {
             }
             DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
             Ok(cursor)
+        }
+
+        /// Exact-name lookup within a directory (FindFirstFile("X:\dir\name")).
+        /// Directory Opus issues one for every item a change notification
+        /// announces; if it fails, Opus drops the new item until a manual refresh.
+        /// Answering it directly avoids listing the whole directory per lookup.
+        fn get_dir_info_by_name(
+            &self,
+            context: &Self::FileContext,
+            file_name: &U16CStr,
+            out_dir_info: &mut DirInfo,
+        ) -> FspResult<()> {
+            let dir = match context {
+                Handle::Root => String::new(),
+                Handle::Dir(p) => p.clone(),
+                Handle::File(_) => return Err(not_found()),
+            };
+            let name = names::from_windows(&file_name.to_string_lossy());
+            let path = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+            let m = self.meta(&path).ok_or_else(not_found)?;
+            let canonical = self.canonical(&path);
+            let real = canonical.rsplit('/').next().unwrap_or(&canonical);
+            out_dir_info.reset();
+            out_dir_info.set_name_raw(wide(&names::to_windows(real)).as_slice())?;
+            fill_file_info(out_dir_info.file_info_mut(), m.size, m.is_dir);
+            Ok(())
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -290,19 +395,21 @@ mod imp {
         ) -> FspResult<Self::FileContext> {
             let path = path_of(file_name);
             if path.is_empty() {
-                return Err(FspError::IO(std::io::ErrorKind::InvalidInput));
+                return Err(FspError::WIN32(ERROR_INVALID_PARAMETER));
             }
             let mut store = self.store.lock().unwrap();
             if create_options & FILE_DIRECTORY_FILE != 0 {
-                store.mkdir(&path)?;
+                store.mkdir(&path).map_err(fsp)?;
                 drop(store);
-                self.enqueue(&path, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_ACTION_ADDED);
+                let path = self.canonical(&path);
+                set_normalized_name(file_info, &path, file_name);
                 fill_file_info(file_info.as_mut(), 0, true);
                 Ok(Handle::Dir(path))
             } else {
-                store.create(&path)?;
+                store.create(&path).map_err(fsp)?;
                 drop(store);
-                self.enqueue(&path, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_ADDED);
+                let path = self.canonical(&path);
+                set_normalized_name(file_info, &path, file_name);
                 fill_file_info(file_info.as_mut(), 0, false);
                 Ok(Handle::File(path))
             }
@@ -326,14 +433,9 @@ mod imp {
             } else {
                 offset
             };
-            store.write_at(path, at, buffer)?;
+            store.write_at(path, at, buffer).map_err(fsp)?;
             let size = store.metadata(path).ok().flatten().map(|m| m.size).unwrap_or(0);
             drop(store);
-            self.enqueue(
-                path,
-                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                FILE_ACTION_MODIFIED,
-            );
             fill_file_info(file_info, size, false);
             Ok(buffer.len() as u32)
         }
@@ -348,12 +450,7 @@ mod imp {
             let Handle::File(path) = context else {
                 return Err(not_found());
             };
-            self.store.lock().unwrap().truncate(path, new_size)?;
-            self.enqueue(
-                path,
-                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                FILE_ACTION_MODIFIED,
-            );
+            self.store.lock().unwrap().truncate(path, new_size).map_err(fsp)?;
             fill_file_info(file_info, new_size, false);
             Ok(())
         }
@@ -370,53 +467,62 @@ mod imp {
             let Handle::File(path) = context else {
                 return Err(not_found());
             };
-            self.store.lock().unwrap().truncate(path, 0)?;
+            self.store.lock().unwrap().truncate(path, 0).map_err(fsp)?;
             fill_file_info(file_info, 0, false);
             Ok(())
         }
 
         fn rename(
             &self,
-            context: &Self::FileContext,
+            _context: &Self::FileContext,
             file_name: &U16CStr,
             new_file_name: &U16CStr,
-            _replace_if_exists: bool,
+            replace_if_exists: bool,
         ) -> FspResult<()> {
             let old = path_of(file_name);
             let new = path_of(new_file_name);
-            self.store.lock().unwrap().rename_path(&old, &new)?;
-            let filter = match context {
-                Handle::File(_) => FILE_NOTIFY_CHANGE_FILE_NAME,
-                _ => FILE_NOTIFY_CHANGE_DIR_NAME,
-            };
-            self.enqueue(&old, filter, FILE_ACTION_RENAMED_OLD_NAME);
-            self.enqueue(&new, filter, FILE_ACTION_RENAMED_NEW_NAME);
-            Ok(())
+            let mut store = self.store.lock().unwrap();
+            // MoveFileEx(REPLACE_EXISTING) is how many editors save (write a
+            // temp file, rename it over the original).
+            if replace_if_exists {
+                store.rename_replace(&old, &new).map_err(fsp)
+            } else {
+                store.rename_path(&old, &new).map_err(fsp)
+            }
         }
 
         fn set_delete(
             &self,
             context: &Self::FileContext,
             _file_name: &U16CStr,
-            _delete_file: bool,
+            delete_file: bool,
         ) -> FspResult<()> {
             match context {
-                Handle::Root => Err(FspError::IO(std::io::ErrorKind::PermissionDenied)),
+                Handle::Root => Err(FspError::WIN32(ERROR_ACCESS_DENIED)),
+                // Like NTFS, a directory can only be deleted once it's empty;
+                // otherwise `rd folder` (no /s) would wipe the whole subtree.
+                Handle::Dir(p) if delete_file => {
+                    let empty = self
+                        .store
+                        .lock()
+                        .unwrap()
+                        .list_dir(p)
+                        .map(|c| c.is_empty())
+                        .unwrap_or(true);
+                    if empty {
+                        Ok(())
+                    } else {
+                        Err(FspError::WIN32(ERROR_DIR_NOT_EMPTY))
+                    }
+                }
                 _ => Ok(()),
             }
         }
 
         fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
             if flags & (FspCleanupDelete as u32) != 0 {
-                let path_and_filter = match context {
-                    Handle::File(p) => Some((p, FILE_NOTIFY_CHANGE_FILE_NAME)),
-                    Handle::Dir(p) => Some((p, FILE_NOTIFY_CHANGE_DIR_NAME)),
-                    Handle::Root => None,
-                };
-                if let Some((p, filter)) = path_and_filter {
-                    if self.store.lock().unwrap().remove(p).is_ok() {
-                        self.enqueue(p, filter, FILE_ACTION_REMOVED);
-                    }
+                if let Handle::File(p) | Handle::Dir(p) = context {
+                    let _ = self.store.lock().unwrap().remove(p);
                 }
             }
         }
@@ -457,19 +563,17 @@ mod imp {
             // see created/renamed/deleted entries immediately on re-enumeration.
             // A non-zero timeout serves a stale listing for that long, so new
             // folders appear late (Explorer) or not at all (Opus).
-            .file_info_timeout(0);
+            .file_info_timeout(0)
+            // Route exact-name directory queries to get_dir_info_by_name.
+            .pass_query_directory_filename(true);
 
         let context = CloakWinFs {
             store: Mutex::new(store),
-            pending: Mutex::new(Vec::new()),
         };
-        // new_with_timer wires up the notify poll timer so queued change events are
-        // published to WinFsp (and thus to Explorer / Directory Opus) promptly.
-        let mut host = FileSystemHost::new_with_timer::<CloakWinFs, Vec<NotifyEvent>, NOTIFY_INTERVAL_MS>(
-            FileSystemParams::default_params(params),
-            context,
-        )
-        .expect("create filesystem host");
+        let mut fs_params = FileSystemParams::default_params(params);
+        fs_params.use_dir_info_by_name = true;
+        let mut host =
+            FileSystemHost::new_with_options(fs_params, context).expect("create filesystem host");
         host.mount(mount_point.as_str()).expect("mount");
         host.start().expect("start dispatcher");
         println!("mounted {store_dir} at {mount_point}; press Enter (or terminate) to unmount");

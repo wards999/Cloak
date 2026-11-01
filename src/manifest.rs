@@ -12,6 +12,7 @@
 //! manifests over a single global index.
 
 use crate::crypto::{transform_region, Key, NONCE_LEN};
+use crate::names;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -93,16 +94,17 @@ impl Manifest {
         std::fs::write(Self::path_in(dir), out)
     }
 
-    // Name matching is case-insensitive: a mounted drive is case-insensitive on
-    // both Windows and macOS, and the OS hands names back in varying case (e.g.
-    // Windows sends an uppercased source name on rename). Lookups fold case;
-    // the stored name keeps its original case (case-preserving).
+    // Name matching is case-insensitive and Unicode-normalization-insensitive:
+    // a mounted drive is case-insensitive on both Windows and macOS, the OS hands
+    // names back in varying case (Windows sends an uppercased source name on
+    // rename), and macOS sends decomposed (NFD) accents where Windows sends
+    // composed (NFC). See `names::same`. The stored name keeps its case.
     pub fn find(&self, real: &str) -> Option<&Child> {
-        self.children.iter().find(|c| c.real.eq_ignore_ascii_case(real))
+        self.children.iter().find(|c| names::same(&c.real, real))
     }
 
     pub fn position(&self, real: &str) -> Option<usize> {
-        self.children.iter().position(|c| c.real.eq_ignore_ascii_case(real))
+        self.children.iter().position(|c| names::same(&c.real, real))
     }
 
     /// The set of boring names in use here, plus the reserved manifest name, so

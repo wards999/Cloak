@@ -28,8 +28,10 @@
 pub mod boring;
 pub mod crypto;
 pub mod engine;
+pub mod inodes;
 pub mod key;
 pub mod manifest;
+pub mod names;
 
 pub use crypto::{Key, Nonce, KEY_LEN, NONCE_LEN};
 pub use engine::{Metadata, Store};
