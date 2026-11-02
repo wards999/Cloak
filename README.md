@@ -136,6 +136,10 @@ The Cloak app keeps its drive list and settings in a `cloak-data` folder next
 to itself: beside `Cloak.exe` on Windows, beside `Cloak.app` on macOS.
 Nothing is written to your user profile, so the app can live on a USB stick.
 
+On macOS the release is a disk image (`.dmg`). Drag Cloak to Applications
+for a normal install (it then keeps its data in `~/.cloak`), or copy it to
+any other folder, such as a USB stick, to run it portably.
+
 - A drive on the same disk as the app is remembered by its path relative to
   the app too, so it's still found when the stick gets a different drive
   letter (or mount point) on another computer.

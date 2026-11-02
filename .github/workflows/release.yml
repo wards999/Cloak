@@ -1,12 +1,16 @@
 name: Release
 
-# Push a tag like `v0.1.0` to build the Windows and macOS binaries and publish
-# a GitHub release with them attached. Release notes come from
+# Push a tag like `v0.1.0` to build the Windows zip and the macOS disk image
+# and publish a GitHub release with them attached. Release notes come from
 # .github/release-notes/<tag>.md when present.
+#
+# Run it by hand (Actions -> Release -> Run workflow) for a dry run: it builds
+# both packages and keeps them as run artifacts, but publishes nothing.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,19 +71,31 @@ jobs:
           pip install -r pyapp/requirements.txt pyinstaller
           python pyapp/package.py target/release out
           file out/Cloak.app/Contents/MacOS/bin/*
-          dir="cloak-${{ github.ref_name }}-macos-arm64"
-          mkdir "$dir"
-          mv out/Cloak.app "$dir/"
-          cp README.md "$dir/"
-          ditto -c -k --keepParent "$dir" "$dir.zip"
+      - name: Build the disk image
+        run: |
+          # The usual layout: the app, a shortcut to Applications to drag it
+          # onto, and the README.
+          mkdir dmg
+          mv out/Cloak.app dmg/
+          ln -s /Applications dmg/Applications
+          cp README.md dmg/
+          image="cloak-${{ github.ref_name }}-macos-arm64.dmg"
+          # hdiutil sometimes fails with "Resource busy" on CI runners; retry.
+          for attempt in 1 2 3 4 5; do
+            hdiutil create -volname "Cloak" -srcfolder dmg -fs HFS+ -format UDZO -ov "$image" && break
+            echo "hdiutil failed (attempt $attempt), retrying"; sleep 5
+          done
+          hdiutil verify "$image"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: cloak-${{ github.ref_name }}-macos-arm64.zip
+          path: cloak-${{ github.ref_name }}-macos-arm64.dmg
 
   publish:
     name: Publish release
     needs: [windows, macos]
+    # Only for a pushed tag; a manual run is a dry run.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -96,4 +112,4 @@ jobs:
         run: |
           notes=".github/release-notes/$TAG.md"
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
-          gh release create "$TAG" dist/*.zip --title "cloak $TAG" --verify-tag "$@"
+          gh release create "$TAG" dist/*.zip dist/*.dmg --title "cloak $TAG" --verify-tag "$@"
