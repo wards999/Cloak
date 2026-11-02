@@ -31,16 +31,16 @@ fn main() {
 #[cfg(all(feature = "winfsp", windows))]
 mod imp {
     use cloak::{names, Metadata, Store};
-    use std::sync::Mutex;
+    use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use widestring::U16CStr;
     use winfsp::filesystem::{
-        DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
+        DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
         OpenFileInfo, VolumeInfo, WideNameInfo,
     };
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
     use winfsp::{winfsp_init_or_die, FspError, Result as FspResult};
-    use winfsp_sys::{FspCleanupDelete, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
+    use winfsp_sys::{FspCleanupDelete, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FSP_FSCTL_VOLUME_PARAMS};
 
     const ATTR_DIRECTORY: u32 = 0x10; // FILE_ATTRIBUTE_DIRECTORY
     const ATTR_NORMAL: u32 = 0x80; // FILE_ATTRIBUTE_NORMAL
@@ -52,22 +52,48 @@ mod imp {
     // event. The driver needs two things from us for them to be usable: true-case
     // names (`set_normalized_name`) and NUL-free entry names (`wide`).
 
-    /// An open handle, carrying the logical path it refers to.
+    /// An open handle, carrying the logical path it refers to. A directory
+    /// handle also holds its listing while it is being enumerated.
     enum Handle {
-        Root,
-        Dir(String),
-        File(String),
+        Root(DirBuffer),
+        Dir(String, DirBuffer),
+        /// A file: its path, and its id in the store (see `Store::open_file`),
+        /// which reads and writes use and which follows renames.
+        File(String, u64),
     }
 
     struct CloakWinFs {
-        // WinFsp calls back on many threads with only &self, so the mutable Store
-        // lives behind a Mutex (engine ops are quick; simple and safe).
-        store: Mutex<Store>,
+        // WinFsp calls back on many threads with only &self. The Store lives
+        // behind a read-write lock: reads, lookups and listings run side by
+        // side, changes one at a time. Shared with the thread that saves
+        // directory lists (`saver`).
+        store: Arc<RwLock<Store>>,
     }
 
     impl CloakWinFs {
+        /// The store, even if an earlier callback panicked while holding it.
+        /// WinFsp catches the panic and fails just that request; without this,
+        /// the poisoned lock would fail every request after it and the drive
+        /// would be dead until remounted. The store's state is all on disk, so
+        /// carrying on is safe.
+        fn store(&self) -> RwLockWriteGuard<'_, Store> {
+            lock(&self.store)
+        }
+
+        /// The store for a call that changes nothing (several at once).
+        fn reader(&self) -> RwLockReadGuard<'_, Store> {
+            self.store.read().unwrap_or_else(PoisonError::into_inner)
+        }
+
         fn meta(&self, path: &str) -> Option<Metadata> {
-            self.store.lock().unwrap().metadata(path).ok().flatten()
+            self.reader().metadata(path).ok().flatten()
+        }
+
+        /// Fill `info` with the current state of open file `id`.
+        fn file_info(&self, id: u64, info: &mut FileInfo) -> FspResult<()> {
+            let m = self.reader().file_metadata(id).map_err(fsp)?;
+            fill_file_info(info, &m);
+            Ok(())
         }
 
         /// Fill `info` with the current state of `path`.
@@ -80,9 +106,7 @@ mod imp {
         /// `path` with each component in its stored case, falling back to the
         /// path as given.
         fn canonical(&self, path: &str) -> String {
-            self.store
-                .lock()
-                .unwrap()
+            self.reader()
                 .canonical_path(path)
                 .ok()
                 .flatten()
@@ -244,14 +268,22 @@ mod imp {
             let m = self.meta(&path).ok_or_else(not_found)?;
             fill_file_info(file_info.as_mut(), &m);
             if path.is_empty() {
-                return Ok(Handle::Root);
+                return Ok(Handle::Root(DirBuffer::new()));
             }
             let path = self.canonical(&path);
             set_normalized_name(file_info, &path, file_name);
-            Ok(if m.is_dir { Handle::Dir(path) } else { Handle::File(path) })
+            if m.is_dir {
+                return Ok(Handle::Dir(path, DirBuffer::new()));
+            }
+            let id = self.store().open_file(&path).map_err(fsp)?;
+            Ok(Handle::File(path, id))
         }
 
-        fn close(&self, _context: Self::FileContext) {}
+        fn close(&self, context: Self::FileContext) {
+            if let Handle::File(_, id) = context {
+                self.store().release_file(id);
+            }
+        }
 
         fn get_file_info(
             &self,
@@ -259,8 +291,9 @@ mod imp {
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
             match context {
-                Handle::Root => self.info("", file_info),
-                Handle::Dir(path) | Handle::File(path) => self.info(path, file_info),
+                Handle::Root(_) => self.info("", file_info),
+                Handle::Dir(path, _) => self.info(path, file_info),
+                Handle::File(_, id) => self.file_info(*id, file_info),
             }
         }
 
@@ -277,8 +310,15 @@ mod imp {
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
             match context {
-                Some(c) => self.get_file_info(c, file_info),
-                None => Ok(()),
+                Some(c) => {
+                    // FlushFileBuffers: make the file's writes durable.
+                    if let Handle::File(_, id) = c {
+                        self.store().flush_file(*id).map_err(fsp)?;
+                    }
+                    self.get_file_info(c, file_info)
+                }
+                // The whole volume: save every pending change.
+                None => self.store().sync().map_err(fsp),
             }
         }
 
@@ -292,18 +332,16 @@ mod imp {
             _last_change_time: u64,
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
-            let path = match context {
-                Handle::Root => "",
-                Handle::Dir(p) | Handle::File(p) => p.as_str(),
-            };
             let (accessed, modified, created) =
                 (systime(last_access_time), systime(last_write_time), systime(creation_time));
             if accessed.is_some() || modified.is_some() || created.is_some() {
-                self.store
-                    .lock()
-                    .unwrap()
-                    .set_times(path, accessed, modified, created)
-                    .map_err(fsp)?;
+                let store = self.reader();
+                match context {
+                    Handle::Root(_) => store.set_times("", accessed, modified, created),
+                    Handle::Dir(p, _) => store.set_times(p, accessed, modified, created),
+                    Handle::File(_, id) => store.set_file_times(*id, accessed, modified, created),
+                }
+                .map_err(fsp)?;
             }
             self.get_file_info(context, file_info)
         }
@@ -323,10 +361,10 @@ mod imp {
             buffer: &mut [u8],
             offset: u64,
         ) -> FspResult<u32> {
-            let Handle::File(path) = context else {
+            let Handle::File(_, id) = context else {
                 return Err(not_found());
             };
-            let data = self.store.lock().unwrap().read_at(path, offset, buffer.len()).map_err(fsp)?;
+            let data = self.reader().read_file(*id, offset, buffer.len()).map_err(fsp)?;
             buffer[..data.len()].copy_from_slice(&data);
             Ok(data.len() as u32)
         }
@@ -338,62 +376,36 @@ mod imp {
             marker: DirMarker,
             buffer: &mut [u8],
         ) -> FspResult<u32> {
-            let dir = match context {
-                Handle::Root => String::new(),
-                Handle::Dir(p) => p.clone(),
-                Handle::File(_) => return Err(not_found()),
+            let (dir, listing) = match context {
+                Handle::Root(b) => (String::new(), b),
+                Handle::Dir(p, b) => (p.clone(), b),
+                Handle::File(..) => return Err(not_found()),
             };
-            let (this, mut children) = {
-                let store = self.store.lock().unwrap();
-                let this = store.metadata(&dir).ok().flatten().ok_or_else(not_found)?;
-                let children: Vec<(String, Metadata)> = store
-                    .list_dir_meta(&dir)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, m)| (names::to_windows(&name), m))
-                    .collect();
-                (this, children)
-            };
-            // Case-insensitive order (as NTFS lists), so a resume marker can be
-            // located by comparison even if that entry was deleted meanwhile.
-            children.sort_by_cached_key(|(name, _)| names::fold(name));
-
-            let resume_after = marker.inner_as_cstr().map(|c| c.to_string_lossy());
-            let mut entries: Vec<(String, Metadata)> = Vec::new();
-            match resume_after.as_deref() {
-                None => {
-                    entries.push((".".to_string(), this));
-                    entries.push(("..".to_string(), this));
-                    entries.extend(children);
-                }
-                Some(".") => {
-                    entries.push(("..".to_string(), this));
-                    entries.extend(children);
-                }
-                Some("..") => entries.extend(children),
-                Some(after) => {
-                    let after = names::fold(after);
-                    entries.extend(children.into_iter().filter(|(n, _)| names::fold(n) > after));
+            // The whole listing is built when an enumeration starts (no marker)
+            // and later pages are served from it, so a big folder is read
+            // once per listing rather than once per page. A new enumeration
+            // always rebuilds it, so file managers see changes immediately.
+            if let Ok(lock) = listing.acquire(marker.is_none(), None) {
+                let (this, children) = {
+                    let store = self.reader();
+                    let this = store.metadata(&dir).ok().flatten().ok_or_else(not_found)?;
+                    (this, store.list_dir_meta(&dir).unwrap_or_default())
+                };
+                let mut dir_info = DirInfo::<255>::new();
+                let dots = [(".".to_string(), this), ("..".to_string(), this)];
+                let entries = children.into_iter().map(|(name, m)| (names::to_windows(&name), m));
+                for (name, m) in dots.into_iter().chain(entries) {
+                    dir_info.reset();
+                    // A legacy name too long for Windows (over 255 UTF-16 units)
+                    // is skipped rather than failing the whole listing.
+                    if dir_info.set_name_raw(wide(&name).as_slice()).is_err() {
+                        continue;
+                    }
+                    fill_file_info(dir_info.file_info_mut(), &m);
+                    lock.write(&mut dir_info)?;
                 }
             }
-
-            let mut cursor = 0u32;
-            let mut dir_info = DirInfo::<255>::new();
-
-            for (name, m) in entries {
-                dir_info.reset();
-                // A legacy name too long for Windows (over 255 UTF-16 units) is
-                // skipped rather than failing the whole listing.
-                if dir_info.set_name_raw(wide(&name).as_slice()).is_err() {
-                    continue;
-                }
-                fill_file_info(dir_info.file_info_mut(), &m);
-                if !dir_info.append_to_buffer(buffer, &mut cursor) {
-                    return Ok(cursor); // buffer full; WinFsp will resume with a marker
-                }
-            }
-            DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-            Ok(cursor)
+            Ok(listing.read(marker, buffer))
         }
 
         /// Exact-name lookup within a directory (FindFirstFile("X:\dir\name")).
@@ -407,9 +419,9 @@ mod imp {
             out_dir_info: &mut DirInfo,
         ) -> FspResult<()> {
             let dir = match context {
-                Handle::Root => String::new(),
-                Handle::Dir(p) => p.clone(),
-                Handle::File(_) => return Err(not_found()),
+                Handle::Root(_) => String::new(),
+                Handle::Dir(p, _) => p.clone(),
+                Handle::File(..) => return Err(not_found()),
             };
             let name = names::from_windows(&file_name.to_string_lossy());
             let path = if dir.is_empty() { name } else { format!("{dir}/{name}") };
@@ -439,21 +451,22 @@ mod imp {
             if path.is_empty() {
                 return Err(FspError::WIN32(ERROR_INVALID_PARAMETER));
             }
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store();
             if create_options & FILE_DIRECTORY_FILE != 0 {
                 store.mkdir(&path).map_err(fsp)?;
                 drop(store);
                 let path = self.canonical(&path);
                 set_normalized_name(file_info, &path, file_name);
                 self.info(&path, file_info.as_mut())?;
-                Ok(Handle::Dir(path))
+                Ok(Handle::Dir(path, DirBuffer::new()))
             } else {
                 store.create(&path).map_err(fsp)?;
                 drop(store);
                 let path = self.canonical(&path);
                 set_normalized_name(file_info, &path, file_name);
-                self.info(&path, file_info.as_mut())?;
-                Ok(Handle::File(path))
+                let id = self.store().open_file(&path).map_err(fsp)?;
+                self.file_info(id, file_info.as_mut())?;
+                Ok(Handle::File(path, id))
             }
         }
 
@@ -463,21 +476,33 @@ mod imp {
             buffer: &[u8],
             offset: u64,
             write_to_eof: bool,
-            _constrained_io: bool,
+            constrained_io: bool,
             file_info: &mut FileInfo,
         ) -> FspResult<u32> {
-            let Handle::File(path) = context else {
+            let Handle::File(_, id) = context else {
                 return Err(not_found());
             };
-            let mut store = self.store.lock().unwrap();
-            let at = if write_to_eof {
-                store.metadata(path).ok().flatten().map(|m| m.size).unwrap_or(0)
+            let id = *id;
+            let mut store = self.store();
+            let size = || store.file_metadata(id).map_or(0, |m| m.size);
+            let mut buffer = buffer;
+            let at = if constrained_io {
+                // Windows' cache writing back whole pages: these must never
+                // grow the file, so the part past the end is dropped.
+                let size = size();
+                if offset >= size {
+                    return Ok(0);
+                }
+                buffer = &buffer[..buffer.len().min((size - offset) as usize)];
+                offset
+            } else if write_to_eof {
+                size()
             } else {
                 offset
             };
-            store.write_at(path, at, buffer).map_err(fsp)?;
+            store.write_file(id, at, buffer).map_err(fsp)?;
             drop(store);
-            self.info(path, file_info)?;
+            self.file_info(id, file_info)?;
             Ok(buffer.len() as u32)
         }
 
@@ -485,14 +510,23 @@ mod imp {
             &self,
             context: &Self::FileContext,
             new_size: u64,
-            _set_allocation_size: bool,
+            set_allocation_size: bool,
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
-            let Handle::File(path) = context else {
+            let Handle::File(_, id) = context else {
                 return Err(not_found());
             };
-            self.store.lock().unwrap().truncate(path, new_size).map_err(fsp)?;
-            self.info(path, file_info)
+            let id = *id;
+            let mut store = self.store();
+            // An allocation size is disk space reserved (rounded up to whole
+            // sectors), not the file's length: it only matters if it's less
+            // than the length, which then shrinks to fit.
+            let size = store.file_metadata(id).map_or(0, |m| m.size);
+            if !set_allocation_size || new_size < size {
+                store.truncate_file(id, new_size).map_err(fsp)?;
+            }
+            drop(store);
+            self.file_info(id, file_info)
         }
 
         fn overwrite(
@@ -504,11 +538,11 @@ mod imp {
             _extra_buffer: Option<&[u8]>,
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
-            let Handle::File(path) = context else {
+            let Handle::File(_, id) = context else {
                 return Err(not_found());
             };
-            self.store.lock().unwrap().truncate(path, 0).map_err(fsp)?;
-            self.info(path, file_info)
+            self.store().truncate_file(*id, 0).map_err(fsp)?;
+            self.file_info(*id, file_info)
         }
 
         fn rename(
@@ -520,7 +554,7 @@ mod imp {
         ) -> FspResult<()> {
             let old = path_of(file_name);
             let new = path_of(new_file_name);
-            let mut store = self.store.lock().unwrap();
+            let mut store = self.store();
             // MoveFileEx(REPLACE_EXISTING) is how many editors save (write a
             // temp file, rename it over the original).
             if replace_if_exists {
@@ -537,15 +571,12 @@ mod imp {
             delete_file: bool,
         ) -> FspResult<()> {
             match context {
-                Handle::Root => Err(FspError::WIN32(ERROR_ACCESS_DENIED)),
+                Handle::Root(_) => Err(FspError::WIN32(ERROR_ACCESS_DENIED)),
                 // Like NTFS, a directory can only be deleted once it's empty;
                 // otherwise `rd folder` (no /s) would wipe the whole subtree.
-                Handle::Dir(p) if delete_file => {
-                    let empty = self
-                        .store
-                        .lock()
-                        .unwrap()
-                        .list_dir(p)
+                Handle::Dir(p, _) if delete_file => {
+                    let empty = self.reader()
+                        .list_entries(p)
                         .map(|c| c.is_empty())
                         .unwrap_or(true);
                     if empty {
@@ -560,8 +591,8 @@ mod imp {
 
         fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
             if flags & (FspCleanupDelete as u32) != 0 {
-                if let Handle::File(p) | Handle::Dir(p) = context {
-                    let _ = self.store.lock().unwrap().remove(p);
+                if let Handle::File(p, _) | Handle::Dir(p, _) = context {
+                    let _ = self.store().remove(p);
                 }
             }
         }
@@ -598,16 +629,35 @@ mod imp {
             .case_sensitive_search(false)
             .unicode_on_disk(true)
             .persistent_acls(false)
-            // No metadata caching: file managers (Explorer, Directory Opus) must
-            // see created/renamed/deleted entries immediately on re-enumeration.
-            // A non-zero timeout serves a stale listing for that long, so new
-            // folders appear late (Explorer) or not at all (Opus).
-            .file_info_timeout(0)
+            // Let Windows cache file data and file details: reads get its
+            // read-ahead and small writes are gathered, instead of every 4 KiB
+            // going through us. Every change goes through this volume, so the
+            // cache stays correct.
+            .file_info_timeout(u32::MAX)
+            // ...but hand a file's cached writes to us as soon as the app
+            // closes it, so closed files are on the backing store like before
+            // (an unmount or a crash can't lose data the app has finished
+            // writing and closed).
+            .flush_and_purge_on_cleanup(true)
             // Route exact-name directory queries to get_dir_info_by_name.
             .pass_query_directory_filename(true);
+        // But never cache directory listings: file managers (Explorer,
+        // Directory Opus) must see created/renamed/deleted entries immediately
+        // on re-enumeration. A cached listing shows new folders late
+        // (Explorer) or not at all (Opus). winfsp-rs has no setter for the
+        // "valid" flag that makes the separate listing timeout apply.
+        {
+            // SAFETY: VolumeParams is a #[repr(transparent)] wrapper around
+            // FSP_FSCTL_VOLUME_PARAMS.
+            let raw = unsafe { &mut *(&mut params as *mut VolumeParams).cast::<FSP_FSCTL_VOLUME_PARAMS>() };
+            raw.set_DirInfoTimeoutValid(1);
+            raw.DirInfoTimeout = 0;
+        }
 
+        let store = Arc::new(RwLock::new(store));
+        saver(&store);
         let context = CloakWinFs {
-            store: Mutex::new(store),
+            store: store.clone(),
         };
         let mut fs_params = FileSystemParams::default_params(params);
         fs_params.use_dir_info_by_name = true;
@@ -622,5 +672,30 @@ mod imp {
 
         host.stop();
         host.unmount();
+        let saved = lock(&store).sync();
+        if let Err(e) = saved {
+            eprintln!("saving on unmount failed: {e}");
+        }
+    }
+
+    /// The store, even if a thread panicked while holding it (see
+    /// `CloakWinFs::store`).
+    fn lock(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+        store.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Save changed directory lists shortly after they change, even when
+    /// nothing else is happening on the drive.
+    fn saver(store: &Arc<RwLock<Store>>) {
+        let store = Arc::downgrade(store);
+        std::thread::spawn(move || {
+            while let Some(store) = store.upgrade() {
+                if let Err(e) = lock(&store).tick() {
+                    eprintln!("saving directory lists failed: {e}");
+                }
+                drop(store);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
     }
 }

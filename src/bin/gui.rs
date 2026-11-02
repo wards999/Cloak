@@ -502,7 +502,13 @@ mod imp {
 
         fn unmount(&mut self) {
             if let Some(mut child) = self.child.take() {
+                // Closing stdin asks the adapter to unmount and save its
+                // pending changes; give it a few seconds before forcing it.
                 drop(child.stdin.take());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 self.mount_status = "Unmounted.".into();
@@ -512,6 +518,11 @@ mod imp {
 
     impl eframe::App for CloakGui {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if let Some(store) = self.opened.as_mut() {
+                // Save list changes made while browsing; errors resurface on
+                // the next save.
+                let _ = store.tick();
+            }
             egui::CentralPanel::default().show(ctx, |ui| {
                 // Centered, fixed-width content column for a modern app feel.
                 let full = ui.available_width();

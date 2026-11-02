@@ -39,6 +39,7 @@ mod imp {
     };
     use std::ffi::OsStr;
     use std::io;
+    use std::sync::{mpsc, Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
     use std::time::{Duration, SystemTime};
 
     const TTL: Duration = Duration::from_secs(1);
@@ -91,13 +92,27 @@ mod imp {
     }
 
     struct CloakFs {
-        store: Store,
+        /// Reads, lookups and listings can run side by side, changes one at a
+        /// time. Shared with the read workers and with the thread that saves
+        /// directory lists (`saver`).
+        store: Arc<RwLock<Store>>,
+        /// Threads that run reads (fuser hands us one request at a time).
+        workers: Workers,
         inodes: Inodes,
         uid: u32,
         gid: u32,
     }
 
     impl CloakFs {
+        fn store(&self) -> RwLockWriteGuard<'_, Store> {
+            lock(&self.store)
+        }
+
+        /// The store for a call that changes nothing (runs alongside reads).
+        fn reader(&self) -> RwLockReadGuard<'_, Store> {
+            self.store.read().unwrap_or_else(PoisonError::into_inner)
+        }
+
         fn attr(&self, ino: u64, m: Metadata) -> FileAttr {
             FileAttr {
                 ino,
@@ -122,7 +137,7 @@ mod imp {
         fn node(&self, ino: u64) -> Result<(String, Metadata), i32> {
             let path = self.inodes.path(ino).ok_or(libc::ENOENT)?.to_string();
             let m = self
-                .store
+                .reader()
                 .metadata(&path)
                 .map_err(|e| errno(&e))?
                 .ok_or(libc::ENOENT)?;
@@ -139,12 +154,12 @@ mod imp {
         /// Look up an existing path: its stored spelling, inode and attributes.
         fn entry(&mut self, path: &str) -> Result<FileAttr, i32> {
             let m = self
-                .store
+                .reader()
                 .metadata(path)
                 .map_err(|e| errno(&e))?
                 .ok_or(libc::ENOENT)?;
             let canonical = self
-                .store
+                .reader()
                 .canonical_path(path)
                 .ok()
                 .flatten()
@@ -154,7 +169,7 @@ mod imp {
         }
 
         fn canonical(&self, path: &str) -> String {
-            self.store
+            self.reader()
                 .canonical_path(path)
                 .ok()
                 .flatten()
@@ -189,7 +204,7 @@ mod imp {
             atime: Option<TimeOrNow>,
             mtime: Option<TimeOrNow>,
             _ctime: Option<SystemTime>,
-            _fh: Option<u64>,
+            fh: Option<u64>,
             crtime: Option<SystemTime>,
             _chgtime: Option<SystemTime>,
             _bkuptime: Option<SystemTime>,
@@ -206,7 +221,11 @@ mod imp {
                 if m.is_dir {
                     return reply.error(libc::EISDIR);
                 }
-                if let Err(e) = self.store.truncate(&path, new_size) {
+                let result = match fh {
+                    Some(fh) if fh != 0 => self.store().truncate_file(fh, new_size),
+                    _ => self.store().truncate(&path, new_size),
+                };
+                if let Err(e) = result {
                     return reply.error(errno(&e));
                 }
             }
@@ -215,7 +234,7 @@ mod imp {
                 TimeOrNow::Now => SystemTime::now(),
             };
             if atime.is_some() || mtime.is_some() || crtime.is_some() {
-                if let Err(e) = self.store.set_times(&path, atime.map(when), mtime.map(when), crtime) {
+                if let Err(e) = self.store().set_times(&path, atime.map(when), mtime.map(when), crtime) {
                     return reply.error(errno(&e));
                 }
             }
@@ -238,7 +257,7 @@ mod imp {
                 return reply.error(libc::EACCES);
             }
             let result = self.child(parent, name).and_then(|path| {
-                self.store.mkdir(&path).map_err(|e| errno(&e))?;
+                self.store().mkdir(&path).map_err(|e| errno(&e))?;
                 self.entry(&path)
             });
             match result {
@@ -261,18 +280,19 @@ mod imp {
                 return reply.error(libc::EACCES);
             }
             let result = self.child(parent, name).and_then(|path| {
-                let exists = self.store.metadata(&path).map_err(|e| errno(&e))?.is_some();
+                let exists = self.reader().metadata(&path).map_err(|e| errno(&e))?.is_some();
                 if exists && flags & libc::O_EXCL != 0 {
                     return Err(libc::EEXIST);
                 }
-                self.store.create(&path).map_err(|e| errno(&e))?;
+                self.store().create(&path).map_err(|e| errno(&e))?;
+                let fh = self.store().open_file(&path).map_err(|e| errno(&e))?;
                 if exists && flags & libc::O_TRUNC != 0 {
-                    self.store.truncate(&path, 0).map_err(|e| errno(&e))?;
+                    self.store().truncate_file(fh, 0).map_err(|e| errno(&e))?;
                 }
-                self.entry(&path)
+                Ok((self.entry(&path)?, fh))
             });
             match result {
-                Ok(attr) => reply.created(&TTL, &attr, 0, 0, 0),
+                Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
                 Err(e) => reply.error(e),
             }
         }
@@ -281,12 +301,18 @@ mod imp {
             match self.node(ino) {
                 Ok((_, m)) if m.is_dir => reply.error(libc::EISDIR),
                 Ok((path, _)) => {
+                    let mut store = self.store();
+                    let fh = match store.open_file(&path) {
+                        Ok(fh) => fh,
+                        Err(e) => return reply.error(errno(&e)),
+                    };
                     if flags & libc::O_TRUNC != 0 {
-                        if let Err(e) = self.store.truncate(&path, 0) {
+                        if let Err(e) = store.truncate_file(fh, 0) {
+                            store.release_file(fh);
                             return reply.error(errno(&e));
                         }
                     }
-                    reply.opened(0, 0)
+                    reply.opened(fh, 0)
                 }
                 Err(e) => reply.error(e),
             }
@@ -295,28 +321,35 @@ mod imp {
         fn read(
             &mut self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
+            _ino: u64,
+            fh: u64,
             offset: i64,
             size: u32,
             _flags: i32,
             _lock: Option<u64>,
             reply: ReplyData,
         ) {
-            let Some(path) = self.inodes.path(ino) else {
-                return reply.error(libc::ENOENT);
-            };
-            match self.store.read_at(path, offset.max(0) as u64, size as usize) {
-                Ok(bytes) => reply.data(&bytes),
-                Err(e) => reply.error(errno(&e)),
-            }
+            // On a worker, under the shared lock: reads of different files (or
+            // of one file, ahead of the app) run side by side, and a slow read
+            // doesn't hold up the requests queued behind it.
+            let store = self.store.clone();
+            self.workers.run(move || {
+                let result = store
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .read_file(fh, offset.max(0) as u64, size as usize);
+                match result {
+                    Ok(bytes) => reply.data(&bytes),
+                    Err(e) => reply.error(errno(&e)),
+                }
+            });
         }
 
         fn write(
             &mut self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
+            _ino: u64,
+            fh: u64,
             offset: i64,
             data: &[u8],
             _write_flags: u32,
@@ -324,10 +357,7 @@ mod imp {
             _lock_owner: Option<u64>,
             reply: ReplyWrite,
         ) {
-            let Some(path) = self.inodes.path(ino).map(str::to_string) else {
-                return reply.error(libc::ENOENT);
-            };
-            match self.store.write_at(&path, offset.max(0) as u64, data) {
+            match self.store().write_file(fh, offset.max(0) as u64, data) {
                 Ok(()) => reply.written(data.len() as u32),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -352,12 +382,12 @@ mod imp {
             let Some(dir) = self.inodes.path(ino).map(str::to_string) else {
                 return reply.error(libc::ENOENT);
             };
-            let mut children = match self.store.list_dir(&dir) {
+            let mut children = match self.reader().list_entries(&dir) {
                 Ok(c) => c,
                 Err(e) => return reply.error(errno(&e)),
             };
             // Stable order so a listing resumed at `offset` doesn't skip or repeat.
-            children.sort_by_cached_key(|(name, _, _)| cloak::names::fold(name));
+            children.sort_by_cached_key(|e| cloak::names::fold(&e.name));
 
             let parent_ino = if ino == ROOT_INO {
                 ROOT_INO
@@ -368,10 +398,10 @@ mod imp {
                 (ino, FileType::Directory, ".".to_string()),
                 (parent_ino, FileType::Directory, "..".to_string()),
             ];
-            for (name, is_dir, _) in children {
-                let child_ino = self.inodes.ino(&join(&dir, &name));
-                let kind = if is_dir { FileType::Directory } else { FileType::RegularFile };
-                entries.push((child_ino, kind, name));
+            for e in children {
+                let child_ino = self.inodes.ino(&join(&dir, &e.name));
+                let kind = if e.is_dir { FileType::Directory } else { FileType::RegularFile };
+                entries.push((child_ino, kind, e.name));
             }
             for (i, (child_ino, kind, name)) in
                 entries.into_iter().enumerate().skip(offset.max(0) as usize)
@@ -385,7 +415,7 @@ mod imp {
 
         fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
             let result = self.child(parent, name).and_then(|path| {
-                let m = self.store.metadata(&path).map_err(|e| errno(&e))?;
+                let m = self.reader().metadata(&path).map_err(|e| errno(&e))?;
                 match m {
                     None => Err(libc::ENOENT),
                     // POSIX: unlink(2) on a directory is EISDIR (Linux) / EPERM (macOS).
@@ -396,7 +426,7 @@ mod imp {
                     }),
                     Some(_) => {
                         let canonical = self.canonical(&path);
-                        self.store.remove(&path).map_err(|e| errno(&e))?;
+                        self.store().remove(&path).map_err(|e| errno(&e))?;
                         self.inodes.forget(&canonical);
                         Ok(())
                     }
@@ -411,7 +441,7 @@ mod imp {
         fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
             let result = self.child(parent, name).and_then(|path| {
                 let m = self
-                    .store
+                    .reader()
                     .metadata(&path)
                     .map_err(|e| errno(&e))?
                     .ok_or(libc::ENOENT)?;
@@ -419,11 +449,11 @@ mod imp {
                     return Err(libc::ENOTDIR);
                 }
                 // The engine deletes subtrees; rmdir(2) must only remove empty ones.
-                if !self.store.list_dir(&path).map_err(|e| errno(&e))?.is_empty() {
+                if !self.reader().list_entries(&path).map_err(|e| errno(&e))?.is_empty() {
                     return Err(libc::ENOTEMPTY);
                 }
                 let canonical = self.canonical(&path);
-                self.store.remove(&path).map_err(|e| errno(&e))?;
+                self.store().remove(&path).map_err(|e| errno(&e))?;
                 self.inodes.forget(&canonical);
                 Ok(())
             });
@@ -456,16 +486,16 @@ mod imp {
                 // A different entry already at `new` is replaced (POSIX rename),
                 // which is how most Mac apps save. Forget its inodes first.
                 let replaced = self
-                    .store
+                    .reader()
                     .metadata(&new)
                     .map_err(|e| errno(&e))?
                     .is_some()
                     && !cloak::names::same(&old_canonical, &self.canonical(&new));
                 if flags & RENAME_NOREPLACE != 0 {
-                    self.store.rename_path(&old, &new).map_err(|e| errno(&e))?;
+                    self.store().rename_path(&old, &new).map_err(|e| errno(&e))?;
                 } else {
                     let new_canonical = self.canonical(&new);
-                    self.store.rename_replace(&old, &new).map_err(|e| errno(&e))?;
+                    self.store().rename_replace(&old, &new).map_err(|e| errno(&e))?;
                     if replaced {
                         self.inodes.forget(&new_canonical);
                     }
@@ -523,7 +553,26 @@ mod imp {
             reply.ok(); // writes go straight to the backing store
         }
 
-        fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        /// fsync(2): make the file's writes durable.
+        fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+            match self.store().flush_file(fh) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn release(
+            &mut self,
+            _req: &Request,
+            _ino: u64,
+            fh: u64,
+            _flags: i32,
+            _lock_owner: Option<u64>,
+            _flush: bool,
+            reply: ReplyEmpty,
+        ) {
+            self.store().release_file(fh);
             reply.ok();
         }
 
@@ -548,8 +597,11 @@ mod imp {
             std::process::exit(2);
         });
         let store = Store::open_with_passphrase(&store_dir, &passphrase).expect("open store");
+        let store = Arc::new(RwLock::new(store));
+        saver(&store);
         let fs = CloakFs {
-            store,
+            store: store.clone(),
+            workers: Workers::new(4),
             inodes: Inodes::default(),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -580,5 +632,60 @@ mod imp {
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
         drop(session); // unmounts
+        let saved = lock(&store).sync();
+        if let Err(e) = saved {
+            eprintln!("saving on unmount failed: {e}");
+        }
+    }
+
+    /// The store, even if a thread panicked while holding it: its state is
+    /// all on disk or in its own consistent lists, so carrying on is safe.
+    fn lock(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+        store.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// A few threads that run jobs handed to them, each answering its own
+    /// request (fuser's replies can be sent from any thread).
+    struct Workers(mpsc::Sender<Job>);
+
+    impl Workers {
+        fn new(threads: usize) -> Workers {
+            let (tx, rx) = mpsc::channel::<Job>();
+            let rx = Arc::new(Mutex::new(rx));
+            for _ in 0..threads {
+                let rx = rx.clone();
+                std::thread::spawn(move || loop {
+                    let job = match rx.lock().unwrap_or_else(PoisonError::into_inner).recv() {
+                        Ok(job) => job,
+                        Err(_) => return, // unmounted
+                    };
+                    // A panic fails only its own request (the unsent reply
+                    // answers EIO when dropped), never the worker.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                });
+            }
+            Workers(tx)
+        }
+
+        fn run(&self, job: impl FnOnce() + Send + 'static) {
+            let _ = self.0.send(Box::new(job));
+        }
+    }
+
+    /// Save changed directory lists shortly after they change, even when
+    /// nothing else is happening on the drive.
+    fn saver(store: &Arc<RwLock<Store>>) {
+        let store = Arc::downgrade(store);
+        std::thread::spawn(move || {
+            while let Some(store) = store.upgrade() {
+                if let Err(e) = lock(&store).tick() {
+                    eprintln!("saving directory lists failed: {e}");
+                }
+                drop(store);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
     }
 }
