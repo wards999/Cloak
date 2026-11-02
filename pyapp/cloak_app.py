@@ -16,7 +16,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QVBoxLayout, QWidget,
@@ -1136,6 +1136,7 @@ class Cloak(FluentWindow):
         super().__init__()
         self.setWindowTitle("cloak")
         self.resize(820, 560)
+        self.navigationInterface.setReturnButtonVisible(False)
         self.auto_lock = load_settings()["auto_lock"]
         self.drives = DrivesInterface(self)
         self.settings = SettingsInterface(self)
@@ -1152,12 +1153,12 @@ class Cloak(FluentWindow):
         self.drives.lock_all()
         super().closeEvent(e)
 
-    if sys.platform == "darwin":
-        def _updateSystemButtonRect(self):
-            # The widget library re-places the traffic lights from their
-            # frames, which lands them on the right on current macOS; leave
-            # them where macOS puts them, top left.
-            pass
+    def systemTitleBarRect(self, size):
+        # Where macOS's traffic lights go. The widget library puts them top
+        # right, clear of its back and menu buttons; Mac windows have them top
+        # left, so they go just right of the menu button (the back button is
+        # hidden: two pages need no history).
+        return QRect(52, 0 if self.isFullScreen() else 8, 75, size.height())
 
 
 def main():
