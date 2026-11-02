@@ -10,6 +10,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -469,14 +471,44 @@ class DrivesInterface(QWidget):
         wb = winfsp_bin()
         if wb:
             env["PATH"] = wb + os.pathsep + env.get("PATH", "")
+        # Give the adapter real places to write: started from Explorer or
+        # Finder, the app has no console, and an adapter left with a dead
+        # output handle can fail on its first message. Its errors go to a
+        # file so they can be shown if the mount doesn't come up.
+        errors = tempfile.TemporaryFile()
         try:
-            proc = subprocess.Popen([adapter, drive["path"], mp], stdin=subprocess.PIPE, env=env, **NO_WINDOW)
+            proc = subprocess.Popen(
+                [adapter, drive["path"], mp],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, env=env, **NO_WINDOW,
+            )
         except OSError as e:
             return self.err(f"Couldn't start the mount driver ({e}). Is it installed?")
+        if not self._wait_for_mount(proc, mp):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            errors.seek(0)
+            lines = [l for l in errors.read().decode(errors="replace").splitlines() if l.strip()]
+            detail = lines[-1].strip() if lines else "it stopped without saying why"
+            return self.err(f"The drive couldn't be mounted: {detail}")
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
         self.refresh()
         self.ok(f"Unlocked at {mp}")
-        QTimer.singleShot(1200, lambda: open_in_file_manager(mp))
+        QTimer.singleShot(300, lambda: open_in_file_manager(mp))
+
+    def _wait_for_mount(self, proc, mp, timeout=15.0):
+        """True once `mp` is mounted; False if the adapter exits first or the
+        mount doesn't appear in time. Keeps the window responsive meanwhile."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return False
+            if (os.path.exists(mp + "\\") if IS_WIN else os.path.ismount(mp)):
+                return True
+            QApplication.processEvents()
+            time.sleep(0.1)
+        return False
 
     def lock(self, drive):
         self._unmount(drive["path"])

@@ -605,22 +605,43 @@ mod imp {
         }
     }
 
+    /// Print a line, ignoring failure. Started by the desktop app, the adapter
+    /// can have nowhere to print, and `println!` would abort the mount over
+    /// it.
+    fn say(msg: impl std::fmt::Display) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{msg}");
+    }
+
+    /// The same for errors (the desktop app shows these if the mount fails).
+    fn warn(msg: impl std::fmt::Display) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+
+    /// Report `msg` and exit.
+    fn fail(msg: impl std::fmt::Display) -> ! {
+        warn(msg);
+        std::process::exit(1)
+    }
+
     pub fn run() {
         let mut args = std::env::args().skip(1);
         let (store_dir, mount_point) = match (args.next(), args.next()) {
             (Some(a), Some(b)) => (a, b),
             _ => {
-                eprintln!("usage: cloak-winmount <backing-store-dir> <mount-point e.g. X:>");
+                warn("usage: cloak-winmount <backing-store-dir> <mount-point e.g. X:>");
                 std::process::exit(2);
             }
         };
         let passphrase = std::env::var("CLOAK_PASSPHRASE").unwrap_or_else(|_| {
-            eprintln!("set CLOAK_PASSPHRASE to the store passphrase");
+            warn("set CLOAK_PASSPHRASE to the store passphrase");
             std::process::exit(2);
         });
 
         let _init = winfsp_init_or_die();
-        let store = Store::open_with_passphrase(&store_dir, &passphrase).expect("open store");
+        let store = Store::open_with_passphrase(&store_dir, &passphrase)
+            .unwrap_or_else(|e| fail(format!("couldn't open the drive: {e}")));
 
         let mut params = VolumeParams::new();
         params
@@ -662,10 +683,15 @@ mod imp {
         let mut fs_params = FileSystemParams::default_params(params);
         fs_params.use_dir_info_by_name = true;
         let mut host =
-            FileSystemHost::new_with_options(fs_params, context).expect("create filesystem host");
-        host.mount(mount_point.as_str()).expect("mount");
-        host.start().expect("start dispatcher");
-        println!("mounted {store_dir} at {mount_point}; press Enter (or terminate) to unmount");
+            FileSystemHost::new_with_options(fs_params, context)
+                .unwrap_or_else(|e| fail(format!("couldn't start the file system (is WinFsp installed?): {e:?}")));
+        if let Err(e) = host.mount(mount_point.as_str()) {
+            fail(format!("couldn't mount at {mount_point} (is it free?): {e:?}"));
+        }
+        if let Err(e) = host.start() {
+            fail(format!("couldn't start the file system: {e:?}"));
+        }
+        say(format!("mounted {store_dir} at {mount_point}; press Enter (or terminate) to unmount"));
 
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
@@ -674,7 +700,7 @@ mod imp {
         host.unmount();
         let saved = lock(&store).sync();
         if let Err(e) = saved {
-            eprintln!("saving on unmount failed: {e}");
+            warn(format!("saving on unmount failed: {e}"));
         }
     }
 
@@ -691,7 +717,7 @@ mod imp {
         std::thread::spawn(move || {
             while let Some(store) = store.upgrade() {
                 if let Err(e) = lock(&store).tick() {
-                    eprintln!("saving directory lists failed: {e}");
+                    warn(format!("saving directory lists failed: {e}"));
                 }
                 drop(store);
                 std::thread::sleep(Duration::from_millis(100));
