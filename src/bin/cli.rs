@@ -34,6 +34,9 @@ fn main() {
 
 fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
     let cmd = args.first().map(String::as_str).ok_or("usage: cloak <command> <dir> ...")?;
+    if let Some(out) = backup_command(cmd, args)? {
+        return Ok(out);
+    }
     let dir = args.get(1).ok_or("missing <dir>")?;
     let pass = env::var("CLOAK_PASSPHRASE").map_err(|_| "CLOAK_PASSPHRASE not set")?;
 
@@ -106,6 +109,59 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
         }
         other => Err(format!("unknown command: {other}").into()),
     }
+}
+
+/// Recovery backups (see `cloak::backup`). The backup's password comes from
+/// CLOAK_BACKUP_PASSPHRASE; restoring also needs the drive's own in
+/// CLOAK_PASSPHRASE.
+///
+///   backup <out-file> <name> <drive-dir> [<name> <drive-dir> ...]
+///   backup-list <file>              -> [{name, path, files}], plus created
+///   restore <file> <name> <drive-dir> -> {restored, kept, skipped}
+fn backup_command(cmd: &str, args: &[String]) -> Result<Option<String>, Box<dyn Error>> {
+    use cloak::backup;
+    use std::path::Path;
+    let backup_pass = || env::var("CLOAK_BACKUP_PASSPHRASE").map_err(|_| "CLOAK_BACKUP_PASSPHRASE not set");
+    Ok(Some(match cmd {
+        "backup" => {
+            let out = req(args, 1)?;
+            let pairs = &args[2..];
+            if pairs.is_empty() || pairs.len() % 2 != 0 {
+                return Err("usage: cloak backup <out-file> <name> <drive-dir> [...]".into());
+            }
+            let drives = pairs
+                .chunks(2)
+                .map(|p| backup::collect(&p[0], Path::new(&p[1])))
+                .collect::<Result<Vec<_>, _>>()?;
+            let files: usize = drives.iter().map(|d| d.files.len()).sum();
+            let count = drives.len();
+            backup::write(Path::new(&out), &backup_pass()?, drives)?;
+            serde_json::json!({ "ok": true, "drives": count, "files": files }).to_string()
+        }
+        "backup-list" => {
+            let b = backup::read(Path::new(&req(args, 1)?), &backup_pass()?)?;
+            let drives: Vec<_> = b
+                .drives
+                .iter()
+                .map(|d| serde_json::json!({ "name": d.name, "path": d.path, "files": d.files.len() }))
+                .collect();
+            serde_json::json!({ "created": b.created, "drives": drives }).to_string()
+        }
+        "restore" => {
+            let file = req(args, 1)?;
+            let name = req(args, 2)?;
+            let dir = req(args, 3)?;
+            let pass = env::var("CLOAK_PASSPHRASE").map_err(|_| "CLOAK_PASSPHRASE not set")?;
+            let b = backup::read(Path::new(&file), &backup_pass()?)?;
+            let drive = b
+                .drives
+                .iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| format!("no drive called {name} in that backup"))?;
+            serde_json::to_string(&backup::restore(Path::new(&dir), &pass, drive)?)?
+        }
+        _ => return Ok(None),
+    }))
 }
 
 fn ok() -> String {

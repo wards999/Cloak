@@ -90,6 +90,13 @@ pub fn part_name(i: usize) -> String {
     format!("manifest.p{i:02}.idx")
 }
 
+/// Does a file with this name hold (part of) a folder list? `manifest.idx`
+/// or one of its parts; not a side file or a sync tool's conflict copy.
+pub fn is_list_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == MANIFEST_NAME || is_part_name(&lower)
+}
+
 fn is_part_name(lower: &str) -> bool {
     lower.len() == 16
         && lower.starts_with("manifest.p")

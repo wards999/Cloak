@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -25,7 +26,7 @@ from qfluentwidgets import (
     Theme, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel,
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
     ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
-    RadioButton, SwitchButton,
+    RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -116,6 +117,27 @@ def _find(exe_base):
 
 
 CLI = _find("cloak")
+
+
+def engine(args, **env_vars):
+    """Run the `cloak` command line and return its JSON reply; raises
+    RuntimeError with its message on failure."""
+    env = os.environ.copy()
+    env.update(env_vars)
+    try:
+        proc = subprocess.run([CLI, *args], capture_output=True, text=True, env=env, **NO_WINDOW)
+    except OSError as e:
+        raise RuntimeError(f"the engine wasn't found ({e})")
+    out = (proc.stdout or "").strip()
+    try:
+        data = json.loads(out) if out else {}
+    except json.JSONDecodeError:
+        data = {}
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(data["error"])
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "the engine failed").strip())
+    return data
 
 
 def verify(path, password):
@@ -580,6 +602,195 @@ class AddExistingDialog(FocusedDialog):
         return True
 
 
+def _documents():
+    d = Path.home() / "Documents"
+    return d if d.is_dir() else Path.home()
+
+
+class BackupDialog(FocusedDialog):
+    """Back up the recovery files (drive header and folder lists) of
+    `drives` into one password-protected file."""
+
+    def __init__(self, parent, drives):
+        super().__init__(parent)
+        self.drives = drives
+        one = len(drives) == 1
+        title = f"Back up “{drives[0]['name']}”" if one else f"Back up all {len(drives)} drives"
+        self.titleLabel = SubtitleLabel(title, self)
+        what = CaptionLabel(
+            "Saves the files needed to open " + ("this drive" if one else "these drives")
+            + " if they're lost or damaged: the drive header and every folder list. "
+            "Not your files themselves; keep a normal backup of the drive's folder for "
+            "those. Store this somewhere other than the drive's own disk.", self)
+        what.setWordWrap(True)
+        stem = drives[0]["name"] if one else "cloak-drives"
+        self.out = LineEdit(self)
+        self.out.setText(str(_documents() / f"{stem} recovery {date.today().isoformat()}.cloakbak"))
+        self.pick = PushButton("Save as…", self)
+        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password for this backup")
+        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        row = QHBoxLayout(); row.addWidget(self.out); row.addWidget(self.pick)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(what)
+        self.viewLayout.addLayout(row)
+        self.viewLayout.addWidget(self.pw)
+        self.viewLayout.addWidget(self.pw2)
+        self.finish_layout()
+        self.yesButton.setText("Back up")
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(470)
+        self.pick.clicked.connect(self._choose)
+        self.pw2.returnPressed.connect(self.yesButton.click)
+        self.first = self.pw
+        self.busy_text = "Backing up…"
+        self.result = None
+
+    def _choose(self):
+        f, _ = QFileDialog.getSaveFileName(self, "Save the backup as", self.out.text(), "cloak backup (*.cloakbak)")
+        if f:
+            self.out.setText(os.path.normpath(f))
+
+    def validate(self):
+        out = self.out.text().strip()
+        if not out:
+            return self.problem("Choose where to save the backup.", self.out)
+        if not out.lower().endswith(".cloakbak"):
+            out += ".cloakbak"
+        if not os.path.isdir(os.path.dirname(os.path.abspath(out))):
+            return self.problem("That folder doesn't exist.", self.out)
+        if not self.pw.text():
+            return self.problem("Choose a password for the backup.", self.pw)
+        if self.pw.text() != self.pw2.text():
+            return self.problem("The passwords don't match.", self.pw2)
+        args = ["backup", out]
+        for d in self.drives:
+            args += [d["name"], d["path"]]
+        try:
+            self.result = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text())
+        except RuntimeError as e:
+            return self.problem(f"Couldn't make the backup: {e}", self.out)
+        self.result["file"] = out
+        return True
+
+
+class RestoreDialog(FocusedDialog):
+    """Put a drive's recovery files back from a backup. Only what's missing or
+    can't be read is replaced."""
+
+    def __init__(self, parent, known_drives, mounted):
+        super().__init__(parent)
+        self.known = known_drives
+        self.mounted = mounted
+        self.backup = None  # the backup's listing, once opened
+        self.titleLabel = SubtitleLabel("Restore from a backup", self)
+        what = CaptionLabel(
+            "Puts back a drive's header and folder lists where they're missing or "
+            "damaged. Anything still readable is left as it is.", self)
+        what.setWordWrap(True)
+        self.file = LineEdit(self); self.file.setPlaceholderText("Backup file (.cloakbak)")
+        self.pick = PushButton("Choose…", self)
+        self.bpw = PasswordLineEdit(self); self.bpw.setPlaceholderText("The backup's password")
+        self.combo = ComboBox(self)
+        self.target = LineEdit(self); self.target.setPlaceholderText("The drive's folder")
+        self.pick_target = PushButton("Choose folder…", self)
+        self.dpw = PasswordLineEdit(self); self.dpw.setPlaceholderText("The drive's password")
+        row = QHBoxLayout(); row.addWidget(self.file); row.addWidget(self.pick)
+        row2 = QHBoxLayout(); row2.addWidget(self.target); row2.addWidget(self.pick_target)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(what)
+        self.viewLayout.addLayout(row)
+        self.viewLayout.addWidget(self.bpw)
+        self.second = [self.combo, self.target, self.pick_target, self.dpw]
+        self.viewLayout.addWidget(self.combo)
+        self.viewLayout.addLayout(row2)
+        self.viewLayout.addWidget(self.dpw)
+        self.finish_layout()
+        for w in self.second:
+            w.hide()
+        self.yesButton.setText("Open backup")
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(470)
+        self.pick.clicked.connect(self._choose)
+        self.pick_target.clicked.connect(self._choose_target)
+        self.combo.currentIndexChanged.connect(self._drive_chosen)
+        self.bpw.returnPressed.connect(self.yesButton.click)
+        self.dpw.returnPressed.connect(self.yesButton.click)
+        self.first = self.pick
+        self.busy_text = "Working…"
+        self.result = None
+
+    def _choose(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Choose a backup", str(_documents()), "cloak backup (*.cloakbak)")
+        if f:
+            self.file.setText(os.path.normpath(f))
+            self.bpw.setFocus()
+
+    def _choose_target(self):
+        d = QFileDialog.getExistingDirectory(self, "The drive's folder", self.target.text())
+        if d:
+            self.target.setText(os.path.normpath(d))
+
+    def _drive_chosen(self, i):
+        if self.backup and 0 <= i < len(self.backup["drives"]):
+            d = self.backup["drives"][i]
+            # Where it is now, if it's in the list under that name; else where it was.
+            here = next((k["path"] for k in self.known if k["name"] == d["name"]), d["path"])
+            self.target.setText(os.path.normpath(here))
+
+    def validate(self):
+        if self.backup is None:
+            return self._open()
+        return self._restore()
+
+    def _open(self):
+        f = self.file.text().strip()
+        if not f:
+            return self.problem("Choose the backup file.", self.pick)
+        if not os.path.isfile(f):
+            return self.problem("That file doesn't exist.", self.file)
+        if not self.bpw.text():
+            return self.problem("Enter the backup's password.", self.bpw)
+        try:
+            self.backup = engine(["backup-list", f], CLOAK_BACKUP_PASSPHRASE=self.bpw.text())
+        except RuntimeError as e:
+            return self.problem(str(e)[:1].upper() + str(e)[1:] + ".", self.bpw)
+        if not self.backup.get("drives"):
+            self.backup = None
+            return self.problem("That backup has no drives in it.", self.file)
+        made = datetime.fromtimestamp(self.backup.get("created", 0)).strftime("%d %b %Y, %H:%M")
+        self.combo.clear()
+        self.combo.addItems([f"{d['name']}  (backed up {made})" for d in self.backup["drives"]])
+        for w in (self.file, self.pick, self.bpw):
+            w.setEnabled(False)
+        for w in self.second:
+            w.show()
+        self._drive_chosen(0)
+        self.yesButton.setText("Restore")
+        self.busy_text = "Restoring…"
+        self.dpw.setFocus()
+        return False  # stay open for step two
+
+    def _restore(self):
+        d = self.backup["drives"][self.combo.currentIndex()]
+        target = os.path.normpath(self.target.text().strip()) if self.target.text().strip() else ""
+        if not target:
+            return self.problem("Choose the drive's folder.", self.target)
+        if not os.path.isdir(target):
+            return self.problem("That folder doesn't exist.", self.target)
+        if target in self.mounted:
+            return self.problem("That drive is unlocked. Lock it first, then restore.", self.target)
+        if not self.dpw.text():
+            return self.problem("Enter the drive's password.", self.dpw)
+        try:
+            r = engine(["restore", self.file.text().strip(), d["name"], target],
+                       CLOAK_BACKUP_PASSPHRASE=self.bpw.text(), CLOAK_PASSPHRASE=self.dpw.text())
+        except RuntimeError as e:
+            field = self.dpw if "password" in str(e) else self.target
+            return self.problem(str(e)[:1].upper() + str(e)[1:] + ".", field)
+        self.result = {"name": d["name"], "path": target, **r}
+        return True
+
+
 # ---- drive card ------------------------------------------------------------
 
 class DriveCard(CardWidget):
@@ -613,6 +824,11 @@ class DriveCard(CardWidget):
             removeb = TransparentPushButton("Remove", self)
             removeb.clicked.connect(lambda: callbacks["remove"](drive))
             row.addWidget(unlockb); row.addStretch(1); row.addWidget(removeb)
+        backupb = TransparentToolButton(FIF.SAVE, self)
+        backupb.setToolTip("Back up this drive's recovery files")
+        backupb.installEventFilter(ToolTipFilter(backupb))
+        backupb.clicked.connect(lambda: callbacks["backup"](drive))
+        row.insertWidget(1, backupb)
         lay.addLayout(row)
 
 
@@ -655,7 +871,8 @@ class DrivesInterface(QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove}
+        cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove,
+               "backup": lambda d: self.back_up([d])}
         for d in self.drives:
             self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs))
 
@@ -761,6 +978,33 @@ class DrivesInterface(QWidget):
             time.sleep(0.1)
         return False
 
+    def back_up(self, drives):
+        if not drives:
+            return self.err("There are no drives to back up yet.")
+        dlg = BackupDialog(self.win, drives)
+        if not dlg.exec() or not dlg.result:
+            return
+        n = len(drives)
+        self.ok(f"Backed up {'the drive' if n == 1 else f'{n} drives'} to {dlg.result['file']}")
+
+    def restore(self):
+        dlg = RestoreDialog(self.win, self.drives, {os.path.normpath(p) for p in self.mounts})
+        if not dlg.exec() or not dlg.result:
+            return
+        r = dlg.result
+        if not any(os.path.normpath(d["path"]) == r["path"] for d in self.drives):
+            self.drives.insert(0, {"name": r["name"], "path": r["path"]})
+            save_drives(self.drives)
+            self.refresh()
+        if r["restored"]:
+            n = len(r["restored"])
+            msg = f"Restored {n} file{'s' if n != 1 else ''} to “{r['name']}”."
+        else:
+            msg = f"Nothing needed restoring: everything in “{r['name']}” is readable."
+        if r["skipped"]:
+            msg += f" {len(r['skipped'])} folder list(s) were skipped because those folders are gone."
+        self.ok(msg)
+
     def lock(self, drive):
         self._unmount(drive["path"])
         self.refresh()
@@ -852,6 +1096,23 @@ class SettingsInterface(QWidget):
         note = CaptionLabel(where, self)
         note.setWordWrap(True)
         lay.addWidget(note)
+
+        lay.addSpacing(10)
+        lay.addWidget(StrongBodyLabel("Recovery", self))
+        rec = CaptionLabel(
+            "If a drive's header or a folder list is lost or damaged, the drive (or that "
+            "folder) can't be opened. Back them up into a password-protected file and "
+            "restore from it if that happens. Each drive also has its own Back up button.",
+            self)
+        rec.setWordWrap(True)
+        lay.addWidget(rec)
+        brow = QHBoxLayout()
+        allb = PushButton(FIF.SAVE, "Back up all drives…", self)
+        allb.clicked.connect(lambda: win.drives.back_up(list(win.drives.drives)))
+        restb = PushButton(FIF.HISTORY, "Restore from a backup…", self)
+        restb.clicked.connect(win.drives.restore)
+        brow.addWidget(allb); brow.addWidget(restb); brow.addStretch(1)
+        lay.addLayout(brow)
 
         lay.addStretch(1)
 

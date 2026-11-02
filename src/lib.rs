@@ -25,6 +25,7 @@
 //! confidentiality guarantee: the body of each file stays plaintext on disk.
 //! See README.md for the threat model.
 
+pub mod backup;
 pub mod boring;
 pub mod crypto;
 pub mod dircache;

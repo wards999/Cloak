@@ -49,6 +49,21 @@ struct StoreMeta {
     verifier: Vec<u8>,
 }
 
+/// The key and region for `passphrase`, from the bytes of a store's
+/// `meta.json`. `InvalidData` if they aren't a store header,
+/// `PermissionDenied` if the passphrase is wrong.
+pub fn key_from_meta(meta: &[u8], passphrase: &str) -> io::Result<(Key, u64)> {
+    let meta: StoreMeta = serde_json::from_slice(meta)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("damaged drive header: {e}")))?;
+    let derived = key::derive_key(passphrase, &meta.salt);
+    let mut check = meta.verifier.clone();
+    transform_region(&derived, &meta.verifier_nonce, 0, &mut check);
+    if check != VERIFY_TOKEN {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong password"));
+    }
+    Ok((derived, meta.region))
+}
+
 /// What a path points at. The times are those of its boring file or directory
 /// on disk: the store records none of its own, and the disk already shows them
 /// to anyone looking at the backing folder, so passing them through reveals
@@ -330,18 +345,8 @@ impl Store {
         if !meta_path.exists() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
         }
-        let meta: StoreMeta = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
-        let derived = key::derive_key(passphrase, &meta.salt);
-
-        let mut check = meta.verifier.clone();
-        transform_region(&derived, &meta.verifier_nonce, 0, &mut check);
-        if check != VERIFY_TOKEN {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "wrong password",
-            ));
-        }
-        Self::open(backing_dir, derived, meta.region)
+        let (derived, region) = key_from_meta(&std::fs::read(&meta_path)?, passphrase)?;
+        Self::open(backing_dir, derived, region)
     }
 
     // ---- path resolution -------------------------------------------------
