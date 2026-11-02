@@ -30,6 +30,7 @@ APP_DIR = Path(__file__).resolve().parent
 FROZEN = getattr(sys, "frozen", False)
 EXE_DIR = Path(sys.executable).resolve().parent if FROZEN else APP_DIR
 CONFIG = Path.home() / ".cloak" / "drives.json"
+SETTINGS = Path.home() / ".cloak" / "settings.json"
 ICON = APP_DIR / "assets" / "icon.png"
 IS_WIN = sys.platform.startswith("win")
 # Engine calls from a windowed app would each flash a console window.
@@ -146,6 +147,43 @@ def save_drives(drives):
     try:
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(drives, indent=2))
+    except Exception:
+        pass
+
+
+# Remembered preferences. Earlier versions wrote the theme capitalised
+# ("System"), so names are matched without regard to case.
+THEMES = {"system": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
+
+
+def load_settings():
+    """{"theme": "system" | "light" | "dark", "auto_lock": bool}, with
+    defaults for anything missing or unreadable."""
+    try:
+        data = json.loads(SETTINGS.read_text())
+    except Exception:
+        data = {}
+    theme = str(data.get("theme", "system")).lower()
+    auto_lock = data.get("auto_lock", True)
+    return {
+        "theme": theme if theme in THEMES else "system",
+        "auto_lock": auto_lock if isinstance(auto_lock, bool) else True,
+    }
+
+
+def save_setting(key, value):
+    """Change one preference, keeping the others (and any this version
+    doesn't know about)."""
+    try:
+        data = json.loads(SETTINGS.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data[key] = value
+    try:
+        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS.write_text(json.dumps(data, indent=2))
     except Exception:
         pass
 
@@ -492,11 +530,11 @@ class SettingsInterface(QWidget):
         lay.addWidget(StrongBodyLabel("Appearance", self))
         lay.addWidget(CaptionLabel("Choose a theme.", self))
         group = QButtonGroup(self)
-        for label, theme in (("System", Theme.AUTO), ("Light", Theme.LIGHT), ("Dark", Theme.DARK)):
+        current = load_settings()["theme"]
+        for label, name in (("System", "system"), ("Light", "light"), ("Dark", "dark")):
             rb = RadioButton(label, self)
-            rb.clicked.connect(lambda _=False, t=theme: setTheme(t))
-            if theme == Theme.AUTO:
-                rb.setChecked(True)
+            rb.clicked.connect(lambda _=False, n=name: self.set_theme(n))
+            rb.setChecked(name == current)
             group.addButton(rb)
             lay.addWidget(rb)
 
@@ -507,12 +545,20 @@ class SettingsInterface(QWidget):
         row.addStretch(1)
         sw = SwitchButton(self)
         sw.setChecked(win.auto_lock)
-        sw.checkedChanged.connect(lambda v: setattr(win, "auto_lock", v))
+        sw.checkedChanged.connect(self.set_auto_lock)
         row.addWidget(sw)
         lay.addLayout(row)
         lay.addWidget(CaptionLabel("Drives always unmount on shutdown and when you quit.", self))
 
         lay.addStretch(1)
+
+    def set_theme(self, name):
+        setTheme(THEMES[name])
+        save_setting("theme", name)
+
+    def set_auto_lock(self, on):
+        self.win.auto_lock = on
+        save_setting("auto_lock", on)
 
 
 # ---- window ----------------------------------------------------------------
@@ -522,7 +568,7 @@ class Cloak(FluentWindow):
         super().__init__()
         self.setWindowTitle("cloak")
         self.resize(820, 560)
-        self.auto_lock = True
+        self.auto_lock = load_settings()["auto_lock"]
         self.drives = DrivesInterface(self)
         self.settings = SettingsInterface(self)
         self.addSubInterface(self.drives, FIF.FOLDER, "Drives")
@@ -553,7 +599,7 @@ def main():
             pass
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(ICON)))
-    setTheme(Theme.AUTO)
+    setTheme(THEMES[load_settings()["theme"]])
     setThemeColor(QColor("#13b3a4"))
     w = Cloak()
     install_power_hook(app, w.on_power)
