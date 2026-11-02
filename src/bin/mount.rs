@@ -510,11 +510,15 @@ mod imp {
             }
         }
 
+        /// The drive's size and free space are those of the disk its folder is
+        /// on: its files are ordinary files there, and nothing is set aside, so
+        /// whatever else is on that disk shares the same free space.
         fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-            // Nominal sizes, as on Windows. Finder refuses to copy onto a volume
-            // reporting zero free space, which is fuser's default.
-            let total = (1u64 << 40) / BLOCK;
-            let free = (1u64 << 39) / BLOCK;
+            let dir = self.reader().backing_dir().to_path_buf();
+            // Nominal sizes if the disk can't be asked: Finder refuses to copy
+            // onto a volume reporting no free space (fuser's default).
+            let (total, free) = disk_space(&dir).unwrap_or((1 << 40, 1 << 39));
+            let (total, free) = (total / BLOCK, free / BLOCK);
             reply.statfs(total, free, free, 1 << 20, 1 << 20, BLOCK as u32, 255, BLOCK as u32);
         }
 
@@ -579,6 +583,20 @@ mod imp {
         fn fsyncdir(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
             reply.ok();
         }
+    }
+
+    /// Total size and space free to this user, in bytes, of the disk holding
+    /// `dir`.
+    fn disk_space(dir: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: statvfs fills the zeroed struct; checked for failure below.
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut s) } != 0 {
+            return None;
+        }
+        let unit = s.f_frsize as u64;
+        Some((s.f_blocks as u64 * unit, s.f_bavail as u64 * unit))
     }
 
     /// Print a line, ignoring failure. Started by the desktop app, the adapter

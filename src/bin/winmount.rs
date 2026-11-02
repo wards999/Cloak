@@ -597,12 +597,39 @@ mod imp {
             }
         }
 
+        /// The drive's size and free space are those of the disk its folder is
+        /// on: its files are ordinary files there, and nothing is set aside, so
+        /// whatever else is on that disk shares the same free space.
+        ///
+        /// WinFsp keeps the answer until something is written to the drive (it
+        /// then asks again); with file data cached by Windows, a separate
+        /// volume-info timeout isn't honoured. So space used on that disk by
+        /// other programs shows up at the next write here, or on remount.
         fn get_volume_info(&self, out: &mut VolumeInfo) -> FspResult<()> {
-            out.total_size = 1 << 40; // 1 TiB nominal
-            out.free_size = 1 << 39; // 512 GiB nominal
+            let dir = self.reader().backing_dir().to_path_buf();
+            // Nominal sizes if the disk can't be asked: Explorer refuses to copy
+            // onto a drive that reports no free space.
+            let (total, free) = disk_space(&dir).unwrap_or((1 << 40, 1 << 39));
+            out.total_size = total;
+            out.free_size = free;
             out.set_volume_label("cloak");
             Ok(())
         }
+    }
+
+    /// Total size and space free to this user, in bytes, of the disk holding
+    /// `dir`.
+    fn disk_space(dir: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(dir: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+        }
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+        let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+        // SAFETY: a NUL-terminated path and three valid out-pointers.
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+        (ok != 0).then_some((total, available))
     }
 
     /// Print a line, ignoring failure. Started by the desktop app, the adapter

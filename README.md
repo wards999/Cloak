@@ -152,6 +152,16 @@ any other folder, such as a USB stick, to run it portably.
 - Passwords are never stored. Each drive's own folder holds everything needed
   to open it.
 
+## Size and free space
+
+A mounted drive reports the size and free space of the disk its folder is on.
+Nothing is reserved: the drive's files are ordinary files in that folder, so
+the drive grows as you add to it and shares its free space with everything
+else on that disk. A drive whose folder is on C: shows C:'s numbers, and
+copying 1 GB into it uses 1 GB of C:. On Windows the free space shown updates
+whenever something is written to the drive; space used on the same disk by
+other programs shows up then, or on remount.
+
 ## Recovery backups
 
 Two kinds of file matter most: a drive's `meta.json` (without it no password

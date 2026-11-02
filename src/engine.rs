@@ -349,6 +349,11 @@ impl Store {
         Self::open(backing_dir, derived, region)
     }
 
+    /// The folder the drive lives in.
+    pub fn backing_dir(&self) -> &Path {
+        &self.backing_dir
+    }
+
     // ---- path resolution -------------------------------------------------
 
     /// Resolve a sequence of directory components to their on-disk path.
