@@ -43,9 +43,10 @@ NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
 # Cloak is portable: its drive list and settings live in a `cloak-data` folder
 # next to the app (beside Cloak.exe, or beside Cloak.app on macOS, since writing
 # inside a signed app bundle would break its signature), so the whole thing can
-# travel on a USB stick. If that folder can't be written (the app is in Program
-# Files or /Applications, or macOS is running it from a read-only quarantine
-# copy) it falls back to ~/.cloak, which is where earlier versions kept it.
+# travel on a USB stick. An app installed the usual macOS way, in Applications,
+# keeps them in ~/.cloak instead, as does one whose folder can't be written
+# (Program Files, or a read-only quarantine copy); that's also where earlier
+# versions kept them.
 
 LEGACY_DIR = Path.home() / ".cloak"
 
@@ -68,8 +69,18 @@ def _writable(d):
         return False
 
 
+def _installed():
+    """Is this a macOS app installed in an Applications folder?"""
+    if not (FROZEN and sys.platform == "darwin"):
+        return False
+    home = _app_home()
+    return home in (Path("/Applications"), Path.home() / "Applications")
+
+
 def _data_dir():
     """(folder, portable?) for the drive list and settings."""
+    if _installed():
+        return LEGACY_DIR, False
     d = _app_home() / "cloak-data"
     if not _writable(d):
         return LEGACY_DIR, False
@@ -687,6 +698,12 @@ class SettingsInterface(QWidget):
         lay.addWidget(StrongBodyLabel("Storage", self))
         if PORTABLE:
             where = f"Your drive list and settings are kept with the app, in {DATA_DIR}."
+        elif _installed():
+            where = (
+                f"Cloak is installed in Applications, so your drive list and settings are "
+                f"kept in {DATA_DIR}. To keep them with the app instead (on a USB stick, "
+                f"say), run Cloak from any other folder."
+            )
         else:
             where = (
                 f"The app's folder can't be written to, so your drive list and settings are "
