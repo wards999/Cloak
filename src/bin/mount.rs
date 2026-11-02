@@ -522,8 +522,10 @@ mod imp {
             reply.statfs(total, free, free, 1 << 20, 1 << 20, BLOCK as u32, 255, BLOCK as u32);
         }
 
-        // Extended attributes aren't stored. Answer like a filesystem without
-        // any rather than ENOSYS, which makes Finder abort copies with -36.
+        // Extended attributes aren't stored. Reads answer like a filesystem
+        // without any rather than ENOSYS, which makes Finder abort copies with
+        // -36; writes are accepted and dropped, since refusing them fails the
+        // copy (or sends Finder to ._* files, which are refused too).
         fn getxattr(&mut self, _req: &Request, _ino: u64, _name: &OsStr, _size: u32, reply: ReplyXattr) {
             reply.error(NO_XATTR);
         }
@@ -546,7 +548,7 @@ mod imp {
             _position: u32,
             reply: ReplyEmpty,
         ) {
-            reply.error(libc::ENOTSUP);
+            reply.ok();
         }
 
         fn removexattr(&mut self, _req: &Request, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
@@ -655,10 +657,12 @@ mod imp {
                 .map_or_else(|| "cloak".into(), |n| n.to_string_lossy().into_owned());
             options.extend([
                 MountOption::CUSTOM(format!("volname={volname}")),
-                // Keep Finder's ._* / .DS_Store files and com.apple.* xattrs out
-                // of the store (they'd appear as junk files on Windows).
+                // Keep Finder's ._* / .DS_Store files out of the store (they'd
+                // appear as junk files on Windows). Not `noapplexattr`: it
+                // refuses com.apple.* attributes with EPERM, which nearly every
+                // file carries, so Finder copies failed with "you don't have
+                // permission"; setxattr discards them instead.
                 MountOption::CUSTOM("noappledouble".into()),
-                MountOption::CUSTOM("noapplexattr".into()),
             ]);
         }
 
