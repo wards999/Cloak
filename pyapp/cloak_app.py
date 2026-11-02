@@ -390,6 +390,8 @@ class FocusedDialog(MessageBoxBase):
         self.error = CaptionLabel("", self)
         self.error.setStyleSheet("color: #d13438;")
         self.error.setWordWrap(True)
+        # Selectable, so a message can be copied into a bug report.
+        self.error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.error.hide()
         # Route the main button through validate() rather than straight to
         # accept(), which is all the library's own handler does.
@@ -959,9 +961,11 @@ class DrivesInterface(QWidget):
             except Exception:
                 pass
             errors.seek(0)
-            lines = [l for l in errors.read().decode(errors="replace").splitlines() if l.strip()]
-            detail = lines[-1].strip() if lines else "the mount driver stopped without saying why"
-            return f"Couldn't mount the drive: {detail}"
+            # Everything the driver said: the system's own reason (from macFUSE
+            # or WinFsp) usually comes before the driver's summary line.
+            lines = [l.strip() for l in errors.read().decode(errors="replace").splitlines() if l.strip()]
+            detail = "\n".join(lines)[-1500:] if lines else "the mount driver stopped without saying why"
+            return f"Couldn't mount the drive:\n{detail}"
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
         return None
 

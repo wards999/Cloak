@@ -663,7 +663,12 @@ mod imp {
         }
 
         let session = fuser::spawn_mount2(fs, &mount_point, &options).unwrap_or_else(|e| {
-            fail(format!("couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}"))
+            // macFUSE prints its own reason (if any) before this; the options
+            // tried help pin down which one it objected to.
+            fail(format!(
+                "couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}\n\
+                 mount options tried: {options:?}"
+            ))
         });
         say(format!("mounted {store_dir} at {mount_point}; press Enter (or close stdin) to unmount"));
 
