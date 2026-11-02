@@ -581,22 +581,43 @@ mod imp {
         }
     }
 
+    /// Print a line, ignoring failure. Started by the desktop app, the adapter
+    /// can have nowhere to print, and `println!` would abort the mount over
+    /// it.
+    fn say(msg: impl std::fmt::Display) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{msg}");
+    }
+
+    /// The same for errors (the desktop app shows these if the mount fails).
+    fn warn(msg: impl std::fmt::Display) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+
+    /// Report `msg` and exit.
+    fn fail(msg: impl std::fmt::Display) -> ! {
+        warn(msg);
+        std::process::exit(1)
+    }
+
     pub fn run() {
         let mut args = std::env::args().skip(1);
         let (store_dir, mount_point) = match (args.next(), args.next()) {
             (Some(a), Some(b)) => (a, b),
             _ => {
-                eprintln!("usage: cloak-mount <backing-store-dir> <mount-point>");
+                warn("usage: cloak-mount <backing-store-dir> <mount-point>");
                 std::process::exit(2);
             }
         };
 
         // Passphrase from the environment keeps it off the command line / argv.
         let passphrase = std::env::var("CLOAK_PASSPHRASE").unwrap_or_else(|_| {
-            eprintln!("set CLOAK_PASSPHRASE to the store passphrase");
+            warn("set CLOAK_PASSPHRASE to the store passphrase");
             std::process::exit(2);
         });
-        let store = Store::open_with_passphrase(&store_dir, &passphrase).expect("open store");
+        let store = Store::open_with_passphrase(&store_dir, &passphrase)
+            .unwrap_or_else(|e| fail(format!("couldn't open the drive: {e}")));
         let store = Arc::new(RwLock::new(store));
         saver(&store);
         let fs = CloakFs {
@@ -623,8 +644,10 @@ mod imp {
             ]);
         }
 
-        let session = fuser::spawn_mount2(fs, &mount_point, &options).expect("mount failed");
-        println!("mounted {store_dir} at {mount_point}; press Enter (or close stdin) to unmount");
+        let session = fuser::spawn_mount2(fs, &mount_point, &options).unwrap_or_else(|e| {
+            fail(format!("couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}"))
+        });
+        say(format!("mounted {store_dir} at {mount_point}; press Enter (or close stdin) to unmount"));
 
         // Hold the mount until stdin closes, like cloak-winmount: the app locks
         // a drive by closing our stdin. (macFUSE has no auto-unmount on exit, so
@@ -634,7 +657,7 @@ mod imp {
         drop(session); // unmounts
         let saved = lock(&store).sync();
         if let Err(e) = saved {
-            eprintln!("saving on unmount failed: {e}");
+            warn(format!("saving on unmount failed: {e}"));
         }
     }
 
@@ -681,7 +704,7 @@ mod imp {
         std::thread::spawn(move || {
             while let Some(store) = store.upgrade() {
                 if let Err(e) = lock(&store).tick() {
-                    eprintln!("saving directory lists failed: {e}");
+                    warn(format!("saving directory lists failed: {e}"));
                 }
                 drop(store);
                 std::thread::sleep(Duration::from_millis(100));
