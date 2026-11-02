@@ -16,7 +16,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QVBoxLayout, QWidget,
@@ -390,6 +390,8 @@ class FocusedDialog(MessageBoxBase):
         self.error = CaptionLabel("", self)
         self.error.setStyleSheet("color: #d13438;")
         self.error.setWordWrap(True)
+        # Selectable, so a message can be copied into a bug report.
+        self.error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.error.hide()
         # Route the main button through validate() rather than straight to
         # accept(), which is all the library's own handler does.
@@ -959,9 +961,11 @@ class DrivesInterface(QWidget):
             except Exception:
                 pass
             errors.seek(0)
-            lines = [l for l in errors.read().decode(errors="replace").splitlines() if l.strip()]
-            detail = lines[-1].strip() if lines else "the mount driver stopped without saying why"
-            return f"Couldn't mount the drive: {detail}"
+            # Everything the driver said: the system's own reason (from macFUSE
+            # or WinFsp) usually comes before the driver's summary line.
+            lines = [l.strip() for l in errors.read().decode(errors="replace").splitlines() if l.strip()]
+            detail = "\n".join(lines)[-1500:] if lines else "the mount driver stopped without saying why"
+            return f"Couldn't mount the drive:\n{detail}"
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
         return None
 
@@ -1132,6 +1136,7 @@ class Cloak(FluentWindow):
         super().__init__()
         self.setWindowTitle("cloak")
         self.resize(820, 560)
+        self.navigationInterface.setReturnButtonVisible(False)
         self.auto_lock = load_settings()["auto_lock"]
         self.drives = DrivesInterface(self)
         self.settings = SettingsInterface(self)
@@ -1148,6 +1153,13 @@ class Cloak(FluentWindow):
         self.drives.lock_all()
         super().closeEvent(e)
 
+    def systemTitleBarRect(self, size):
+        # Where macOS's traffic lights go. The widget library puts them top
+        # right, clear of its back and menu buttons; Mac windows have them top
+        # left, so they go just right of the menu button (the back button is
+        # hidden: two pages need no history).
+        return QRect(52, 0 if self.isFullScreen() else 8, 75, size.height())
+
 
 def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -1162,7 +1174,11 @@ def main():
         except Exception:
             pass
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(str(ICON)))
+    # On macOS the window icon also replaces the Dock icon, and this PNG is
+    # cropped edge to edge for Windows; the app bundle's .icns has the
+    # margin macOS icons are drawn with, so a packaged Mac app keeps that.
+    if not (FROZEN and sys.platform == "darwin"):
+        app.setWindowIcon(QIcon(str(ICON)))
     setTheme(THEMES[load_settings()["theme"]])
     setThemeColor(QColor("#13b3a4"))
     w = Cloak()

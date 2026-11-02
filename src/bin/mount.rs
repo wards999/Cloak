@@ -39,10 +39,20 @@ mod imp {
     };
     use std::ffi::OsStr;
     use std::io;
-    use std::sync::{mpsc, Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+    use std::sync::{
+        mpsc, Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    };
     use std::time::{Duration, SystemTime};
 
-    const TTL: Duration = Duration::from_secs(1);
+    /// How long the kernel may reuse a name lookup without asking. Kept
+    /// short: it caches each spelling separately while the store's names are
+    /// case-insensitive, so a deleted `a.txt` can linger as `A.txt` this long.
+    const ENTRY_TTL: Duration = Duration::from_secs(5);
+    /// How long the kernel may reuse a file's details without asking. Every
+    /// change goes through this mount and the kernel keeps its copy current
+    /// for its own changes (the Windows adapter's cache never expires), so
+    /// this can be long; Finder otherwise re-asks for every item it shows.
+    const ATTR_TTL: Duration = Duration::from_secs(60);
     const BLOCK: u64 = 4096;
 
     /// "No such attribute": ENOATTR on macOS, ENODATA on Linux.
@@ -92,18 +102,33 @@ mod imp {
     }
 
     struct CloakFs {
-        /// Reads, lookups and listings can run side by side, changes one at a
-        /// time. Shared with the read workers and with the thread that saves
-        /// directory lists (`saver`).
-        store: Arc<RwLock<Store>>,
-        /// Threads that run reads (fuser hands us one request at a time).
+        shared: Shared,
+        /// Threads that run reads, lookups and listings (fuser hands us one
+        /// request at a time).
         workers: Workers,
-        inodes: Inodes,
+    }
+
+    impl std::ops::Deref for CloakFs {
+        type Target = Shared;
+        fn deref(&self) -> &Shared {
+            &self.shared
+        }
+    }
+
+    /// What the request handlers work on, shared with the workers. The store
+    /// and the inode table have a lock each, never held together.
+    #[derive(Clone)]
+    struct Shared {
+        /// Reads, lookups and listings can run side by side, changes one at a
+        /// time. Also shared with the thread that saves directory lists
+        /// (`saver`).
+        store: Arc<RwLock<Store>>,
+        inodes: Arc<Mutex<Inodes>>,
         uid: u32,
         gid: u32,
     }
 
-    impl CloakFs {
+    impl Shared {
         fn store(&self) -> RwLockWriteGuard<'_, Store> {
             lock(&self.store)
         }
@@ -111,6 +136,10 @@ mod imp {
         /// The store for a call that changes nothing (runs alongside reads).
         fn reader(&self) -> RwLockReadGuard<'_, Store> {
             self.store.read().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn inodes(&self) -> MutexGuard<'_, Inodes> {
+            self.inodes.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
         fn attr(&self, ino: u64, m: Metadata) -> FileAttr {
@@ -135,7 +164,7 @@ mod imp {
 
         /// Path and metadata for an inode.
         fn node(&self, ino: u64) -> Result<(String, Metadata), i32> {
-            let path = self.inodes.path(ino).ok_or(libc::ENOENT)?.to_string();
+            let path = self.inodes().path(ino).ok_or(libc::ENOENT)?.to_string();
             let m = self
                 .reader()
                 .metadata(&path)
@@ -146,13 +175,14 @@ mod imp {
 
         /// Logical path of `name` inside directory `parent`.
         fn child(&self, parent: u64, name: &OsStr) -> Result<String, i32> {
-            let dir = self.inodes.path(parent).ok_or(libc::ENOENT)?;
             let name = name.to_str().ok_or(libc::EINVAL)?;
+            let inodes = self.inodes();
+            let dir = inodes.path(parent).ok_or(libc::ENOENT)?;
             Ok(join(dir, name))
         }
 
         /// Look up an existing path: its stored spelling, inode and attributes.
-        fn entry(&mut self, path: &str) -> Result<FileAttr, i32> {
+        fn entry(&self, path: &str) -> Result<FileAttr, i32> {
             let m = self
                 .reader()
                 .metadata(path)
@@ -164,7 +194,7 @@ mod imp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| path.to_string());
-            let ino = self.inodes.ino(&canonical);
+            let ino = self.inodes().ino(&canonical);
             Ok(self.attr(ino, m))
         }
 
@@ -175,21 +205,66 @@ mod imp {
                 .flatten()
                 .unwrap_or_else(|| path.to_string())
         }
+
+        /// Answer a readdir: directory `ino`'s entries from `offset` on.
+        fn list(&self, ino: u64, offset: i64, mut reply: ReplyDirectory) {
+            let Some(dir) = self.inodes().path(ino).map(str::to_string) else {
+                return reply.error(libc::ENOENT);
+            };
+            let mut children = match self.reader().list_entries(&dir) {
+                Ok(c) => c,
+                Err(e) => return reply.error(errno(&e)),
+            };
+            // Stable order so a listing resumed at `offset` doesn't skip or repeat.
+            children.sort_by_cached_key(|e| cloak::names::fold(&e.name));
+
+            let mut inodes = self.inodes();
+            let parent_ino = if ino == ROOT_INO {
+                ROOT_INO
+            } else {
+                inodes.ino(parent_of(&dir))
+            };
+            let mut entries = vec![
+                (ino, FileType::Directory, ".".to_string()),
+                (parent_ino, FileType::Directory, "..".to_string()),
+            ];
+            for e in children {
+                let child_ino = inodes.ino(&join(&dir, &e.name));
+                let kind = if e.is_dir { FileType::Directory } else { FileType::RegularFile };
+                entries.push((child_ino, kind, e.name));
+            }
+            drop(inodes);
+            for (i, (child_ino, kind, name)) in
+                entries.into_iter().enumerate().skip(offset.max(0) as usize)
+            {
+                if reply.add(child_ino, (i + 1) as i64, kind, &name) {
+                    break; // reply buffer full; the kernel resumes at this offset
+                }
+            }
+            reply.ok();
+        }
     }
 
     impl Filesystem for CloakFs {
+        // Lookups, details and listings change nothing in the store, so like
+        // reads they run on the workers, side by side, and a slow one doesn't
+        // hold up the requests queued behind it.
+
         fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-            match self.child(parent, name).and_then(|p| self.entry(&p)) {
-                Ok(attr) => reply.entry(&TTL, &attr, 0),
+            let s = self.shared.clone();
+            let name = name.to_owned();
+            self.workers.run(move || match s.child(parent, &name).and_then(|p| s.entry(&p)) {
+                Ok(attr) => reply.entry(&ENTRY_TTL, &attr, 0),
                 Err(e) => reply.error(e),
-            }
+            });
         }
 
-        fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-            match self.node(ino) {
-                Ok((_, m)) => reply.attr(&TTL, &self.attr(ino, m)),
+        fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+            let s = self.shared.clone();
+            self.workers.run(move || match s.node(ino) {
+                Ok((_, m)) => reply.attr(&ATTR_TTL, &s.attr(ino, m)),
                 Err(e) => reply.error(e),
-            }
+            });
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -239,7 +314,7 @@ mod imp {
                 }
             }
             match self.node(ino) {
-                Ok((_, m)) => reply.attr(&TTL, &self.attr(ino, m)),
+                Ok((_, m)) => reply.attr(&ATTR_TTL, &self.attr(ino, m)),
                 Err(e) => reply.error(e),
             }
         }
@@ -261,7 +336,7 @@ mod imp {
                 self.entry(&path)
             });
             match result {
-                Ok(attr) => reply.entry(&TTL, &attr, 0),
+                Ok(attr) => reply.entry(&ENTRY_TTL, &attr, 0),
                 Err(e) => reply.error(e),
             }
         }
@@ -292,7 +367,7 @@ mod imp {
                 Ok((self.entry(&path)?, fh))
             });
             match result {
-                Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
+                Ok((attr, fh)) => reply.created(&ENTRY_TTL, &attr, 0, fh, 0),
                 Err(e) => reply.error(e),
             }
         }
@@ -364,11 +439,12 @@ mod imp {
         }
 
         fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-            match self.node(ino) {
+            let s = self.shared.clone();
+            self.workers.run(move || match s.node(ino) {
                 Ok((_, m)) if m.is_dir => reply.opened(0, 0),
                 Ok(_) => reply.error(libc::ENOTDIR),
                 Err(e) => reply.error(e),
-            }
+            });
         }
 
         fn readdir(
@@ -377,40 +453,10 @@ mod imp {
             ino: u64,
             _fh: u64,
             offset: i64,
-            mut reply: ReplyDirectory,
+            reply: ReplyDirectory,
         ) {
-            let Some(dir) = self.inodes.path(ino).map(str::to_string) else {
-                return reply.error(libc::ENOENT);
-            };
-            let mut children = match self.reader().list_entries(&dir) {
-                Ok(c) => c,
-                Err(e) => return reply.error(errno(&e)),
-            };
-            // Stable order so a listing resumed at `offset` doesn't skip or repeat.
-            children.sort_by_cached_key(|e| cloak::names::fold(&e.name));
-
-            let parent_ino = if ino == ROOT_INO {
-                ROOT_INO
-            } else {
-                self.inodes.ino(parent_of(&dir))
-            };
-            let mut entries = vec![
-                (ino, FileType::Directory, ".".to_string()),
-                (parent_ino, FileType::Directory, "..".to_string()),
-            ];
-            for e in children {
-                let child_ino = self.inodes.ino(&join(&dir, &e.name));
-                let kind = if e.is_dir { FileType::Directory } else { FileType::RegularFile };
-                entries.push((child_ino, kind, e.name));
-            }
-            for (i, (child_ino, kind, name)) in
-                entries.into_iter().enumerate().skip(offset.max(0) as usize)
-            {
-                if reply.add(child_ino, (i + 1) as i64, kind, &name) {
-                    break; // reply buffer full; the kernel resumes at this offset
-                }
-            }
-            reply.ok();
+            let s = self.shared.clone();
+            self.workers.run(move || s.list(ino, offset, reply));
         }
 
         fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -427,7 +473,7 @@ mod imp {
                     Some(_) => {
                         let canonical = self.canonical(&path);
                         self.store().remove(&path).map_err(|e| errno(&e))?;
-                        self.inodes.forget(&canonical);
+                        self.inodes().forget(&canonical);
                         Ok(())
                     }
                 }
@@ -454,7 +500,7 @@ mod imp {
                 }
                 let canonical = self.canonical(&path);
                 self.store().remove(&path).map_err(|e| errno(&e))?;
-                self.inodes.forget(&canonical);
+                self.inodes().forget(&canonical);
                 Ok(())
             });
             match result {
@@ -497,11 +543,11 @@ mod imp {
                     let new_canonical = self.canonical(&new);
                     self.store().rename_replace(&old, &new).map_err(|e| errno(&e))?;
                     if replaced {
-                        self.inodes.forget(&new_canonical);
+                        self.inodes().forget(&new_canonical);
                     }
                 }
                 let new_canonical = self.canonical(&new);
-                self.inodes.rename(&old_canonical, &new_canonical);
+                self.inodes().rename(&old_canonical, &new_canonical);
                 Ok(())
             })();
             match result {
@@ -522,8 +568,10 @@ mod imp {
             reply.statfs(total, free, free, 1 << 20, 1 << 20, BLOCK as u32, 255, BLOCK as u32);
         }
 
-        // Extended attributes aren't stored. Answer like a filesystem without
-        // any rather than ENOSYS, which makes Finder abort copies with -36.
+        // Extended attributes aren't stored. Reads answer like a filesystem
+        // without any rather than ENOSYS, which makes Finder abort copies with
+        // -36; writes are accepted and dropped, since refusing them fails the
+        // copy (or sends Finder to ._* files, which are refused too).
         fn getxattr(&mut self, _req: &Request, _ino: u64, _name: &OsStr, _size: u32, reply: ReplyXattr) {
             reply.error(NO_XATTR);
         }
@@ -546,7 +594,7 @@ mod imp {
             _position: u32,
             reply: ReplyEmpty,
         ) {
-            reply.error(libc::ENOTSUP);
+            reply.ok();
         }
 
         fn removexattr(&mut self, _req: &Request, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
@@ -638,12 +686,14 @@ mod imp {
             .unwrap_or_else(|e| fail(format!("couldn't open the drive: {e}")));
         let store = Arc::new(RwLock::new(store));
         saver(&store);
-        let fs = CloakFs {
-            store: store.clone(),
-            workers: Workers::new(4),
-            inodes: Inodes::default(),
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+        let new_fs = || CloakFs {
+            shared: Shared {
+                store: store.clone(),
+                inodes: Arc::new(Mutex::new(Inodes::default())),
+                uid: unsafe { libc::getuid() },
+                gid: unsafe { libc::getgid() },
+            },
+            workers: Workers::new(8),
         };
 
         #[allow(unused_mut)]
@@ -655,16 +705,32 @@ mod imp {
                 .map_or_else(|| "cloak".into(), |n| n.to_string_lossy().into_owned());
             options.extend([
                 MountOption::CUSTOM(format!("volname={volname}")),
-                // Keep Finder's ._* / .DS_Store files and com.apple.* xattrs out
-                // of the store (they'd appear as junk files on Windows).
+                // Keep Finder's ._* / .DS_Store files out of the store (they'd
+                // appear as junk files on Windows). Not `noapplexattr`: it
+                // refuses com.apple.* attributes with EPERM, which nearly every
+                // file carries, so Finder copies failed with "you don't have
+                // permission"; setxattr discards them instead.
                 MountOption::CUSTOM("noappledouble".into()),
-                MountOption::CUSTOM("noapplexattr".into()),
             ]);
         }
 
-        let session = fuser::spawn_mount2(fs, &mount_point, &options).unwrap_or_else(|e| {
-            fail(format!("couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}"))
-        });
+        let mounted = match fuser::spawn_mount2(new_fs(), &mount_point, &options) {
+            Ok(session) => Mounted::Fuser(session),
+            // macFUSE 5.3+ no longer supports the call fuser mounts with
+            // (fuser#752); its regular libfuse mount still works.
+            #[cfg(target_os = "macos")]
+            Err(e) => macfuse::mount(new_fs(), &mount_point, &options).unwrap_or_else(|e2| {
+                fail(format!(
+                    "couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}; then {e2}\n\
+                     mount options tried: {options:?}"
+                ))
+            }),
+            #[cfg(not(target_os = "macos"))]
+            Err(e) => fail(format!(
+                "couldn't mount at {mount_point} (is FUSE installed?): {e}\n\
+                 mount options tried: {options:?}"
+            )),
+        };
         say(format!("mounted {store_dir} at {mount_point}; press Enter (or close stdin) to unmount"));
 
         // Hold the mount until stdin closes, like cloak-winmount: the app locks
@@ -672,10 +738,115 @@ mod imp {
         // this explicit unmount is what keeps a lock from leaving a stale mount.)
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
-        drop(session); // unmounts
+        match mounted {
+            Mounted::Fuser(session) => drop(session), // unmounts
+            #[cfg(target_os = "macos")]
+            Mounted::Channel(m) => m.unmount(&mount_point),
+        }
         let saved = lock(&store).sync();
         if let Err(e) = saved {
             warn(format!("saving on unmount failed: {e}"));
+        }
+    }
+
+    /// A live mount, made by whichever route worked.
+    enum Mounted {
+        Fuser(fuser::BackgroundSession),
+        #[cfg(target_os = "macos")]
+        Channel(macfuse::Channel),
+    }
+
+    /// Mounting through macFUSE's own libfuse calls, for macFUSE 5.3 and
+    /// later where fuser's mount call fails without a reason (fuser#752):
+    /// `fuse_mount` makes the mount, and fuser serves its device handle.
+    #[cfg(target_os = "macos")]
+    mod macfuse {
+        use super::CloakFs;
+        use fuser::{MountOption, Session, SessionACL};
+        use libc::{c_char, c_int, c_void};
+        use std::ffi::CString;
+        use std::io;
+        use std::os::fd::{BorrowedFd, OwnedFd};
+
+        #[repr(C)]
+        struct FuseArgs {
+            argc: c_int,
+            argv: *const *const c_char,
+            allocated: c_int,
+        }
+
+        // libfuse 2, which fuser already links.
+        extern "C" {
+            fn fuse_mount(mountpoint: *const c_char, args: *mut FuseArgs) -> *mut c_void;
+            fn fuse_chan_fd(ch: *mut c_void) -> c_int;
+            fn fuse_chan_destroy(ch: *mut c_void);
+        }
+
+        /// The mount's libfuse channel, and fuser serving it in the background.
+        pub struct Channel {
+            ch: *mut c_void,
+            _session: fuser::BackgroundSession,
+        }
+
+        pub fn mount(fs: CloakFs, mount_point: &str, options: &[MountOption]) -> io::Result<super::Mounted> {
+            let opts: Vec<String> = options
+                .iter()
+                .map(|o| match o {
+                    MountOption::FSName(name) => format!("fsname={name}"),
+                    MountOption::CUSTOM(o) => o.clone(),
+                    other => format!("{other:?}").to_lowercase(),
+                })
+                .collect();
+            let argv_owned = [c"cloak".to_owned(), c"-o".to_owned(), cstr(&opts.join(","))?];
+            let argv: Vec<*const c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
+            let mut args = FuseArgs { argc: argv.len() as c_int, argv: argv.as_ptr(), allocated: 0 };
+            let path = cstr(mount_point)?;
+
+            // SAFETY: the strings outlive the call; a null channel is a failure.
+            let ch = unsafe { fuse_mount(path.as_ptr(), &mut args) };
+            if ch.is_null() {
+                return Err(io::Error::other("macFUSE's fuse_mount failed"));
+            }
+            // The channel keeps its descriptor, so fuser gets its own copy.
+            // SAFETY: a live channel's descriptor stays open until it's destroyed.
+            let fd = unsafe { fuse_chan_fd(ch) };
+            let owned: io::Result<OwnedFd> = if fd < 0 {
+                Err(io::Error::other("macFUSE gave no device for the mount"))
+            } else {
+                unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+            };
+            let session = owned.and_then(|fd| Session::from_fd(fs, fd, SessionACL::Owner).spawn());
+            match session {
+                Ok(session) => Ok(super::Mounted::Channel(Channel { ch, _session: session })),
+                Err(e) => {
+                    unmount_path(&path);
+                    // SAFETY: the channel is live and released exactly once.
+                    unsafe { fuse_chan_destroy(ch) };
+                    Err(e)
+                }
+            }
+        }
+
+        impl Channel {
+            /// Unmount, which ends fuser's loop, then release the channel.
+            pub fn unmount(self, mount_point: &str) {
+                if let Ok(path) = cstr(mount_point) {
+                    unmount_path(&path);
+                }
+                // SAFETY: the channel is live and released exactly once.
+                unsafe { fuse_chan_destroy(self.ch) };
+            }
+        }
+
+        fn unmount_path(path: &CString) {
+            // SAFETY: a valid C string; failure leaves nothing to clean up here.
+            if unsafe { libc::unmount(path.as_ptr(), 0) } != 0 {
+                super::warn(format!("unmounting failed: {}", io::Error::last_os_error()));
+            }
+        }
+
+        fn cstr(s: &str) -> io::Result<CString> {
+            CString::new(s).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
         }
     }
 

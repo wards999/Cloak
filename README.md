@@ -85,8 +85,9 @@ names follow one set of rules (`src/names.rs`):
   Windows. The Windows adapter shows them through the Services-for-Macintosh
   mapping macOS's own SMB client uses (private-use look-alikes such as U+F022
   for `:`); nothing is renamed on disk and the mapping round-trips.
-- **Mac litter:** the macOS adapter mounts with `noappledouble`/`noapplexattr`
-  and refuses `._*`/`.DS_Store`, so Finder metadata never lands in the store.
+- **Mac litter:** the macOS adapter mounts with `noappledouble`, refuses
+  `._*`/`.DS_Store`, and accepts but drops extended attributes (tags,
+  quarantine, provenance), so Finder metadata never lands in the store.
 - **Saving:** both adapters support rename-over-existing (how most editors
   save) and case-only renames.
 
