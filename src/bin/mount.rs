@@ -185,7 +185,7 @@ mod imp {
             }
         }
 
-        fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
             match self.node(ino) {
                 Ok((_, m)) => reply.attr(&TTL, &self.attr(ino, m)),
                 Err(e) => reply.error(e),
@@ -638,7 +638,7 @@ mod imp {
             .unwrap_or_else(|e| fail(format!("couldn't open the drive: {e}")));
         let store = Arc::new(RwLock::new(store));
         saver(&store);
-        let fs = CloakFs {
+        let new_fs = || CloakFs {
             store: store.clone(),
             workers: Workers::new(4),
             inodes: Inodes::default(),
@@ -662,14 +662,23 @@ mod imp {
             ]);
         }
 
-        let session = fuser::spawn_mount2(fs, &mount_point, &options).unwrap_or_else(|e| {
-            // macFUSE prints its own reason (if any) before this; the options
-            // tried help pin down which one it objected to.
-            fail(format!(
-                "couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}\n\
+        let mounted = match fuser::spawn_mount2(new_fs(), &mount_point, &options) {
+            Ok(session) => Mounted::Fuser(session),
+            // macFUSE 5.3+ no longer supports the call fuser mounts with
+            // (fuser#752); its regular libfuse mount still works.
+            #[cfg(target_os = "macos")]
+            Err(e) => macfuse::mount(new_fs(), &mount_point, &options).unwrap_or_else(|e2| {
+                fail(format!(
+                    "couldn't mount at {mount_point} (is macFUSE installed and allowed?): {e}; then {e2}\n\
+                     mount options tried: {options:?}"
+                ))
+            }),
+            #[cfg(not(target_os = "macos"))]
+            Err(e) => fail(format!(
+                "couldn't mount at {mount_point} (is FUSE installed?): {e}\n\
                  mount options tried: {options:?}"
-            ))
-        });
+            )),
+        };
         say(format!("mounted {store_dir} at {mount_point}; press Enter (or close stdin) to unmount"));
 
         // Hold the mount until stdin closes, like cloak-winmount: the app locks
@@ -677,10 +686,115 @@ mod imp {
         // this explicit unmount is what keeps a lock from leaving a stale mount.)
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
-        drop(session); // unmounts
+        match mounted {
+            Mounted::Fuser(session) => drop(session), // unmounts
+            #[cfg(target_os = "macos")]
+            Mounted::Channel(m) => m.unmount(&mount_point),
+        }
         let saved = lock(&store).sync();
         if let Err(e) = saved {
             warn(format!("saving on unmount failed: {e}"));
+        }
+    }
+
+    /// A live mount, made by whichever route worked.
+    enum Mounted {
+        Fuser(fuser::BackgroundSession),
+        #[cfg(target_os = "macos")]
+        Channel(macfuse::Channel),
+    }
+
+    /// Mounting through macFUSE's own libfuse calls, for macFUSE 5.3 and
+    /// later where fuser's mount call fails without a reason (fuser#752):
+    /// `fuse_mount` makes the mount, and fuser serves its device handle.
+    #[cfg(target_os = "macos")]
+    mod macfuse {
+        use super::CloakFs;
+        use fuser::{MountOption, Session, SessionACL};
+        use libc::{c_char, c_int, c_void};
+        use std::ffi::CString;
+        use std::io;
+        use std::os::fd::{BorrowedFd, OwnedFd};
+
+        #[repr(C)]
+        struct FuseArgs {
+            argc: c_int,
+            argv: *const *const c_char,
+            allocated: c_int,
+        }
+
+        // libfuse 2, which fuser already links.
+        extern "C" {
+            fn fuse_mount(mountpoint: *const c_char, args: *mut FuseArgs) -> *mut c_void;
+            fn fuse_chan_fd(ch: *mut c_void) -> c_int;
+            fn fuse_chan_destroy(ch: *mut c_void);
+        }
+
+        /// The mount's libfuse channel, and fuser serving it in the background.
+        pub struct Channel {
+            ch: *mut c_void,
+            _session: fuser::BackgroundSession,
+        }
+
+        pub fn mount(fs: CloakFs, mount_point: &str, options: &[MountOption]) -> io::Result<super::Mounted> {
+            let opts: Vec<String> = options
+                .iter()
+                .map(|o| match o {
+                    MountOption::FSName(name) => format!("fsname={name}"),
+                    MountOption::CUSTOM(o) => o.clone(),
+                    other => format!("{other:?}").to_lowercase(),
+                })
+                .collect();
+            let argv_owned = [c"cloak".to_owned(), c"-o".to_owned(), cstr(&opts.join(","))?];
+            let argv: Vec<*const c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
+            let mut args = FuseArgs { argc: argv.len() as c_int, argv: argv.as_ptr(), allocated: 0 };
+            let path = cstr(mount_point)?;
+
+            // SAFETY: the strings outlive the call; a null channel is a failure.
+            let ch = unsafe { fuse_mount(path.as_ptr(), &mut args) };
+            if ch.is_null() {
+                return Err(io::Error::other("macFUSE's fuse_mount failed"));
+            }
+            // The channel keeps its descriptor, so fuser gets its own copy.
+            // SAFETY: a live channel's descriptor stays open until it's destroyed.
+            let fd = unsafe { fuse_chan_fd(ch) };
+            let owned: io::Result<OwnedFd> = if fd < 0 {
+                Err(io::Error::other("macFUSE gave no device for the mount"))
+            } else {
+                unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+            };
+            let session = owned.and_then(|fd| Session::from_fd(fs, fd, SessionACL::Owner).spawn());
+            match session {
+                Ok(session) => Ok(super::Mounted::Channel(Channel { ch, _session: session })),
+                Err(e) => {
+                    unmount_path(&path);
+                    // SAFETY: the channel is live and released exactly once.
+                    unsafe { fuse_chan_destroy(ch) };
+                    Err(e)
+                }
+            }
+        }
+
+        impl Channel {
+            /// Unmount, which ends fuser's loop, then release the channel.
+            pub fn unmount(self, mount_point: &str) {
+                if let Ok(path) = cstr(mount_point) {
+                    unmount_path(&path);
+                }
+                // SAFETY: the channel is live and released exactly once.
+                unsafe { fuse_chan_destroy(self.ch) };
+            }
+        }
+
+        fn unmount_path(path: &CString) {
+            // SAFETY: a valid C string; failure leaves nothing to clean up here.
+            if unsafe { libc::unmount(path.as_ptr(), 0) } != 0 {
+                super::warn(format!("unmounting failed: {}", io::Error::last_os_error()));
+            }
+        }
+
+        fn cstr(s: &str) -> io::Result<CString> {
+            CString::new(s).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
         }
     }
 
