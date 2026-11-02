@@ -55,6 +55,7 @@ src/key.rs      Argon2id passphrase -> master key (key never stored)
 src/engine.rs   Store: path/tree ops (mkdir / create / write_at / rename / move / remove)
 src/names.rs    cross-platform name rules (NFC, case folding, limits, Windows mapping)
 src/durable.rs  crash-safe metadata writes (side file + flush + rename)
+src/backup.rs   password-protected recovery backups of headers and folder lists
 src/dircache.rs folder-list cache, delayed saving, and split lists for big folders
 src/inodes.rs   inode <-> path table for the fuser adapter
 src/bin/mount.rs     read-write fuser mount adapter (macOS/Linux)
@@ -150,6 +151,29 @@ any other folder, such as a USB stick, to run it portably.
   shows which folder is in use.
 - Passwords are never stored. Each drive's own folder holds everything needed
   to open it.
+
+## Recovery backups
+
+Two kinds of file matter most: a drive's `meta.json` (without it no password
+can open the drive) and each folder's list, `manifest.idx` (without it that
+folder's names, and the keys to the encrypted ends of its files, are gone).
+The app can back these up, for one drive (the save button on its card) or
+all of them (Settings → Recovery), into one `.cloakbak` file protected by a
+password of your choice (Argon2id + XChaCha20-Poly1305, so a wrong password
+or a damaged file is detected). It holds no file contents: keep a normal
+backup of each drive's folder too.
+
+**Restore from a backup…** puts a drive's header and lists back only where
+they're missing or can't be read. A list that still reads is newer than the
+backup and is left alone, so files added since aren't hidden. Restoring
+needs both the backup's password and the drive's own, and won't overwrite a
+different drive. The same is available from the command line:
+
+```bash
+CLOAK_BACKUP_PASSPHRASE=... cloak backup out.cloakbak "Personal" D:/Personal "Work" E:/Work
+CLOAK_BACKUP_PASSPHRASE=... cloak backup-list out.cloakbak
+CLOAK_BACKUP_PASSPHRASE=... CLOAK_PASSPHRASE=... cloak restore out.cloakbak "Personal" D:/Personal
+```
 
 ## Performance notes
 

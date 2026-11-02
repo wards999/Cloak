@@ -18,6 +18,8 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 # Passphrase -> master key (Argon2id), so the key is derived, never stored.
 argon2 = "0.5.3"
+# Authenticated encryption for recovery backups (see src/backup.rs).
+chacha20poly1305 = "0.10.1"
 
 
 [dev-dependencies]
