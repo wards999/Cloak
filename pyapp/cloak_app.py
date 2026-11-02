@@ -1152,6 +1152,13 @@ class Cloak(FluentWindow):
         self.drives.lock_all()
         super().closeEvent(e)
 
+    if sys.platform == "darwin":
+        def _updateSystemButtonRect(self):
+            # The widget library re-places the traffic lights from their
+            # frames, which lands them on the right on current macOS; leave
+            # them where macOS puts them, top left.
+            pass
+
 
 def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -1166,7 +1173,11 @@ def main():
         except Exception:
             pass
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(str(ICON)))
+    # On macOS the window icon also replaces the Dock icon, and this PNG is
+    # cropped edge to edge for Windows; the app bundle's .icns has the
+    # margin macOS icons are drawn with, so a packaged Mac app keeps that.
+    if not (FROZEN and sys.platform == "darwin"):
+        app.setWindowIcon(QIcon(str(ICON)))
     setTheme(THEMES[load_settings()["theme"]])
     setThemeColor(QColor("#13b3a4"))
     w = Cloak()
