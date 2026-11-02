@@ -130,6 +130,23 @@ names follow one set of rules (`src/names.rs`):
   v0.1.1 and earlier read sizes from the manifest and would see stale ones,
   and can't read a split folder list.
 
+## The desktop app is portable
+
+The Cloak app keeps its drive list and settings in a `cloak-data` folder next
+to itself: beside `Cloak.exe` on Windows, beside `Cloak.app` on macOS.
+Nothing is written to your user profile, so the app can live on a USB stick.
+
+- A drive on the same disk as the app is remembered by its path relative to
+  the app too, so it's still found when the stick gets a different drive
+  letter (or mount point) on another computer.
+- On first run the app copies in the drive list and settings that earlier
+  versions kept in `~/.cloak`.
+- If the app's folder can't be written to (Program Files, `/Applications`,
+  or a macOS quarantine copy), it uses `~/.cloak` instead. The Settings page
+  shows which folder is in use.
+- Passwords are never stored. Each drive's own folder holds everything needed
+  to open it.
+
 ## Performance notes
 
 - **Open files are read and written by handle.** A mount adapter opens a file

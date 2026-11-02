@@ -8,6 +8,8 @@
 
 # Python
 __pycache__/
+# The desktop app's drive list and settings when run from source
+/pyapp/cloak-data/
 *.pyc
 .venv/
 

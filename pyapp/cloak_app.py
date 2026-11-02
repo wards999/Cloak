@@ -8,6 +8,7 @@ verify the password) and the `cloak-winmount` / `cloak-mount` adapter (to mount)
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,12 +30,61 @@ APP_DIR = Path(__file__).resolve().parent
 # A packaged app (PyInstaller) keeps the engine in `bin` next to its executable.
 FROZEN = getattr(sys, "frozen", False)
 EXE_DIR = Path(sys.executable).resolve().parent if FROZEN else APP_DIR
-CONFIG = Path.home() / ".cloak" / "drives.json"
-SETTINGS = Path.home() / ".cloak" / "settings.json"
 ICON = APP_DIR / "assets" / "icon.png"
 IS_WIN = sys.platform.startswith("win")
 # Engine calls from a windowed app would each flash a console window.
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+
+
+# ---- where the app keeps its data ------------------------------------------
+#
+# Cloak is portable: its drive list and settings live in a `cloak-data` folder
+# next to the app (beside Cloak.exe, or beside Cloak.app on macOS, since writing
+# inside a signed app bundle would break its signature), so the whole thing can
+# travel on a USB stick. If that folder can't be written (the app is in Program
+# Files or /Applications, or macOS is running it from a read-only quarantine
+# copy) it falls back to ~/.cloak, which is where earlier versions kept it.
+
+LEGACY_DIR = Path.home() / ".cloak"
+
+
+def _app_home():
+    """The folder the app lives in (for a macOS bundle, the one holding it)."""
+    if FROZEN and sys.platform == "darwin":
+        return EXE_DIR.parents[2]  # Cloak.app/Contents/MacOS -> beside Cloak.app
+    return EXE_DIR
+
+
+def _writable(d):
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".write-test"
+        probe.write_text("")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _data_dir():
+    """(folder, portable?) for the drive list and settings."""
+    d = _app_home() / "cloak-data"
+    if not _writable(d):
+        return LEGACY_DIR, False
+    # First portable run: bring over the drive list and settings from ~/.cloak.
+    for name in ("drives.json", "settings.json"):
+        src, dst = LEGACY_DIR / name, d / name
+        if src.exists() and not dst.exists():
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                pass
+    return d, True
+
+
+DATA_DIR, PORTABLE = _data_dir()
+CONFIG = DATA_DIR / "drives.json"
+SETTINGS = DATA_DIR / "settings.json"
 
 
 # ---- engine bridge ---------------------------------------------------------
@@ -136,17 +186,50 @@ def winfsp_bin():
     return default if os.path.isdir(default) else None
 
 
+# Drive paths are saved twice: as last seen, and relative to the data folder
+# when the drive is on the same disk as the app. On a USB stick that's the
+# one that keeps working when the stick gets another drive letter (or mount
+# point) on another computer.
+
+def _same_volume(a, b):
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def _resolve(entry):
+    """A drive entry's folder now: the relative path if it still leads to a
+    folder, else the path as last seen."""
+    rel = entry.get("rel")
+    if rel:
+        p = os.path.normpath(os.path.join(DATA_DIR, rel))
+        if os.path.isdir(p):
+            return p
+    return os.path.normpath(entry.get("path", ""))
+
+
 def load_drives():
     try:
-        return json.loads(CONFIG.read_text())
+        drives = json.loads(CONFIG.read_text())
     except Exception:
         return []
+    return [{"name": d.get("name", ""), "path": _resolve(d)} for d in drives if isinstance(d, dict)]
 
 
 def save_drives(drives):
+    out = []
+    for d in drives:
+        entry = {"name": d["name"], "path": os.path.normpath(d["path"])}
+        if PORTABLE and _same_volume(d["path"], DATA_DIR):
+            try:
+                entry["rel"] = os.path.relpath(d["path"], DATA_DIR)
+            except ValueError:
+                pass  # different drive letters after all
+        out.append(entry)
     try:
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG.write_text(json.dumps(drives, indent=2))
+        CONFIG.write_text(json.dumps(out, indent=2))
     except Exception:
         pass
 
@@ -408,6 +491,7 @@ class DrivesInterface(QWidget):
         if not dlg.exec():
             return
         name, loc, pw, pw2 = dlg.name.text().strip(), dlg.loc.text().strip(), dlg.pw.text(), dlg.pw2.text()
+        loc = os.path.normpath(loc) if loc else loc
         if not name or not loc or not pw:
             return self.err("Name, location and password are required.")
         if pw != pw2:
@@ -426,6 +510,7 @@ class DrivesInterface(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select an existing cloak drive folder")
         if not folder:
             return
+        folder = os.path.normpath(folder)
         if not (Path(folder) / "meta.json").exists():
             return self.err("That folder isn't a cloak drive (no drive metadata found).")
         if any(d["path"] == folder for d in self.drives):
@@ -549,6 +634,20 @@ class SettingsInterface(QWidget):
         row.addWidget(sw)
         lay.addLayout(row)
         lay.addWidget(CaptionLabel("Drives always unmount on shutdown and when you quit.", self))
+
+        lay.addSpacing(10)
+        lay.addWidget(StrongBodyLabel("Storage", self))
+        if PORTABLE:
+            where = f"Your drive list and settings are kept with the app, in {DATA_DIR}."
+        else:
+            where = (
+                f"The app's folder can't be written to, so your drive list and settings are "
+                f"kept in {DATA_DIR}. Move the app to a folder you can write to (such as a "
+                f"USB stick) to keep them with the app instead."
+            )
+        note = CaptionLabel(where, self)
+        note.setWordWrap(True)
+        lay.addWidget(note)
 
         lay.addStretch(1)
 
