@@ -258,7 +258,20 @@ def install_power_hook(app, on_power):
 
 # ---- dialogs ---------------------------------------------------------------
 
-class CreateDialog(MessageBoxBase):
+class FocusedDialog(MessageBoxBase):
+    """A dialog that puts the cursor in `self.first` when it appears. Setting
+    focus while it's being built doesn't stick: the opening animation moves
+    focus after that."""
+
+    first = None
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.first is not None:
+            QTimer.singleShot(0, self.first.setFocus)
+
+
+class CreateDialog(FocusedDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel("Create a new drive", self)
@@ -274,6 +287,7 @@ class CreateDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.pw)
         self.viewLayout.addWidget(self.pw2)
         self.yesButton.setText("Create drive")
+        self.first = self.name
         self.cancelButton.setText("Cancel")
         self.widget.setMinimumWidth(430)
         self.pick.clicked.connect(self._choose)
@@ -284,7 +298,7 @@ class CreateDialog(MessageBoxBase):
             self.loc.setText(d)
 
 
-class UnlockDialog(MessageBoxBase):
+class UnlockDialog(FocusedDialog):
     def __init__(self, parent, name, path, letters):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel(f"Unlock “{name}”", self)
@@ -305,9 +319,10 @@ class UnlockDialog(MessageBoxBase):
         self.cancelButton.setText("Cancel")
         self.widget.setMinimumWidth(390)
         self.pw.returnPressed.connect(self.yesButton.click)
+        self.first = self.pw
 
 
-class NameDialog(MessageBoxBase):
+class NameDialog(FocusedDialog):
     def __init__(self, parent, title, placeholder):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel(title, self)
@@ -318,6 +333,7 @@ class NameDialog(MessageBoxBase):
         self.cancelButton.setText("Cancel")
         self.widget.setMinimumWidth(360)
         self.edit.returnPressed.connect(self.yesButton.click)
+        self.first = self.edit
 
 
 # ---- drive card ------------------------------------------------------------
