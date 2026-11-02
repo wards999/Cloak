@@ -23,61 +23,59 @@ jobs:
       - name: Point bindgen at libclang
         shell: bash
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
-      - name: Build
-        run: cargo build --release --features "winfsp gui" --bin cloak --bin cloak-winmount --bin cloak-gui
-      - name: Package
+      - name: Build the engine
+        run: cargo build --release --features winfsp --bin cloak --bin cloak-winmount
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package the app
         shell: pwsh
         run: |
-          $dir = "cloak-${{ github.ref_name }}-windows-x64"
-          New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item target/release/cloak.exe, target/release/cloak-winmount.exe, target/release/cloak-gui.exe, README.md $dir
-          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          pip install -r pyapp/requirements.txt pyinstaller
+          python pyapp/package.py target/release out
+          Copy-Item README.md out/Cloak
+          $zip = "cloak-${{ github.ref_name }}-windows-x64.zip"
+          Compress-Archive -Path out/Cloak -DestinationPath $zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: cloak-${{ github.ref_name }}-windows-x64.zip
 
   macos:
-    name: macOS binaries (universal)
+    name: macOS binaries (Apple Silicon)
+    # macos-latest runs on Apple Silicon, so this is a native build.
     runs-on: macos-latest
     env:
-      # macFUSE installs libfuse + fuse.pc under /usr/local on both Intel and
-      # Apple Silicon; it's a universal library, so one install serves both
-      # targets (hence allowing pkg-config to answer for the cross target).
+      # macFUSE installs libfuse + fuse.pc under /usr/local.
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-      PKG_CONFIG_ALLOW_CROSS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Install macFUSE (headers + libfuse for linking)
         run: |
           brew install --cask macfuse
           brew list pkgconf >/dev/null 2>&1 || brew install pkgconf
-      - name: Build
+      - name: Build the engine
         run: |
-          for t in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --target "$t" --bin cloak
-            cargo build --release --target "$t" --features gui --bin cloak-gui
-            cargo build --release --target "$t" --features mount --bin cloak-mount
-          done
-      - name: Package (universal binaries)
+          cargo build --release --bin cloak
+          cargo build --release --features mount --bin cloak-mount
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package the app
         run: |
-          dir="cloak-${{ github.ref_name }}-macos-universal"
+          pip install -r pyapp/requirements.txt pyinstaller
+          python pyapp/package.py target/release out
+          file out/Cloak.app/Contents/MacOS/bin/*
+          dir="cloak-${{ github.ref_name }}-macos-arm64"
           mkdir "$dir"
-          for b in cloak cloak-gui cloak-mount; do
-            lipo -create -output "$dir/$b" \
-              "target/aarch64-apple-darwin/release/$b" \
-              "target/x86_64-apple-darwin/release/$b"
-            lipo -info "$dir/$b"
-          done
+          mv out/Cloak.app "$dir/"
           cp README.md "$dir/"
           ditto -c -k --keepParent "$dir" "$dir.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: cloak-${{ github.ref_name }}-macos-universal.zip
+          path: cloak-${{ github.ref_name }}-macos-arm64.zip
 
   publish:
     name: Publish release

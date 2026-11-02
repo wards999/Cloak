@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QVBoxLayout, QWidget,
 )
@@ -26,8 +26,14 @@ from qfluentwidgets import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
+# A packaged app (PyInstaller) keeps the engine in `bin` next to its executable.
+FROZEN = getattr(sys, "frozen", False)
+EXE_DIR = Path(sys.executable).resolve().parent if FROZEN else APP_DIR
 CONFIG = Path.home() / ".cloak" / "drives.json"
+ICON = APP_DIR / "assets" / "icon.png"
 IS_WIN = sys.platform.startswith("win")
+# Engine calls from a windowed app would each flash a console window.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
 
 
 # ---- engine bridge ---------------------------------------------------------
@@ -37,8 +43,9 @@ def _find(exe_base):
     if env and Path(env).exists():
         return env
     exe = exe_base + (".exe" if IS_WIN else "")
-    for rel in ("../target/release", "../target/debug", "."):
-        p = APP_DIR / rel / exe
+    candidates = [EXE_DIR / "bin" / exe, EXE_DIR / exe]
+    candidates += [APP_DIR / rel / exe for rel in ("../target/release", "../target/debug")]
+    for p in candidates:
         if p.exists():
             return str(p)
     return exe
@@ -52,7 +59,7 @@ def verify(path, password):
     env = os.environ.copy()
     env["CLOAK_PASSPHRASE"] = password
     try:
-        proc = subprocess.run([CLI, "open", path], capture_output=True, text=True, env=env)
+        proc = subprocess.run([CLI, "open", path], capture_output=True, text=True, env=env, **NO_WINDOW)
     except OSError as e:
         raise RuntimeError(f"engine not found ({e})")
     out = (proc.stdout or "").strip()
@@ -70,7 +77,7 @@ def create_store(path, password):
     env = os.environ.copy()
     env["CLOAK_PASSPHRASE"] = password
     try:
-        proc = subprocess.run([CLI, "create", path], capture_output=True, text=True, env=env)
+        proc = subprocess.run([CLI, "create", path], capture_output=True, text=True, env=env, **NO_WINDOW)
     except OSError as e:
         raise RuntimeError(f"engine not found ({e})")
     out = (proc.stdout or "").strip()
@@ -425,7 +432,7 @@ class DrivesInterface(QWidget):
         if wb:
             env["PATH"] = wb + os.pathsep + env.get("PATH", "")
         try:
-            proc = subprocess.Popen([adapter, drive["path"], mp], stdin=subprocess.PIPE, env=env)
+            proc = subprocess.Popen([adapter, drive["path"], mp], stdin=subprocess.PIPE, env=env, **NO_WINDOW)
         except OSError as e:
             return self.err(f"Couldn't start the mount driver ({e}). Is it installed?")
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
@@ -442,14 +449,15 @@ class DrivesInterface(QWidget):
         if not m:
             return
         proc = m["proc"]
-        # Closing stdin tells the adapter to unmount cleanly; give it a moment,
-        # then force-terminate as a fallback (the driver also unmounts on exit).
+        # Closing stdin tells the adapter to unmount cleanly and save its last
+        # changes (folder lists are saved half a second after they change);
+        # give it time, then force-terminate as a fallback.
         try:
             proc.stdin.close()
         except Exception:
             pass
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=10)
         except Exception:
             try:
                 proc.terminate()
@@ -535,7 +543,16 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
+    if IS_WIN:
+        # Our own taskbar identity, so the taskbar shows cloak's icon rather
+        # than that of the Python running it (when run from source).
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("cloak.app")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(ICON)))
     setTheme(Theme.AUTO)
     setThemeColor(QColor("#13b3a4"))
     w = Cloak()
