@@ -59,7 +59,8 @@ src/dircache.rs folder-list cache, delayed saving, and split lists for big folde
 src/inodes.rs   inode <-> path table for the fuser adapter
 src/bin/mount.rs     read-write fuser mount adapter (macOS/Linux)
 src/bin/winmount.rs  read-write WinFsp mount adapter (Windows, MSVC)
-src/bin/gui.rs       cross-platform eframe GUI (mount/unmount + passphrase)
+pyapp/cloak_app.py   desktop app (PySide6 + QFluentWidgets): create, lock, unlock
+pyapp/package.py     packages the app with the engine inside (PyInstaller)
 benches/crypto_bench.rs  full-file vs ends-only timing
 ```
 
@@ -153,8 +154,9 @@ cargo test
 # the full-file vs ends-only benchmark
 cargo bench
 
-# the GUI (cross-platform): pick a store folder, mount point, passphrase
-cargo run --features gui --bin cloak-gui
+# the desktop app (needs Python 3.12 and the engine built in target/release)
+pip install -r pyapp/requirements.txt
+python pyapp/cloak_app.py
 
 # mount via CLI (macOS: install macFUSE first; Linux: libfuse3)
 # Holds the mount until Enter / stdin closes, then unmounts.
@@ -173,7 +175,8 @@ set CLOAK_PASSPHRASE=... & cloak-winmount .\store X:
 
 Don't want the local MSVC install? The GitHub Actions workflow
 (`.github/workflows/ci.yml`) compiles the WinFsp adapter on a Windows MSVC
-runner for you, and builds the core + GUI + fuser adapter across all three OSes.
+runner for you, builds the core and fuser adapter across all three OSes, and
+checks the desktop app.
 
 ## Status
 
@@ -185,9 +188,9 @@ runner for you, and builds the core + GUI + fuser adapter across all three OSes.
 - [x] WinFsp mount adapter (Windows, MSVC)
 - [x] Passphrase-derived key (Argon2id); key never stored
 - [x] Folder tree: boring-named dirs + per-directory encrypted manifests
-- [x] Cross-platform GUI (mount/unmount + passphrase; Windows drive-letter picker)
+- [x] Desktop app (Fluent design; create, lock/unlock, auto-lock on sleep)
 - [x] Full-file vs ends-only benchmark
-- [x] GitHub Actions CI (core + adapters + GUI across 3 OSes)
+- [x] GitHub Actions CI (core + adapters across 3 OSes, desktop app)
 - [ ] FSKit adapter for modern macOS (kext-free; via a C-ABI core)
 - [ ] Code signing / notarization for public distribution
 - [ ] Optional per-region nonce for files > 256 GiB

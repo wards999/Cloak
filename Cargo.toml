@@ -19,10 +19,6 @@ serde_json = "1.0.140"
 # Passphrase -> master key (Argon2id), so the key is derived, never stored.
 argon2 = "0.5.3"
 
-# Cross-platform GUI (behind the `gui` feature). eframe is win/mac/linux;
-# rfd gives native folder pickers.
-eframe = { version = "0.28.1", optional = true }
-rfd = { version = "0.14.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10.1"
@@ -47,16 +43,10 @@ required-features = ["winfsp"]
 name = "cloak"
 path = "src/bin/cli.rs"
 
-[[bin]]
-name = "cloak-gui"
-path = "src/bin/gui.rs"
-required-features = ["gui"]
-
 [features]
 default = []
 mount = ["dep:fuser", "dep:libc"]
 winfsp = ["dep:winfsp", "dep:winfsp-sys"]
-gui = ["dep:eframe", "dep:rfd"]
 
 [target.'cfg(unix)'.dependencies]
 # macOS (via macFUSE) and Linux.

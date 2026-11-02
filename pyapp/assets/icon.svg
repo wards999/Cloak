@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- cloak app icon: a hood with the face in shadow, on the app's teal.
+       Flat and bold so it reads at 16 px. Source for icon.png, icon.ico and
+       icon.icns (regenerate with pyapp/make_icon.py). The tile sits on the
+       macOS icon grid (824 of 1024); Windows sizes are cropped to the tile. -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#13B3A4"/>
+  <path d="M512 210 C 362 210 300 330 300 460 C 300 560 270 660 220 790 Q 512 860 804 790 C 754 660 724 560 724 460 C 724 330 662 210 512 210 Z" fill="#FFFFFF"/>
+  <path d="M512 340 C 436 340 400 404 400 470 C 400 556 446 616 512 650 C 578 616 624 556 624 470 C 624 404 588 340 512 340 Z" fill="#0B2A3A"/>
+</svg>
