@@ -353,16 +353,71 @@ def install_power_hook(app, on_power):
 # ---- dialogs ---------------------------------------------------------------
 
 class FocusedDialog(MessageBoxBase):
-    """A dialog that puts the cursor in `self.first` when it appears. Setting
-    focus while it's being built doesn't stick: the opening animation moves
-    focus after that."""
+    """A dialog that puts the cursor in `self.first` when it appears, and that
+    checks its fields before closing: the main button (and Enter) call
+    `validate`, and a problem is shown inside the dialog, keeping what was
+    typed, instead of closing it.
+
+    Focus is set once the dialog is on screen; setting it while it's being
+    built doesn't stick, as the opening animation moves focus after that."""
 
     first = None
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.error = CaptionLabel("", self)
+        self.error.setStyleSheet("color: #d13438;")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        # Route the main button through validate() rather than straight to
+        # accept(), which is all the library's own handler does.
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._on_yes)
+
+    def finish_layout(self):
+        """Call after adding the fields: puts the error line below them."""
+        self.viewLayout.addWidget(self.error)
 
     def showEvent(self, e):
         super().showEvent(e)
         if self.first is not None:
             QTimer.singleShot(0, self.first.setFocus)
+
+    def validate(self):
+        """True to close the dialog; otherwise call `problem` and return False."""
+        return True
+
+    def problem(self, message, field=None):
+        """Show `message` in the dialog and put the cursor in `field`."""
+        self.error.setText(message)
+        self.error.show()
+        if field is not None:
+            field.setFocus()
+            if hasattr(field, "selectAll"):
+                field.selectAll()
+        return False
+
+    busy_text = None  # the main button's label while validate() works
+
+    def _on_yes(self):
+        self.error.hide()
+        label = self.yesButton.text()
+        if self.busy_text:
+            self.yesButton.setText(self.busy_text)
+        self.yesButton.setEnabled(False)
+        self.cancelButton.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            ok = self.validate()
+        finally:
+            self.yesButton.setText(label)
+            self.yesButton.setEnabled(True)
+            self.cancelButton.setEnabled(True)
+        if ok:
+            self.accept()
+            signal = getattr(self, "yesSignal", None)  # not in every version
+            if signal is not None:
+                signal.emit()
 
 
 class CreateDialog(FocusedDialog):
@@ -380,6 +435,10 @@ class CreateDialog(FocusedDialog):
         self.viewLayout.addLayout(row)
         self.viewLayout.addWidget(self.pw)
         self.viewLayout.addWidget(self.pw2)
+        self.finish_layout()
+        self.created = None  # (name, folder) once the drive exists
+        self.busy_text = "Creating…"
+        self.pw2.returnPressed.connect(self.yesButton.click)
         self.yesButton.setText("Create drive")
         self.first = self.name
         self.cancelButton.setText("Cancel")
@@ -389,12 +448,46 @@ class CreateDialog(FocusedDialog):
     def _choose(self):
         d = QFileDialog.getExistingDirectory(self, "Choose an empty folder for the drive")
         if d:
-            self.loc.setText(d)
+            self.loc.setText(os.path.normpath(d))
+
+    def validate(self):
+        name, loc = self.name.text().strip(), self.loc.text().strip()
+        if not name:
+            return self.problem("Give the drive a name.", self.name)
+        if not loc:
+            return self.problem("Choose a folder for the drive.", self.loc)
+        if not self.pw.text():
+            return self.problem("Enter a password.", self.pw)
+        if self.pw.text() != self.pw2.text():
+            return self.problem("The passwords don't match.", self.pw2)
+        loc = os.path.normpath(loc)
+        folder = Path(loc)
+        if (folder / "meta.json").exists():
+            return self.problem(
+                "That folder is already a cloak drive. Choose an empty folder, or use "
+                "Add existing to add this drive to your list.", self.loc)
+        if folder.is_file():
+            return self.problem("That's a file. Choose a folder for the drive.", self.loc)
+        if folder.is_dir() and any(folder.iterdir()):
+            return self.problem("That folder isn't empty. Choose an empty folder, or a new one.", self.loc)
+        try:
+            create_store(loc, self.pw.text())
+        except RuntimeError as e:
+            return self.problem(f"Couldn't create the drive there: {e}", self.loc)
+        self.created = (name, loc)
+        return True
 
 
 class UnlockDialog(FocusedDialog):
-    def __init__(self, parent, name, path, letters):
+    """Password and drive letter, then the mount itself, all checked before
+    closing: `mount(password, mountpoint)` returns an error message, or None
+    once the drive is up."""
+
+    def __init__(self, parent, name, path, letters, mount):
         super().__init__(parent)
+        self.path = path
+        self.mount = mount
+        self.busy_text = "Unlocking…"
         self.titleLabel = SubtitleLabel(f"Unlock “{name}”", self)
         self.sub = CaptionLabel(path, self)
         self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
@@ -414,20 +507,77 @@ class UnlockDialog(FocusedDialog):
         self.widget.setMinimumWidth(390)
         self.pw.returnPressed.connect(self.yesButton.click)
         self.first = self.pw
+        self.finish_layout()
+
+    def validate(self):
+        if not self.pw.text():
+            return self.problem("Enter the password.", self.pw)
+        if IS_WIN:
+            mp = self.combo.currentText() if self.combo else ""
+            if not mp:
+                return self.problem("Choose a drive letter.", self.combo)
+            # It may have been taken since the dialog opened.
+            if mp in used_drive_letters():
+                return self.problem(f"{mp} is no longer free. Pick another letter.", self.combo)
+        try:
+            verify(self.path, self.pw.text())
+        except RuntimeError as e:
+            return self.problem(str(e)[:1].upper() + str(e)[1:] + ".", self.pw)
+        mp = self.combo.currentText() if (IS_WIN and self.combo) else None
+        failure = self.mount(self.pw.text(), mp)
+        if failure:
+            return self.problem(failure, self.combo if IS_WIN else self.pw)
+        return True
 
 
-class NameDialog(FocusedDialog):
-    def __init__(self, parent, title, placeholder):
+class AddExistingDialog(FocusedDialog):
+    """Pick a drive's folder and name it, checked before closing."""
+
+    def __init__(self, parent, known_paths):
         super().__init__(parent)
-        self.titleLabel = SubtitleLabel(title, self)
-        self.edit = LineEdit(self); self.edit.setPlaceholderText(placeholder)
+        self.known = known_paths
+        self.titleLabel = SubtitleLabel("Add an existing drive", self)
+        self.loc = LineEdit(self); self.loc.setPlaceholderText("The drive's folder")
+        self.pick = PushButton("Choose folder…", self)
+        self.name = LineEdit(self); self.name.setPlaceholderText("Name for this drive")
+        row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
-        self.viewLayout.addWidget(self.edit)
-        self.yesButton.setText("OK")
+        self.viewLayout.addLayout(row)
+        self.viewLayout.addWidget(self.name)
+        self.finish_layout()
+        self.yesButton.setText("Add drive")
         self.cancelButton.setText("Cancel")
-        self.widget.setMinimumWidth(360)
-        self.edit.returnPressed.connect(self.yesButton.click)
-        self.first = self.edit
+        self.widget.setMinimumWidth(430)
+        self.pick.clicked.connect(self._choose)
+        self.name.returnPressed.connect(self.yesButton.click)
+        self.loc.returnPressed.connect(self.yesButton.click)
+        self.first = self.pick
+        self.added = None  # (name, folder) once checked
+
+    def _choose(self):
+        d = QFileDialog.getExistingDirectory(self, "Select an existing cloak drive folder")
+        if d:
+            d = os.path.normpath(d)
+            self.loc.setText(d)
+            if not self.name.text().strip():
+                self.name.setText(Path(d).name)
+            self.name.setFocus()
+            self.name.selectAll()
+
+    def validate(self):
+        loc = self.loc.text().strip()
+        if not loc:
+            return self.problem("Choose the drive's folder.", self.pick)
+        loc = os.path.normpath(loc)
+        if not os.path.isdir(loc):
+            return self.problem("That folder doesn't exist.", self.loc)
+        if not (Path(loc) / "meta.json").exists():
+            return self.problem(
+                "That folder isn't a cloak drive. Choose the folder you created the drive in.", self.loc)
+        if loc in self.known:
+            return self.problem("That drive is already in your list.", self.loc)
+        self.added = (self.name.text().strip() or Path(loc).name, loc)
+        return True
 
 
 # ---- drive card ------------------------------------------------------------
@@ -517,18 +667,9 @@ class DrivesInterface(QWidget):
 
     def create_drive(self):
         dlg = CreateDialog(self.win)
-        if not dlg.exec():
+        if not dlg.exec() or not dlg.created:
             return
-        name, loc, pw, pw2 = dlg.name.text().strip(), dlg.loc.text().strip(), dlg.pw.text(), dlg.pw2.text()
-        loc = os.path.normpath(loc) if loc else loc
-        if not name or not loc or not pw:
-            return self.err("Name, location and password are required.")
-        if pw != pw2:
-            return self.err("Passwords don't match.")
-        try:
-            create_store(loc, pw)
-        except RuntimeError as e:
-            return self.err(str(e))
+        name, loc = dlg.created
         self.drives = [d for d in self.drives if d["path"] != loc]
         self.drives.insert(0, {"name": name, "path": loc})
         save_drives(self.drives)
@@ -536,19 +677,10 @@ class DrivesInterface(QWidget):
         self.ok(f"Created “{name}”. Unlock it to mount.")
 
     def import_existing(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select an existing cloak drive folder")
-        if not folder:
+        dlg = AddExistingDialog(self.win, {os.path.normpath(d["path"]) for d in self.drives})
+        if not dlg.exec() or not dlg.added:
             return
-        folder = os.path.normpath(folder)
-        if not (Path(folder) / "meta.json").exists():
-            return self.err("That folder isn't a cloak drive (no drive metadata found).")
-        if any(d["path"] == folder for d in self.drives):
-            return self.err("That drive is already in your list.")
-        dlg = NameDialog(self.win, "Add existing drive", "Name for this drive")
-        dlg.edit.setText(Path(folder).name)
-        if not dlg.exec():
-            return
-        name = dlg.edit.text().strip() or Path(folder).name
+        name, folder = dlg.added
         self.drives.insert(0, {"name": name, "path": folder})
         save_drives(self.drives)
         self.refresh()
@@ -558,29 +690,33 @@ class DrivesInterface(QWidget):
         letters = free_drive_letters()
         if IS_WIN and not letters:
             return self.err("No free drive letters available. Free one and try again.")
-        dlg = UnlockDialog(self.win, drive["name"], drive["path"], letters)
-        if not dlg.exec():
+        mounted = {}
+
+        def mount(pw, letter):
+            mp = letter if IS_WIN else str(Path.home() / "cloak-mnt" / drive["name"])
+            failure = self._mount(drive, pw, mp)
+            if not failure:
+                mounted["mp"] = mp
+            return failure
+
+        dlg = UnlockDialog(self.win, drive["name"], drive["path"], letters, mount)
+        if not dlg.exec() or "mp" not in mounted:
             return
-        pw = dlg.pw.text()
-        try:
-            verify(drive["path"], pw)
-        except RuntimeError as e:
-            return self.err(str(e))
+        mp = mounted["mp"]
+        self.refresh()
+        self.ok(f"Unlocked at {mp}")
+        QTimer.singleShot(300, lambda: open_in_file_manager(mp))
 
-        if IS_WIN:
-            mp = dlg.combo.currentText() if dlg.combo else ""
-            if not mp:
-                return self.err("Choose a drive letter.")
-            # Re-check right before mounting — it may have been taken meanwhile.
-            if mp in used_drive_letters():
-                return self.err(f"{mp} is no longer free — pick another and try again.")
-        else:
-            mp = str(Path.home() / "cloak-mnt" / drive["name"])
+    def _mount(self, drive, pw, mp):
+        """Mount `drive` at `mp`. Returns an error message for the user, or
+        None once the drive is up (and recorded in self.mounts)."""
+        if not IS_WIN:
             Path(mp).mkdir(parents=True, exist_ok=True)
-
         adapter = _find("cloak-winmount" if IS_WIN else "cloak-mount")
         env = os.environ.copy(); env["CLOAK_PASSPHRASE"] = pw
         wb = winfsp_bin()
+        if IS_WIN and not wb:
+            return "WinFsp isn't installed. Install it (winget install WinFsp.WinFsp) and try again."
         if wb:
             env["PATH"] = wb + os.pathsep + env.get("PATH", "")
         # Give the adapter real places to write: started from Explorer or
@@ -593,8 +729,13 @@ class DrivesInterface(QWidget):
                 [adapter, drive["path"], mp],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, env=env, **NO_WINDOW,
             )
+        except FileNotFoundError:
+            return (
+                f"The mount driver ({Path(adapter).name}) is missing. Keep the app's "
+                f"folder together, including bin, or download Cloak again."
+            )
         except OSError as e:
-            return self.err(f"Couldn't start the mount driver ({e}). Is it installed?")
+            return f"Couldn't start the mount driver: {e.strerror or e}."
         if not self._wait_for_mount(proc, mp):
             try:
                 proc.kill()
@@ -602,12 +743,10 @@ class DrivesInterface(QWidget):
                 pass
             errors.seek(0)
             lines = [l for l in errors.read().decode(errors="replace").splitlines() if l.strip()]
-            detail = lines[-1].strip() if lines else "it stopped without saying why"
-            return self.err(f"The drive couldn't be mounted: {detail}")
+            detail = lines[-1].strip() if lines else "the mount driver stopped without saying why"
+            return f"Couldn't mount the drive: {detail}"
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
-        self.refresh()
-        self.ok(f"Unlocked at {mp}")
-        QTimer.singleShot(300, lambda: open_in_file_manager(mp))
+        return None
 
     def _wait_for_mount(self, proc, mp, timeout=15.0):
         """True once `mp` is mounted; False if the adapter exits first or the
