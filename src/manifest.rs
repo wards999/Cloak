@@ -9,9 +9,22 @@
 //! 12-byte nonce prefix followed by the ChaCha20 keystream XORed over the JSON.
 //! Losing or corrupting one manifest costs you only that one directory's child
 //! names — not the whole store — which is the resilience win of per-directory
-//! manifests over a single global index.
+//! manifests over a single global index. Saves go through
+//! [`crate::durable::write_atomic`], so a crash never leaves one torn.
+//!
+//! When a store folder is synced between machines and both change the same
+//! folder, the sync tool keeps both manifests by renaming one
+//! (`manifest (conflicted copy).idx`, `manifest-PC.idx`,
+//! `manifest.sync-conflict-….idx`, `manifest 2.idx`). [`merge_conflicts`]
+//! folds those back in so neither side's files go missing.
+//!
+//! A very large directory's list is split across parts (`manifest.p00.idx`
+//! …), so a change rewrites one part instead of the whole list; `manifest.idx`
+//! then holds only a tag per part. See [`crate::dircache`], which reads and
+//! writes listings in either form.
 
 use crate::crypto::{transform_region, Key, NONCE_LEN};
+use crate::durable;
 use crate::names;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -30,7 +43,7 @@ pub enum Kind {
 }
 
 /// One child entry in a directory's manifest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Child {
     /// Name the user sees, e.g. `Taxes` or `Return.pdf`.
     pub real: String,
@@ -39,7 +52,9 @@ pub struct Child {
     pub kind: Kind,
     /// Per-file ChaCha20 nonce (unused / zeroed for directories).
     pub nonce: [u8; NONCE_LEN],
-    /// Plaintext file size (0 for directories).
+    /// Plaintext file size when the entry was last saved (0 for directories).
+    /// Only a hint: the boring file's length on disk is authoritative, since
+    /// writes no longer rewrite the manifest.
     pub size: u64,
 }
 
@@ -50,9 +65,47 @@ impl Child {
 }
 
 /// The decrypted contents of one directory's manifest.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub children: Vec<Child>,
+    /// In a split directory's `manifest.idx`: the tag each part was last
+    /// written with, so a part that hasn't caught up (a sync tool delivering
+    /// files one at a time) is noticed. Empty for a list kept in one file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<u64>,
+    /// In a part file: the tag it was written with.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tag: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Parts a directory's list is split into once it outgrows one file.
+pub const PARTS: usize = 64;
+
+/// The file holding part `i` of a split list.
+pub fn part_name(i: usize) -> String {
+    format!("manifest.p{i:02}.idx")
+}
+
+fn is_part_name(lower: &str) -> bool {
+    lower.len() == 16
+        && lower.starts_with("manifest.p")
+        && lower.ends_with(".idx")
+        && lower[10..12].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Which of `parts` parts holds the child with this boring name. Keyed by the
+/// boring name, which a rename never changes, so a rename touches one part.
+/// FNV-1a: it must give the same answer on every machine and Rust version.
+pub fn part_of(boring: &str, parts: usize) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in boring.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h % parts as u64) as usize
 }
 
 impl Manifest {
@@ -68,30 +121,24 @@ impl Manifest {
         if !path.exists() {
             return Ok(Manifest::default());
         }
-        let mut bytes = std::fs::read(&path)?;
+        Self::load_file(&path, key)
+    }
+
+    fn load_file(path: &Path, key: &Key) -> io::Result<Manifest> {
+        Self::from_sealed(std::fs::read(path)?, key)
+    }
+
+    /// Decrypt and parse a manifest file's bytes.
+    pub fn from_sealed(bytes: Vec<u8>, key: &Key) -> io::Result<Manifest> {
         if bytes.len() < NONCE_LEN {
             return Ok(Manifest::default());
         }
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(&bytes[..NONCE_LEN]);
-        let body = &mut bytes[NONCE_LEN..];
-        // Symmetric stream cipher: XOR the keystream from offset 0 to decrypt.
-        transform_region(key, &nonce, 0, body);
-        let manifest: Manifest = serde_json::from_slice(body)?;
-        Ok(manifest)
+        Ok(serde_json::from_slice(&unseal(bytes, key))?)
     }
 
     /// Encrypt and write the manifest into `dir`, with a fresh random nonce.
     pub fn save(&self, dir: &Path, key: &Key) -> io::Result<()> {
-        let mut body = serde_json::to_vec(self)?;
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        transform_region(key, &nonce, 0, &mut body);
-
-        let mut out = Vec::with_capacity(NONCE_LEN + body.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&body);
-        std::fs::write(Self::path_in(dir), out)
+        durable::write_atomic(&Self::path_in(dir), &seal(serde_json::to_vec(self)?, key))
     }
 
     // Name matching is case-insensitive and Unicode-normalization-insensitive:
@@ -114,6 +161,152 @@ impl Manifest {
             self.children.iter().map(|c| c.boring.clone()).collect();
         set.insert(MANIFEST_NAME.to_string());
         set
+    }
+}
+
+/// Encrypt `body` under a fresh nonce: `nonce || keystream XOR body`.
+pub fn seal(mut body: Vec<u8>, key: &Key) -> Vec<u8> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    transform_region(key, &nonce, 0, &mut body);
+    let mut out = Vec::with_capacity(NONCE_LEN + body.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Undo [`seal`]. Input shorter than a nonce comes back empty.
+pub fn unseal(bytes: Vec<u8>, key: &Key) -> Vec<u8> {
+    if bytes.len() < NONCE_LEN {
+        return Vec::new();
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&bytes[..NONCE_LEN]);
+    let mut body = bytes[NONCE_LEN..].to_vec();
+    transform_region(key, &nonce, 0, &mut body);
+    body
+}
+
+/// Is `name` a sync tool's renamed copy of a manifest? Boring names never
+/// start with `manifest`, so anything else of the form `manifest….idx` is one.
+pub fn is_conflict_copy(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower != MANIFEST_NAME
+        && !is_part_name(&lower)
+        && lower.starts_with("manifest")
+        && lower.ends_with(".idx")
+}
+
+/// Three-way merge of a directory list: `ours` and `theirs` both started from
+/// `base`. Entries are matched by boring name. An entry added on either side
+/// is kept, one removed on either side is dropped (unless the other side
+/// changed it), and one changed on both sides takes our version. Real names
+/// that end up clashing get ` (conflict N)`.
+pub fn merge3(base: &[Child], ours: &[Child], theirs: &[Child]) -> Vec<Child> {
+    use std::collections::HashMap;
+    let by = |v: &[Child]| v.iter().map(|c| (c.boring.clone(), c.clone())).collect::<HashMap<_, _>>();
+    let (b, o, t) = (by(base), by(ours), by(theirs));
+    let mut out = Vec::new();
+    for c in ours {
+        match (b.get(&c.boring), t.get(&c.boring)) {
+            (None, _) => out.push(c.clone()),                     // we added it
+            (Some(_), Some(tc)) if b[&c.boring] == *c => out.push(tc.clone()), // only they changed it
+            (Some(_), Some(_)) => out.push(c.clone()),            // we changed it
+            (Some(bc), None) if bc != c => out.push(c.clone()),   // they removed, we changed
+            (Some(_), None) => {}                                 // they removed it
+        }
+    }
+    for c in theirs {
+        if o.contains_key(&c.boring) {
+            continue;
+        }
+        match b.get(&c.boring) {
+            None => out.push(c.clone()),                  // they added it
+            Some(bc) if bc != c => out.push(c.clone()),   // we removed, they changed
+            Some(_) => {}                                 // we removed it
+        }
+    }
+    unique_names(out)
+}
+
+/// Rename the later of any two children whose real names clash.
+fn unique_names(children: Vec<Child>) -> Vec<Child> {
+    let mut kept: Vec<Child> = Vec::with_capacity(children.len());
+    let mut seen = std::collections::HashSet::new();
+    for mut child in children {
+        let original = child.real.clone();
+        let mut n = 1;
+        while !seen.insert(names::fold(&child.real)) {
+            child.real = conflict_name(&original, n);
+            n += 1;
+        }
+        kept.push(child);
+    }
+    kept
+}
+
+/// Fold any sync-conflict copies of `dir`'s manifest back into it, then delete
+/// them. Returns how many copies were merged.
+///
+/// The result is the union of every readable copy, keyed by boring name (the
+/// main manifest wins where copies disagree), keeping only entries whose
+/// boring file still exists — so a file deleted on one machine stays deleted,
+/// and one added on either machine appears. Two different files that ended up
+/// with the same real name get ` (conflict N)` added to the later one. A copy
+/// that can't be read (wrong key, damaged) is left in place.
+pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
+    let mut copies: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(is_conflict_copy))
+        .map(|e| e.path())
+        .collect();
+    if copies.is_empty() {
+        return Ok(0);
+    }
+    copies.sort();
+
+    let main_path = Manifest::path_in(dir);
+    let listing = crate::dircache::read_listing(dir, key);
+    let parts = listing.as_ref().map_or(0, |l| l.parts);
+    let mut merged = Manifest {
+        // A damaged main list: rebuild from the copies alone.
+        children: listing.map(|l| l.children).unwrap_or_default(),
+        ..Manifest::default()
+    };
+    let mut used = Vec::new();
+    for copy in &copies {
+        let Ok(other) = Manifest::load_file(copy, key) else {
+            continue;
+        };
+        for child in other.children {
+            if !merged.children.iter().any(|c| c.boring == child.boring) {
+                merged.children.push(child);
+            }
+        }
+        used.push(copy);
+    }
+    if used.is_empty() {
+        return Ok(0);
+    }
+    merged.children.retain(|c| dir.join(&c.boring).exists());
+
+    merged.children = unique_names(merged.children);
+    crate::dircache::write_listing(dir, key, &merged.children, parts, &mut vec![0; parts], None)?;
+    for copy in &used {
+        if **copy != main_path {
+            std::fs::remove_file(copy)?;
+        }
+    }
+    durable::sync_dir(dir)?;
+    Ok(used.len())
+}
+
+/// `report.pdf` -> `report (conflict 1).pdf`; folders and dotfiles get the tag
+/// at the end.
+pub fn conflict_name(real: &str, n: usize) -> String {
+    match real.rfind('.') {
+        Some(dot) if dot > 0 => format!("{} (conflict {n}){}", &real[..dot], &real[dot..]),
+        _ => format!("{real} (conflict {n})"),
     }
 }
 
@@ -183,5 +376,65 @@ mod tests {
         let used = m.used_boring_names();
         assert!(used.contains("cache_0001.dat"));
         assert!(used.contains(MANIFEST_NAME));
+    }
+
+    fn file_child(real: &str, boring: &str) -> Child {
+        Child {
+            real: real.into(),
+            boring: boring.into(),
+            kind: Kind::File,
+            nonce: [1; NONCE_LEN],
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn conflict_copy_names() {
+        for n in [
+            "manifest (Simon's conflicted copy 2026-11-02).idx",
+            "manifest-DESKTOP-4F2.idx",
+            "manifest.sync-conflict-20261102-101010-ABCDEF.idx",
+            "manifest 2.idx",
+            "manifest (1).idx",
+        ] {
+            assert!(is_conflict_copy(n), "{n}");
+        }
+        for n in ["manifest.idx", "update_manifest_0001.idx", "manifest.idx.new", "cache_0001.idx"] {
+            assert!(!is_conflict_copy(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn merges_both_sides_of_a_sync_conflict() {
+        let d = tempdir().unwrap();
+        let key = [4u8; 32];
+        for b in ["cache_0001.dat", "cache_0002.dat", "cache_0003.dat", "cache_0004.dat"] {
+            std::fs::write(d.path().join(b), b"x").unwrap();
+        }
+        // Machine A: added "a.txt"; machine B: added "b.txt". Both had "shared"
+        // and "gone.txt" (deleted on one side, so its file is missing). B also
+        // created a different "Notes.txt" than A's "notes.txt".
+        let mut a = Manifest::default();
+        a.children.push(file_child("shared", "cache_0001.dat"));
+        a.children.push(file_child("a.txt", "cache_0002.dat"));
+        a.children.push(file_child("notes.txt", "cache_0003.dat"));
+        a.save(d.path(), &key).unwrap();
+        let mut b = Manifest::default();
+        b.children.push(file_child("shared", "cache_0001.dat"));
+        b.children.push(file_child("gone.txt", "cache_0009.dat"));
+        b.children.push(file_child("b.txt", "cache_0004.dat"));
+        b.children.push(file_child("Notes.txt", "cache_0005.dat"));
+        std::fs::write(d.path().join("cache_0005.dat"), b"y").unwrap();
+        b.save(d.path(), &key).unwrap();
+        std::fs::rename(Manifest::path_in(d.path()), d.path().join("manifest (conflicted copy).idx")).unwrap();
+        a.save(d.path(), &key).unwrap();
+
+        assert_eq!(merge_conflicts(d.path(), &key).unwrap(), 1);
+        let m = Manifest::load(d.path(), &key).unwrap();
+        let mut names: Vec<&str> = m.children.iter().map(|c| c.real.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Notes (conflict 1).txt", "a.txt", "b.txt", "notes.txt", "shared"]);
+        assert!(!d.path().join("manifest (conflicted copy).idx").exists());
+        assert_eq!(merge_conflicts(d.path(), &key).unwrap(), 0);
     }
 }

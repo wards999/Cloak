@@ -68,6 +68,7 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             let path = req(args, 2)?;
             let mut store = Store::open_with_passphrase(dir, &pass)?;
             store.mkdir(&path)?;
+            store.sync()?;
             Ok(ok())
         }
         "write" => {
@@ -77,6 +78,7 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             let mut store = Store::open_with_passphrase(dir, &pass)?;
             store.create(&path)?;
             store.write_at(&path, 0, &data)?;
+            store.sync()?;
             Ok(ok())
         }
         "read" => {
@@ -91,6 +93,7 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             let path = req(args, 2)?;
             let mut store = Store::open_with_passphrase(dir, &pass)?;
             store.remove(&path)?;
+            store.sync()?;
             Ok(ok())
         }
         "mv" => {
@@ -98,6 +101,7 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             let new = req(args, 3)?;
             let mut store = Store::open_with_passphrase(dir, &pass)?;
             store.rename_path(&old, &new)?;
+            store.sync()?;
             Ok(ok())
         }
         other => Err(format!("unknown command: {other}").into()),
