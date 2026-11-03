@@ -182,6 +182,8 @@ mod imp {
         }
 
         /// Look up an existing path: its stored spelling, inode and attributes.
+        /// Counts a lookup on the inode, so only for a reply that hands it to
+        /// the kernel (lookup, create, mkdir), which later `forget`s it.
         fn entry(&self, path: &str) -> Result<FileAttr, i32> {
             let m = self
                 .reader()
@@ -194,7 +196,7 @@ mod imp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| path.to_string());
-            let ino = self.inodes().ino(&canonical);
+            let ino = self.inodes().looked_up(&canonical);
             Ok(self.attr(ino, m))
         }
 
@@ -219,6 +221,7 @@ mod imp {
             children.sort_by_cached_key(|e| cloak::names::fold(&e.name));
 
             let mut inodes = self.inodes();
+            inodes.trim();
             let parent_ino = if ino == ROOT_INO {
                 ROOT_INO
             } else {
@@ -257,6 +260,13 @@ mod imp {
                 Ok(attr) => reply.entry(&ENTRY_TTL, &attr, 0),
                 Err(e) => reply.error(e),
             });
+        }
+
+        /// The kernel is done with `nlookup` of the times it was given `ino`;
+        /// once it has none left the inode table lets the entry go, which
+        /// keeps the table from growing for as long as the drive is mounted.
+        fn forget(&mut self, _req: &Request, ino: u64, nlookup: u64) {
+            self.inodes().forget(ino, nlookup);
         }
 
         fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -473,7 +483,7 @@ mod imp {
                     Some(_) => {
                         let canonical = self.canonical(&path);
                         self.store().remove(&path).map_err(|e| errno(&e))?;
-                        self.inodes().forget(&canonical);
+                        self.inodes().remove(&canonical);
                         Ok(())
                     }
                 }
@@ -500,7 +510,7 @@ mod imp {
                 }
                 let canonical = self.canonical(&path);
                 self.store().remove(&path).map_err(|e| errno(&e))?;
-                self.inodes().forget(&canonical);
+                self.inodes().remove(&canonical);
                 Ok(())
             });
             match result {
@@ -543,7 +553,7 @@ mod imp {
                     let new_canonical = self.canonical(&new);
                     self.store().rename_replace(&old, &new).map_err(|e| errno(&e))?;
                     if replaced {
-                        self.inodes().forget(&new_canonical);
+                        self.inodes().remove(&new_canonical);
                     }
                 }
                 let new_canonical = self.canonical(&new);
