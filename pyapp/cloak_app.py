@@ -470,7 +470,7 @@ class CreateDialog(FocusedDialog):
         self.pick.clicked.connect(self._choose)
 
     def _choose(self):
-        d = QFileDialog.getExistingDirectory(self, "Choose an empty folder for the drive")
+        d = QFileDialog.getExistingDirectory(self, "Choose an empty folder for the drive", str(Path.home()))
         if d:
             self.loc.setText(os.path.normpath(d))
 
@@ -579,7 +579,7 @@ class AddExistingDialog(FocusedDialog):
         self.added = None  # (name, folder) once checked
 
     def _choose(self):
-        d = QFileDialog.getExistingDirectory(self, "Select an existing cloak drive folder")
+        d = QFileDialog.getExistingDirectory(self, "Select an existing cloak drive folder", str(Path.home()))
         if d:
             d = os.path.normpath(d)
             self.loc.setText(d)
@@ -728,7 +728,7 @@ class RestoreDialog(FocusedDialog):
             self.bpw.setFocus()
 
     def _choose_target(self):
-        d = QFileDialog.getExistingDirectory(self, "The drive's folder", self.target.text())
+        d = QFileDialog.getExistingDirectory(self, "The drive's folder", self.target.text() or str(Path.home()))
         if d:
             self.target.setText(os.path.normpath(d))
 
@@ -1137,6 +1137,17 @@ class Cloak(FluentWindow):
         self.setWindowTitle("cloak")
         self.resize(820, 560)
         self.navigationInterface.setReturnButtonVisible(False)
+        if sys.platform == "darwin":
+            # The traffic lights take the top-left corner (systemTitleBarRect):
+            # the sidebar's menu button and items start below them, and the
+            # title bar (which the library puts at x=46) starts its contents,
+            # the app name, after them.
+            panel = self.navigationInterface.panel.vBoxLayout
+            m = panel.contentsMargins()
+            panel.setContentsMargins(m.left(), self.LIGHTS_BOTTOM, m.right(), m.bottom())
+            m = self.titleBar.hBoxLayout.contentsMargins()
+            left = self.LIGHTS_W + 12 - 46
+            self.titleBar.hBoxLayout.setContentsMargins(left, m.top(), m.right(), m.bottom())
         self.auto_lock = load_settings()["auto_lock"]
         self.drives = DrivesInterface(self)
         self.settings = SettingsInterface(self)
@@ -1153,12 +1164,16 @@ class Cloak(FluentWindow):
         self.drives.lock_all()
         super().closeEvent(e)
 
+    # The traffic lights' strip on macOS: its width, and where the sidebar
+    # starts below it.
+    LIGHTS_W, LIGHTS_BOTTOM = 75, 38
+
     def systemTitleBarRect(self, size):
         # Where macOS's traffic lights go. The widget library puts them top
-        # right, clear of its back and menu buttons; Mac windows have them top
-        # left, so they go just right of the menu button (the back button is
+        # right, clear of its back and menu buttons; Mac windows have them in
+        # the top-left corner, with the sidebar below (the back button is
         # hidden: two pages need no history).
-        return QRect(52, 0 if self.isFullScreen() else 8, 75, size.height())
+        return QRect(0, 0 if self.isFullScreen() else 8, self.LIGHTS_W, size.height())
 
 
 def main():
