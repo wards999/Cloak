@@ -727,7 +727,7 @@ mod tests {
         assert!(paths.contains(&"sub/manifest.idx"));
         assert_eq!(paths.iter().any(|p| p.starts_with("Photos/")), clash);
         assert_eq!(report.litter, vec!["Photos/.DS_Store".to_string()]);
-        assert_eq!(report.files, 6 + clash as u64); // fill's 6 and the clash (sub's is a problem)
+        assert_eq!(report.files, 6); // fill's 6: the clash and sub's file are problems instead
         assert!(report.encrypt_bytes < report.bytes);
 
         // Converting refuses, and leaves the folder as it was.
