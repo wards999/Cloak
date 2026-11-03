@@ -1137,6 +1137,13 @@ class Cloak(FluentWindow):
         self.setWindowTitle("cloak")
         self.resize(820, 560)
         self.navigationInterface.setReturnButtonVisible(False)
+        if sys.platform == "darwin":
+            # The title bar starts beside the menu button (the library puts it
+            # at x=46), where the traffic lights now are; start its contents
+            # (the app name) after them.
+            m = self.titleBar.hBoxLayout.contentsMargins()
+            left = self.LIGHTS_X + self.LIGHTS_W + 12 - 46
+            self.titleBar.hBoxLayout.setContentsMargins(left, m.top(), m.right(), m.bottom())
         self.auto_lock = load_settings()["auto_lock"]
         self.drives = DrivesInterface(self)
         self.settings = SettingsInterface(self)
@@ -1153,12 +1160,15 @@ class Cloak(FluentWindow):
         self.drives.lock_all()
         super().closeEvent(e)
 
+    # Where the traffic lights sit on macOS: just right of the menu button.
+    LIGHTS_X, LIGHTS_W = 52, 75
+
     def systemTitleBarRect(self, size):
         # Where macOS's traffic lights go. The widget library puts them top
         # right, clear of its back and menu buttons; Mac windows have them top
         # left, so they go just right of the menu button (the back button is
         # hidden: two pages need no history).
-        return QRect(52, 0 if self.isFullScreen() else 8, 75, size.height())
+        return QRect(self.LIGHTS_X, 0 if self.isFullScreen() else 8, self.LIGHTS_W, size.height())
 
 
 def main():
