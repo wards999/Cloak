@@ -56,6 +56,7 @@ src/engine.rs   Store: path/tree ops (mkdir / create / write_at / rename / move 
 src/names.rs    cross-platform name rules (NFC, case folding, limits, Windows mapping)
 src/durable.rs  crash-safe metadata writes (side file + flush + rename)
 src/backup.rs   password-protected recovery backups of headers and folder lists
+src/convert.rs  turn an existing folder into a drive in place (and back), crash-safe
 src/dircache.rs folder-list cache, delayed saving, and split lists for big folders
 src/inodes.rs   inode <-> path table for the fuser adapter
 src/bin/mount.rs     read-write fuser mount adapter (macOS/Linux)
@@ -184,6 +185,35 @@ different drive. The same is available from the command line:
 CLOAK_BACKUP_PASSPHRASE=... cloak backup out.cloakbak "Personal" D:/Personal "Work" E:/Work
 CLOAK_BACKUP_PASSPHRASE=... cloak backup-list out.cloakbak
 CLOAK_BACKUP_PASSPHRASE=... CLOAK_PASSPHRASE=... cloak restore out.cloakbak "Personal" D:/Personal
+```
+
+## Converting a folder you already have
+
+**Convert folder** makes an existing folder into a drive where it lies,
+without copying it. A drive's files hold their original bytes apart from the
+encrypted ends, so converting only renames each file and folder and encrypts
+each file's first and last 64 KiB: a 40 GB file costs no more than a small
+one, and almost no free space is needed. A dry run checks the folder first
+and changes nothing if anything is in the way (names a drive can't hold,
+links, read-only or cloud-only files, names cloak keeps for itself);
+`.DS_Store`, `Thumbs.db` and similar clutter are deleted.
+
+It's crash-safe: each folder's list is written before anything in it
+changes, and each file's original ends are journaled before they're touched,
+with its rename as the commit. An interrupted conversion shows **Resume** on
+the drive's card and carries on where it stopped; the drive can't be unlocked
+until it's finished. The return button on a locked drive's card turns it back
+into a plain folder the same way.
+
+The originals' plaintext ends may survive in the disk's free space (SSDs and
+copy-on-write file systems write elsewhere), real names linger in search
+indexes and recent-file lists, and a synced folder's service keeps the
+originals in its version history: the dry run warns about the last.
+
+```bash
+cloak convert-scan D:/Photos                 # the dry run: a JSON report
+CLOAK_PASSPHRASE=... cloak convert D:/Photos   # convert (or resume)
+CLOAK_PASSPHRASE=... cloak unconvert D:/Photos # back to a plain folder
 ```
 
 ## Performance notes

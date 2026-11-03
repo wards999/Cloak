@@ -68,6 +68,31 @@ pub fn key_from_meta(meta: &[u8], passphrase: &str) -> io::Result<(Key, u64)> {
     Ok((derived, meta.region))
 }
 
+/// Write a new drive's `meta.json` into `backing_dir`: a fresh salt, the
+/// current password settings, `region`, and a verifier for `passphrase`.
+/// Returns the drive's key.
+pub(crate) fn write_new_meta(backing_dir: &Path, passphrase: &str, region: u64) -> io::Result<Key> {
+    let salt = key::random_salt();
+    let kdf = key::KdfParams::CURRENT;
+    let derived = key::derive_key(passphrase, &salt, &kdf)?;
+
+    let mut verifier_nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut verifier_nonce);
+    let mut verifier = VERIFY_TOKEN.to_vec();
+    transform_region(&derived, &verifier_nonce, 0, &mut verifier);
+
+    let meta = StoreMeta {
+        version: 1,
+        salt,
+        region,
+        verifier_nonce,
+        verifier,
+        kdf,
+    };
+    durable::write_atomic(&backing_dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
+    Ok(derived)
+}
+
 /// What a path points at. The times are those of its boring file or directory
 /// on disk: the store records none of its own, and the disk already shows them
 /// to anyone looking at the backing folder, so passing them through reveals
@@ -318,24 +343,7 @@ impl Store {
                 "a drive already exists here",
             ));
         }
-        let salt = key::random_salt();
-        let kdf = key::KdfParams::CURRENT;
-        let derived = key::derive_key(passphrase, &salt, &kdf)?;
-
-        let mut verifier_nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut verifier_nonce);
-        let mut verifier = VERIFY_TOKEN.to_vec();
-        transform_region(&derived, &verifier_nonce, 0, &mut verifier);
-
-        let meta = StoreMeta {
-            version: 1,
-            salt,
-            region,
-            verifier_nonce,
-            verifier,
-            kdf,
-        };
-        durable::write_atomic(&meta_path, &serde_json::to_vec_pretty(&meta)?)?;
+        let derived = write_new_meta(&backing_dir, passphrase, region)?;
         Self::open(backing_dir, derived, region)
     }
 
@@ -350,6 +358,11 @@ impl Store {
         let meta_path = backing_dir.join("meta.json");
         if !meta_path.exists() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
+        }
+        if crate::convert::in_progress(&backing_dir) {
+            return Err(io::Error::other(
+                "this folder is part-way through being converted; finish converting it first",
+            ));
         }
         let (derived, region) = key_from_meta(&std::fs::read(&meta_path)?, passphrase)?;
         Self::open(backing_dir, derived, region)

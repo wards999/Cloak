@@ -26,7 +26,7 @@ from qfluentwidgets import (
     Theme, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel,
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
     ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
-    RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter,
+    RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter, ProgressBar,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -138,6 +138,63 @@ def engine(args, **env_vars):
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or "the engine failed").strip())
     return data
+
+
+def engine_with_progress(args, on_progress, **env_vars):
+    """Like `engine`, for a command that also prints progress lines
+    (`{"progress": n, "total": t}`): `on_progress(n, t)` is called for each,
+    with the window kept responsive."""
+    env = os.environ.copy()
+    env.update(env_vars)
+    try:
+        proc = subprocess.Popen([CLI, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, **NO_WINDOW)
+    except OSError as e:
+        raise RuntimeError(f"the engine wasn't found ({e})")
+    data = {}
+    for line in proc.stdout:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and "progress" in msg:
+            on_progress(msg["progress"], msg["total"])
+            QApplication.processEvents()
+        elif isinstance(msg, dict):
+            data = msg
+    err = proc.stderr.read()
+    proc.wait()
+    if "error" in data:
+        raise RuntimeError(data["error"])
+    if proc.returncode != 0:
+        raise RuntimeError((err or "the engine failed").strip())
+    return data
+
+
+def conversion_state(path):
+    """"converting" or "unconverting" if a run in `path` was interrupted."""
+    p = Path(path)
+    if (p / "converting.idx").exists():
+        return "converting"
+    if (p / "unconverting.idx").exists():
+        return "unconverting"
+    return None
+
+
+def _size(n):
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1000
+
+
+def _duration(seconds):
+    if seconds < 60:
+        return "under a minute"
+    minutes = round(seconds / 60)
+    if minutes < 90:
+        return f"about {minutes} minute{'s' if minutes != 1 else ''}"
+    return f"about {round(minutes / 60)} hours"
 
 
 def verify(path, password):
@@ -604,6 +661,179 @@ class AddExistingDialog(FocusedDialog):
         return True
 
 
+class ConvertDialog(FocusedDialog):
+    """Make an existing folder into a drive in place: check it first (the
+    dry run), then convert with a progress bar. Also finishes a conversion
+    that was interrupted (`resume`: the drive's name and folder)."""
+
+    def __init__(self, parent, known_paths, resume=None):
+        super().__init__(parent)
+        self.known = known_paths
+        self.checked = None  # the folder the shown report is for
+        self.titleLabel = SubtitleLabel("Finish converting" if resume else "Convert a folder into a drive", self)
+        self.intro = CaptionLabel(
+            "The folder's files stay where they are: cloak renames them and encrypts the start "
+            "and end of each, so even a large folder takes minutes, not hours.", self)
+        self.intro.setWordWrap(True)
+        self.name = LineEdit(self); self.name.setPlaceholderText("Name  (e.g. Personal)")
+        self.loc = LineEdit(self); self.loc.setPlaceholderText("The folder to convert")
+        self.pick = PushButton("Choose folder…", self)
+        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
+        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.report = BodyLabel("", self); self.report.setWordWrap(True); self.report.hide()
+        self.bar = ProgressBar(self); self.bar.hide()
+        row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
+        for w in (self.titleLabel, self.intro, self.name):
+            self.viewLayout.addWidget(w)
+        self.viewLayout.addLayout(row)
+        for w in (self.pw, self.pw2, self.report, self.bar):
+            self.viewLayout.addWidget(w)
+        self.finish_layout()
+        self.converted = None  # (name, folder) once done
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(470)
+        self.pick.clicked.connect(self._choose)
+        self.loc.textChanged.connect(self._unchecked)
+        self.pw2.returnPressed.connect(self.yesButton.click)
+        self.first = self.name
+        self.resume = bool(resume)
+        if resume:
+            self.name.setText(resume["name"]); self.loc.setText(resume["path"])
+            for w in (self.name, self.loc, self.pick):
+                w.setEnabled(False)
+            self.pw2.hide()
+            self.intro.setText("Converting this folder was interrupted. Enter the password you chose "
+                               "for it, and cloak carries on where it stopped.")
+            self.pw.returnPressed.connect(self.yesButton.click)
+            self.first = self.pw
+        self._unchecked()
+
+    def _choose(self):
+        d = QFileDialog.getExistingDirectory(self, "Choose the folder to convert", str(Path.home()))
+        if d:
+            d = os.path.normpath(d)
+            self.loc.setText(d)
+            if not self.name.text().strip():
+                self.name.setText(Path(d).name)
+
+    def _unchecked(self):
+        self.checked = None
+        self.report.hide()
+        self.yesButton.setText("Finish converting" if self.resume else "Check folder")
+        self.busy_text = "Converting…" if self.resume else "Checking…"
+
+    def validate(self):
+        name, loc = self.name.text().strip(), os.path.normpath(self.loc.text().strip() or ".")
+        if not name:
+            return self.problem("Give the drive a name.", self.name)
+        if not self.loc.text().strip() or not os.path.isdir(loc):
+            return self.problem("Choose the folder to convert.", self.pick)
+        if not self.resume and loc in self.known:
+            return self.problem("That folder is already in your list of drives.", self.loc)
+        if not self.pw.text():
+            return self.problem("Enter a password.", self.pw)
+        if not self.resume and self.pw.text() != self.pw2.text():
+            return self.problem("The passwords don't match.", self.pw2)
+        if self.resume or self.checked == loc:
+            return self._convert(name, loc)
+        return self._check(loc)
+
+    def _check(self, loc):
+        """The dry run: show what converting would do; stays open either way."""
+        try:
+            r = engine(["convert-scan", loc])
+        except RuntimeError as e:
+            return self.problem(f"Couldn't check that folder: {e}", self.loc)
+        if r.get("resume"):
+            return self.problem("Converting this folder was interrupted. Add it with Add existing, "
+                                "then use Resume on its card.", self.loc)
+        problems = r.get("problems", [])
+        if problems:
+            lines = [f"• {p['path'] or 'The folder'}: {p['problem']}" for p in problems[:8]]
+            more = f"\n…and {len(problems) - 8} more." if len(problems) > 8 else ""
+            return self.problem("Fix these first, then check again:\n" + "\n".join(lines) + more, self.loc)
+        files, folders = r["files"], r["folders"]
+        # Each file costs a few small writes plus its ends, whatever its size.
+        estimate = files * 0.01 + r["encrypt_bytes"] / 100e6
+        text = (f"{files:,} file{'s' if files != 1 else ''} in {folders + 1:,} folder{'s' if folders else ''}, "
+                f"{_size(r['bytes'])}. Converting should take {_duration(estimate)}.")
+        if r.get("litter"):
+            text += f"\n{len(r['litter'])} system clutter file(s) (.DS_Store, Thumbs.db…) will be deleted."
+        for w in r.get("warnings", []):
+            text += f"\n⚠ {w[:1].upper() + w[1:]}."
+        text += "\nKeep a backup of anything irreplaceable until you've checked the drive."
+        self.report.setText(text)
+        self.report.show()
+        self.checked = loc
+        self.yesButton.setText("Convert")
+        self.busy_text = "Converting…"
+        return False  # stay open: the next press converts
+
+    def _convert(self, name, loc):
+        self.bar.setValue(0); self.bar.show()
+
+        def progress(done, total):
+            self.bar.setValue(int(100 * done / total) if total else 100)
+
+        try:
+            engine_with_progress(["convert", loc], progress, CLOAK_PASSPHRASE=self.pw.text())
+        except RuntimeError as e:
+            self.bar.hide()
+            msg = str(e)
+            if conversion_state(loc) == "converting":
+                msg += "\nNothing is lost: what's done so far is kept, and converting again carries on from there."
+            return self.problem(f"Converting stopped: {msg}", self.pw)
+        self.converted = (name, loc)
+        return True
+
+
+class UnconvertDialog(FocusedDialog):
+    """Turn a drive back into a plain folder, in place."""
+
+    def __init__(self, parent, drive):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.titleLabel = SubtitleLabel(f"Turn “{drive['name']}” back into a plain folder", self)
+        resuming = conversion_state(self.path) == "unconverting"
+        text = ("This was interrupted. Enter the drive's password and cloak carries on where it stopped."
+                if resuming else
+                "Its files get their real names back and are decrypted where they lie, so its folder "
+                "becomes an ordinary, unprotected folder. Anyone with access to it can then read everything.")
+        self.intro = CaptionLabel(text, self); self.intro.setWordWrap(True)
+        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("The drive's password")
+        self.bar = ProgressBar(self); self.bar.hide()
+        for w in (self.titleLabel, self.intro, self.pw, self.bar):
+            self.viewLayout.addWidget(w)
+        self.finish_layout()
+        self.yesButton.setText("Turn back into a folder")
+        self.busy_text = "Working…"
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(450)
+        self.pw.returnPressed.connect(self.yesButton.click)
+        self.first = self.pw
+        self.done = False
+
+    def validate(self):
+        if not self.pw.text():
+            return self.problem("Enter the drive's password.", self.pw)
+        self.bar.setValue(0); self.bar.show()
+
+        def progress(done, total):
+            self.bar.setValue(int(100 * done / total) if total else 100)
+
+        try:
+            engine_with_progress(["unconvert", self.path], progress, CLOAK_PASSPHRASE=self.pw.text())
+        except RuntimeError as e:
+            self.bar.hide()
+            msg = str(e)
+            msg = msg[:1].upper() + msg[1:]
+            if conversion_state(self.path) == "unconverting":
+                msg += ". Nothing is lost: run this again to carry on from where it stopped"
+            return self.problem(msg + ".", self.pw)
+        self.done = True
+        return True
+
+
 def _documents():
     d = Path.home() / "Documents"
     return d if d.is_dir() else Path.home()
@@ -807,13 +1037,28 @@ class DriveCard(CardWidget):
         lay.addStretch(1)
 
         unlocked = mount is not None
-        status = CaptionLabel(
-            f"● Unlocked · {mount['mp']}" if unlocked else "○ Locked", self
-        )
-        status.setStyleSheet("color: #13b3a4;" if unlocked else "color: gray;")
+        state = None if unlocked else conversion_state(drive["path"])
+        if unlocked:
+            status = CaptionLabel(f"● Unlocked · {mount['mp']}", self)
+            status.setStyleSheet("color: #13b3a4;")
+        elif state:
+            what = "Converting" if state == "converting" else "Turning back into a folder"
+            status = CaptionLabel(f"◐ {what} wasn't finished", self)
+            status.setStyleSheet("color: #ca5010;")
+        else:
+            status = CaptionLabel("○ Locked", self)
+            status.setStyleSheet("color: gray;")
         lay.addWidget(status)
 
         row = QHBoxLayout()
+        if state:
+            resumeb = PrimaryPushButton("Resume", self)
+            resumeb.clicked.connect(lambda: callbacks["resume"](drive, state))
+            removeb = TransparentPushButton("Remove", self)
+            removeb.clicked.connect(lambda: callbacks["remove"](drive))
+            row.addWidget(resumeb); row.addStretch(1); row.addWidget(removeb)
+            lay.addLayout(row)
+            return
         if unlocked:
             openb = PushButton("Open", self)
             openb.clicked.connect(lambda: callbacks["open"](drive))
@@ -831,6 +1076,12 @@ class DriveCard(CardWidget):
         backupb.installEventFilter(ToolTipFilter(backupb))
         backupb.clicked.connect(lambda: callbacks["backup"](drive))
         row.insertWidget(1, backupb)
+        if not unlocked:
+            plainb = TransparentToolButton(FIF.RETURN, self)
+            plainb.setToolTip("Turn back into a plain folder")
+            plainb.installEventFilter(ToolTipFilter(plainb))
+            plainb.clicked.connect(lambda: callbacks["unconvert"](drive))
+            row.insertWidget(2, plainb)
         lay.addLayout(row)
 
 
@@ -849,9 +1100,14 @@ class DrivesInterface(QWidget):
         head.addWidget(TitleLabel("Your drives", self)); head.addStretch(1)
         addbtn = PushButton(FIF.FOLDER, "Add existing", self)
         addbtn.clicked.connect(self.import_existing)
+        convbtn = PushButton(FIF.SYNC, "Convert folder", self)
+        convbtn.setToolTip("Make a folder you already have into a drive, without copying it")
+        convbtn.installEventFilter(ToolTipFilter(convbtn))
+        convbtn.clicked.connect(lambda: self.convert_folder())
         newbtn = PrimaryPushButton(FIF.ADD, "New drive", self)
         newbtn.clicked.connect(self.create_drive)
         head.addWidget(addbtn)
+        head.addWidget(convbtn)
         head.addWidget(newbtn)
         lay.addLayout(head)
         lay.addWidget(CaptionLabel("Unlock a drive to mount it — then work with your files in Explorer.", self))
@@ -874,7 +1130,8 @@ class DrivesInterface(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove,
-               "backup": lambda d: self.back_up([d])}
+               "backup": lambda d: self.back_up([d]), "resume": self.resume_conversion,
+               "unconvert": self.unconvert}
         for d in self.drives:
             self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs))
 
@@ -904,6 +1161,36 @@ class DrivesInterface(QWidget):
         save_drives(self.drives)
         self.refresh()
         self.ok(f"Added “{name}”. Unlock it to mount.")
+
+    def convert_folder(self, resume=None):
+        known = {os.path.normpath(d["path"]) for d in self.drives}
+        dlg = ConvertDialog(self.win, known, resume)
+        if not dlg.exec() or not dlg.converted:
+            self.refresh()  # an interrupted run shows as such on its card
+            return
+        name, loc = dlg.converted
+        if not any(os.path.normpath(d["path"]) == loc for d in self.drives):
+            self.drives.insert(0, {"name": name, "path": loc})
+            save_drives(self.drives)
+        self.refresh()
+        self.ok(f"“{name}” is now a drive. Unlock it to mount.")
+
+    def resume_conversion(self, drive, state):
+        if state == "converting":
+            self.convert_folder(resume=drive)
+        else:
+            self.unconvert(drive)
+
+    def unconvert(self, drive):
+        if drive["path"] in self.mounts:
+            return self.err("Lock the drive first.")
+        dlg = UnconvertDialog(self.win, drive)
+        dlg.exec()
+        if dlg.done:
+            self.drives = [d for d in self.drives if d["path"] != drive["path"]]
+            save_drives(self.drives)
+            self.ok(f"“{drive['name']}” is a plain folder again: {drive['path']}")
+        self.refresh()
 
     def unlock(self, drive):
         letters = free_drive_letters()
