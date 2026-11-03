@@ -1138,11 +1138,15 @@ class Cloak(FluentWindow):
         self.resize(820, 560)
         self.navigationInterface.setReturnButtonVisible(False)
         if sys.platform == "darwin":
-            # The title bar starts beside the menu button (the library puts it
-            # at x=46), where the traffic lights now are; start its contents
-            # (the app name) after them.
+            # The traffic lights take the top-left corner (systemTitleBarRect):
+            # the sidebar's menu button and items start below them, and the
+            # title bar (which the library puts at x=46) starts its contents,
+            # the app name, after them.
+            panel = self.navigationInterface.panel.vBoxLayout
+            m = panel.contentsMargins()
+            panel.setContentsMargins(m.left(), self.LIGHTS_BOTTOM, m.right(), m.bottom())
             m = self.titleBar.hBoxLayout.contentsMargins()
-            left = self.LIGHTS_X + self.LIGHTS_W + 12 - 46
+            left = self.LIGHTS_W + 12 - 46
             self.titleBar.hBoxLayout.setContentsMargins(left, m.top(), m.right(), m.bottom())
         self.auto_lock = load_settings()["auto_lock"]
         self.drives = DrivesInterface(self)
@@ -1160,15 +1164,16 @@ class Cloak(FluentWindow):
         self.drives.lock_all()
         super().closeEvent(e)
 
-    # Where the traffic lights sit on macOS: just right of the menu button.
-    LIGHTS_X, LIGHTS_W = 52, 75
+    # The traffic lights' strip on macOS: its width, and where the sidebar
+    # starts below it.
+    LIGHTS_W, LIGHTS_BOTTOM = 75, 38
 
     def systemTitleBarRect(self, size):
         # Where macOS's traffic lights go. The widget library puts them top
-        # right, clear of its back and menu buttons; Mac windows have them top
-        # left, so they go just right of the menu button (the back button is
+        # right, clear of its back and menu buttons; Mac windows have them in
+        # the top-left corner, with the sidebar below (the back button is
         # hidden: two pages need no history).
-        return QRect(self.LIGHTS_X, 0 if self.isFullScreen() else 8, self.LIGHTS_W, size.height())
+        return QRect(0, 0 if self.isFullScreen() else 8, self.LIGHTS_W, size.height())
 
 
 def main():
