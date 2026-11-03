@@ -2,8 +2,8 @@
 //!
 //! The master key is never stored. It's derived from a passphrase with Argon2id
 //! (memory-hard, the current standard for password hashing) plus a random,
-//! non-secret salt kept in the store's `meta.json`. Same passphrase + same salt
-//! + same settings => same key. `meta.json` also holds a verifier (see
+//! non-secret salt kept in the store's `meta.json`. The same passphrase, salt
+//! and settings give the same key. `meta.json` also holds a verifier (see
 //! `engine.rs`) so a wrong passphrase is reported as such; Argon2id is what
 //! makes each guess against it expensive.
 //!

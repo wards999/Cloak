@@ -14,6 +14,15 @@
 //!   cloak read   <dir> <path> <dest>   extract a file out to disk
 //!   cloak rm     <dir> <path>          delete a file or folder
 //!   cloak mv     <dir> <old> <new>     rename / move
+//!
+//! Converting a folder in place (see `cloak::convert`):
+//!
+//!   cloak convert-scan <dir>           dry run, no password -> the report
+//!   cloak convert      <dir>           make the folder a drive (or resume)
+//!   cloak unconvert    <dir>           make a drive a plain folder again
+//!
+//! `convert` and `unconvert` also print `{"progress": n, "total": t}` lines
+//! while they run; the last line is the result as usual.
 
 use cloak::Store;
 use std::env;
@@ -38,7 +47,27 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
         return Ok(out);
     }
     let dir = args.get(1).ok_or("missing <dir>")?;
+    if cmd == "convert-scan" {
+        return Ok(serde_json::to_string(&cloak::convert::scan(std::path::Path::new(dir), REGION)?)?);
+    }
     let pass = env::var("CLOAK_PASSPHRASE").map_err(|_| "CLOAK_PASSPHRASE not set")?;
+    if cmd == "convert" || cmd == "unconvert" {
+        let dir = std::path::Path::new(dir);
+        let mut shown = std::time::Instant::now();
+        let mut progress = |done: u64, total: u64| {
+            // A line every so often is plenty for a progress bar.
+            if done == total || shown.elapsed() >= std::time::Duration::from_millis(200) {
+                shown = std::time::Instant::now();
+                println!("{}", serde_json::json!({ "progress": done, "total": total }));
+            }
+        };
+        if cmd == "convert" {
+            cloak::convert::convert(dir, &pass, REGION, &mut progress)?;
+        } else {
+            cloak::convert::unconvert(dir, &pass, &mut progress)?;
+        }
+        return Ok(ok());
+    }
 
     match cmd {
         "create" => {

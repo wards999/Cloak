@@ -27,6 +27,7 @@
 
 pub mod backup;
 pub mod boring;
+pub mod convert;
 pub mod crypto;
 pub mod dircache;
 pub mod durable;
