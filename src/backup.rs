@@ -18,7 +18,7 @@
 use crate::crypto::Key;
 use crate::durable;
 use crate::engine::key_from_meta;
-use crate::key::{derive_key, random_salt, SALT_LEN};
+use crate::key::{derive_key, random_salt, KdfParams, SALT_LEN};
 use crate::manifest::{is_list_file, Manifest};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -110,7 +110,7 @@ pub fn write(out: &Path, password: &str, drives: Vec<DriveBackup>) -> io::Result
     let salt = random_salt();
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let sealed = cipher(password, &salt)
+    let sealed = cipher(password, &salt)?
         .encrypt(XNonce::from_slice(&nonce), body.as_slice())
         .map_err(|_| io::Error::other("couldn't encrypt the backup"))?;
     let mut file = Vec::with_capacity(MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + sealed.len());
@@ -138,7 +138,7 @@ pub fn read(file: &Path, password: &str) -> io::Result<Backup> {
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&bytes[MAGIC.len() + 1..MAGIC.len() + 1 + SALT_LEN]);
     let nonce = XNonce::from_slice(&bytes[MAGIC.len() + 1 + SALT_LEN..head]);
-    let body = cipher(password, &salt).decrypt(nonce, &bytes[head..]).map_err(|_| {
+    let body = cipher(password, &salt)?.decrypt(nonce, &bytes[head..]).map_err(|_| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             "wrong backup password, or the backup file is damaged",
@@ -147,9 +147,11 @@ pub fn read(file: &Path, password: &str) -> io::Result<Backup> {
     Ok(serde_json::from_slice(&body)?)
 }
 
-fn cipher(password: &str, salt: &[u8; SALT_LEN]) -> XChaCha20Poly1305 {
-    let key: Key = derive_key(password, salt);
-    XChaCha20Poly1305::new(&key.into())
+/// Version-1 backups always use the original Argon2id settings; a backup with
+/// other settings would record them under a new version byte.
+fn cipher(password: &str, salt: &[u8; SALT_LEN]) -> io::Result<XChaCha20Poly1305> {
+    let key: Key = derive_key(password, salt, &KdfParams::ORIGINAL)?;
+    Ok(XChaCha20Poly1305::new(&key.into()))
 }
 
 /// What a restore did, by path inside the drive's folder.

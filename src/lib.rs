@@ -38,5 +38,5 @@ pub mod names;
 
 pub use crypto::{Key, Nonce, KEY_LEN, NONCE_LEN};
 pub use engine::{DirEntry, Metadata, Store};
-pub use key::{derive_key, Salt};
+pub use key::{derive_key, KdfParams, Salt};
 pub use manifest::{Child, Kind, Manifest};
