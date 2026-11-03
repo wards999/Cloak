@@ -47,6 +47,10 @@ struct StoreMeta {
     /// Nonce + ciphertext of VERIFY_TOKEN under the derived key.
     verifier_nonce: [u8; NONCE_LEN],
     verifier: Vec<u8>,
+    /// The Argon2id settings the key is derived with. Absent in drives made
+    /// before they were recorded, which used the original ones.
+    #[serde(default)]
+    kdf: key::KdfParams,
 }
 
 /// The key and region for `passphrase`, from the bytes of a store's
@@ -55,7 +59,7 @@ struct StoreMeta {
 pub fn key_from_meta(meta: &[u8], passphrase: &str) -> io::Result<(Key, u64)> {
     let meta: StoreMeta = serde_json::from_slice(meta)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("damaged drive header: {e}")))?;
-    let derived = key::derive_key(passphrase, &meta.salt);
+    let derived = key::derive_key(passphrase, &meta.salt, &meta.kdf)?;
     let mut check = meta.verifier.clone();
     transform_region(&derived, &meta.verifier_nonce, 0, &mut check);
     if check != VERIFY_TOKEN {
@@ -315,7 +319,8 @@ impl Store {
             ));
         }
         let salt = key::random_salt();
-        let derived = key::derive_key(passphrase, &salt);
+        let kdf = key::KdfParams::CURRENT;
+        let derived = key::derive_key(passphrase, &salt, &kdf)?;
 
         let mut verifier_nonce = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut verifier_nonce);
@@ -328,6 +333,7 @@ impl Store {
             region,
             verifier_nonce,
             verifier,
+            kdf,
         };
         durable::write_atomic(&meta_path, &serde_json::to_vec_pretty(&meta)?)?;
         Self::open(backing_dir, derived, region)
@@ -1522,6 +1528,38 @@ mod tests {
         assert_eq!(
             Store::open_with_passphrase(empty.path(), "x").err().map(|e| e.kind()),
             Some(io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn password_settings_are_recorded_and_old_drives_still_open() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "right", 64).unwrap();
+            s.create("note.txt").unwrap();
+            s.write_at("note.txt", 0, b"kept").unwrap();
+        }
+        let meta_path = d.path().join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<key::KdfParams>(meta["kdf"].clone()).unwrap(),
+            key::KdfParams::CURRENT
+        );
+
+        // A drive from before the settings were recorded has none: it opens
+        // with the original ones.
+        meta.as_object_mut().unwrap().remove("kdf");
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let s = Store::open_with_passphrase(d.path(), "right").unwrap();
+        assert_eq!(s.read_all("note.txt").unwrap(), b"kept");
+
+        // Settings out of range are refused rather than tried.
+        meta["kdf"] = serde_json::json!({ "m_cost": u32::MAX, "t_cost": 2, "p_cost": 1 });
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert_eq!(
+            Store::open_with_passphrase(d.path(), "right").err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
         );
     }
 
