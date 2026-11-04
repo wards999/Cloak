@@ -1,10 +1,12 @@
-//! Recovery backups: a drive's `meta.json` and every folder list, for one
-//! drive or several, in one password-protected file.
+//! Recovery backups: every folder list of a drive, for one drive or several,
+//! in one password-protected file.
 //!
-//! Those are the files whose loss costs the most: without `meta.json` no
-//! password can open the drive, and without a folder's list its file names
-//! and the keys to the encrypted ends of its files are gone. They're small, so
-//! a backup of them is quick to make and easy to keep somewhere safe.
+//! A drive's files describe themselves (see `docs/FORMAT.md`), so a lost list
+//! is rebuilt from them; but only a list knows a rename its files' envelopes
+//! haven't caught up with yet, the names of folders whose lists were both
+//! lost, and empty folders. The lists are small, so a backup of them is quick
+//! to make and easy to keep somewhere safe. Each list carries the drive's
+//! lock, so a backup also proves which drive it belongs to.
 //!
 //! The file is `CLOAKBAK`, a version byte, a salt and a nonce, then the
 //! contents (JSON) sealed with XChaCha20-Poly1305 under an Argon2id key from
@@ -17,8 +19,8 @@
 
 use crate::crypto::Key;
 use crate::durable;
-use crate::engine::key_from_meta;
 use crate::key::{derive_key, random_salt, KdfParams, SALT_LEN};
+use crate::lock::{self, Keys};
 use crate::manifest::{is_list_file, Manifest};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -29,7 +31,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"CLOAKBAK";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const NONCE_LEN: usize = 24;
 
 /// One drive's recovery files.
@@ -39,8 +41,8 @@ pub struct DriveBackup {
     pub name: String,
     /// Where the drive's folder was when backed up.
     pub path: String,
-    /// Each file by its path inside the drive's folder (`/`-separated),
-    /// `meta.json` first.
+    /// Each list file by its path inside the drive's folder (`/`-separated),
+    /// the top folder's first.
     pub files: Vec<(String, Hex)>,
 }
 
@@ -77,12 +79,12 @@ impl<'de> Deserialize<'de> for Hex {
     }
 }
 
-/// Gather a drive's recovery files from its folder.
-pub fn collect(name: &str, store: &Path) -> io::Result<DriveBackup> {
-    let meta = std::fs::read(store.join("meta.json")).map_err(|e| {
-        io::Error::new(e.kind(), format!("{}: no drive header (meta.json): {e}", store.display()))
-    })?;
-    let mut files = vec![("meta.json".to_string(), Hex(meta))];
+/// Gather a drive's recovery files from its folder; `password` is the
+/// drive's own (its lists' names come from its key).
+pub fn collect(name: &str, store: &Path, password: &str) -> io::Result<DriveBackup> {
+    let keys = crate::engine::unlock(store, password)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", store.display())))?;
+    let mut files = Vec::new();
     let mut dirs = vec![(store.to_path_buf(), String::new())];
     while let Some((dir, rel)) = dirs.pop() {
         let mut entries: Vec<_> = std::fs::read_dir(&dir)?.flatten().collect();
@@ -92,11 +94,13 @@ pub fn collect(name: &str, store: &Path) -> io::Result<DriveBackup> {
             let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
             if e.file_type()?.is_dir() {
                 dirs.push((e.path(), path));
-            } else if is_list_file(&name) {
+            } else if is_list_file(&keys.master, &name) {
                 files.push((path, Hex(std::fs::read(e.path())?)));
             }
         }
     }
+    // The top folder's list first.
+    files.sort_by_key(|(p, _)| p.contains('/'));
     Ok(DriveBackup { name: name.to_string(), path: store.display().to_string(), files })
 }
 
@@ -165,59 +169,54 @@ pub struct Restored {
     pub skipped: Vec<String>,
 }
 
-/// Put `backup`'s recovery files back into the drive folder `store`, where
-/// they're missing or can't be read. `password` is the drive's own password:
-/// it proves the backup belongs to this drive and decides which lists still
+/// Put `backup`'s lists back into the drive folder `store`, where they're
+/// missing or can't be read. `password` is the drive's own password: it
+/// proves the backup belongs to this drive and decides which lists still
 /// read.
 pub fn restore(store: &Path, password: &str, backup: &DriveBackup) -> io::Result<Restored> {
-    let meta = backup
+    // The backup's drive, from the lock its lists carry.
+    let tail = crate::envelope::LEN as usize;
+    let first = backup
         .files
         .iter()
-        .find(|(p, _)| p == "meta.json")
         .map(|(_, d)| &d.0)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the backup has no drive header"))?;
-    let (key, _) = key_from_meta(meta, password).map_err(|e| match e.kind() {
-        io::ErrorKind::PermissionDenied => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "wrong password for this drive",
-        ),
-        _ => e,
-    })?;
+        .find(|d| d.len() >= tail)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the backup holds no lists"))?;
+    let keys: Keys = lock::unlock_one(&first[first.len() - tail..first.len() - tail + lock::LEN], password)
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::PermissionDenied => {
+                io::Error::new(io::ErrorKind::PermissionDenied, "wrong password for this drive")
+            }
+            _ => e,
+        })?;
     if !store.is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "the drive's folder doesn't exist"));
     }
-
-    let mut done = Restored::default();
-    // The header: put back if missing or damaged. One that reads but doesn't
-    // take this password belongs to another drive: stop rather than replace it.
-    let meta_path = store.join("meta.json");
-    match std::fs::read(&meta_path) {
-        Ok(current) => match key_from_meta(&current, password) {
-            Ok(_) => done.kept.push("meta.json".into()),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "that folder holds a different drive than the one in the backup",
-                ))
-            }
-            Err(_) => {
-                durable::write_atomic(&meta_path, meta)?;
-                done.restored.push("meta.json".into());
-            }
-        },
-        Err(_) => {
-            durable::write_atomic(&meta_path, meta)?;
-            done.restored.push("meta.json".into());
+    // What's in the folder must be the same drive (or nothing at all).
+    match crate::engine::unlock(store, password) {
+        Ok(k) if k.master != keys.master => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "that folder holds a different drive than the one in the backup",
+            ))
         }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "that folder holds a different drive than the one in the backup (or its password has changed since)",
+            ))
+        }
+        _ => {}
     }
 
-    for (rel, data) in backup.files.iter().filter(|(p, _)| p != "meta.json") {
+    let mut done = Restored::default();
+    for (rel, data) in &backup.files {
         let path = rel.split('/').fold(store.to_path_buf(), |p, c| p.join(c));
         if !path.parent().is_some_and(Path::is_dir) {
             done.skipped.push(rel.clone());
             continue;
         }
-        let readable = std::fs::read(&path).ok().is_some_and(|b| list_reads(b, &key));
+        let readable = std::fs::read(&path).ok().is_some_and(|b| list_reads(b, &keys));
         if readable {
             done.kept.push(rel.clone());
         } else {
@@ -228,11 +227,11 @@ pub fn restore(store: &Path, password: &str, backup: &DriveBackup) -> io::Result
     Ok(done)
 }
 
-/// Does this folder-list file decrypt and parse with `key`? One too short
-/// to hold even a nonce and `{}` is truncated, though the engine would read
-/// it as an empty list.
-fn list_reads(bytes: Vec<u8>, key: &Key) -> bool {
-    bytes.len() >= crate::crypto::NONCE_LEN + 2 && Manifest::from_sealed(bytes, key).is_ok()
+/// Does this folder-list file decrypt and parse with `keys`? One too short
+/// to hold a sealed list and its tail is truncated, though the engine would
+/// read an empty file as an empty list.
+fn list_reads(bytes: Vec<u8>, keys: &Keys) -> bool {
+    bytes.len() >= crate::envelope::LEN as usize + crate::crypto::SEAL_OVERHEAD && Manifest::from_sealed(bytes, keys).is_ok()
 }
 
 #[cfg(test)]
@@ -260,14 +259,16 @@ mod tests {
         drop(drive(&one));
         drop(drive(&two));
         let out = d.path().join("all.cloakbak");
-        write(&out, "backup-pass", vec![collect("One", &one).unwrap(), collect("Two", &two).unwrap()]).unwrap();
+        let both = vec![collect("One", &one, "drive-pass").unwrap(), collect("Two", &two, "drive-pass").unwrap()];
+        write(&out, "backup-pass", both).unwrap();
 
         let b = read(&out, "backup-pass").unwrap();
         assert_eq!(b.drives.len(), 2);
         assert_eq!(b.drives[0].name, "One");
-        // meta.json plus the lists of the root, docs and docs/deep.
-        assert_eq!(b.drives[0].files.len(), 4);
-        assert_eq!(b.drives[0].files[0].0, "meta.json");
+        // The lists of the root, docs and docs/deep, the root's first.
+        assert_eq!(b.drives[0].files.len(), 3);
+        assert!(!b.drives[0].files[0].0.contains('/'));
+        assert!(collect("One", &one, "wrong").is_err(), "needs the drive's password");
 
         let err = read(&out, "nope").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
@@ -276,7 +277,7 @@ mod tests {
         bytes[last] ^= 1;
         std::fs::write(&out, bytes).unwrap();
         assert!(read(&out, "backup-pass").is_err(), "tampering is detected");
-        assert!(read(&one.join("meta.json"), "x").is_err(), "not a backup file");
+        assert!(read(&out.with_extension("nope"), "x").is_err(), "not a backup file");
     }
 
     #[test]
@@ -284,12 +285,11 @@ mod tests {
         let d = tempdir().unwrap();
         let store = d.path().join("drive");
         drop(drive(&store));
-        let backup = collect("Drive", &store).unwrap();
+        let backup = collect("Drive", &store, "drive-pass").unwrap();
+        let keys = crate::engine::unlock(&store, "drive-pass").unwrap();
 
-        // Lose the header, damage the root list, delete a folder's list, and
-        // add a file afterwards to a list that stays healthy.
-        std::fs::remove_file(store.join("meta.json")).unwrap();
-        let root_list = Manifest::path_in(&store);
+        // Damage the root list and delete a folder's list.
+        let root_list = Manifest::path_in(&store, &keys);
         std::fs::write(&root_list, b"garbage that won't decrypt").unwrap();
         let docs_dir = backup
             .files
@@ -301,7 +301,7 @@ mod tests {
 
         assert!(restore(&store, "wrong", &backup).is_err(), "needs the drive's password");
         let r = restore(&store, "drive-pass", &backup).unwrap();
-        assert_eq!(r.restored.len(), 3, "{r:?}");
+        assert_eq!(r.restored.len(), 2, "{r:?}");
         assert_eq!(r.kept.len(), 1, "{r:?}");
 
         let s = Store::open_with_passphrase(&store, "drive-pass").unwrap();
@@ -326,7 +326,7 @@ mod tests {
         let (a, b) = (d.path().join("a"), d.path().join("b"));
         drop(drive(&a));
         Store::create_with_passphrase(&b, "other-pass", 128).unwrap();
-        let backup = collect("A", &a).unwrap();
+        let backup = collect("A", &a, "drive-pass").unwrap();
         let err = restore(&b, "drive-pass", &backup).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
@@ -336,10 +336,11 @@ mod tests {
         let d = tempdir().unwrap();
         let store = d.path().join("drive");
         drop(drive(&store));
-        let backup = collect("Drive", &store).unwrap();
-        std::fs::write(Manifest::path_in(&store), b"cut").unwrap();
+        let backup = collect("Drive", &store, "drive-pass").unwrap();
+        let keys = crate::engine::unlock(&store, "drive-pass").unwrap();
+        std::fs::write(Manifest::path_in(&store, &keys), b"cut").unwrap();
         let r = restore(&store, "drive-pass", &backup).unwrap();
-        assert_eq!(r.restored, ["manifest.idx"], "{r:?}");
+        assert_eq!(r.restored, [keys.list_name()], "{r:?}");
         let s = Store::open_with_passphrase(&store, "drive-pass").unwrap();
         assert_eq!(s.read_all("a.txt").unwrap(), b"a.txt");
     }

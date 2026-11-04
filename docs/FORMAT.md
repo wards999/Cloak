@@ -1,34 +1,60 @@
-# cloak drive format, version 2
+# cloak drive format, version 3
 
 A drive is a folder. Its tree mirrors the drive's tree, with every file and
-folder under a random dull name. What a drive keeps for itself:
+folder under a random dull name. Nothing in it is plain text, and nothing
+has a fixed name that marks it as cloak's: even the drive's own records are
+named like everything else.
 
-| File | Where | What |
+| What | Where | Name |
 |---|---|---|
-| `meta.json` | top | format version, password settings, the wrapped master key |
-| `manifest.idx` (+ `manifest.pNN.idx`) | every folder | that folder's list (the "notebook") |
-| `journal.idx` | top | a change in progress, while it is |
-| `missing.idx` | top | items found gone from the disk, until dismissed |
-| envelope | last 512 bytes of every file | the file's own description |
+| a folder's list (the "notebook") | every folder | a dull name worked out from the drive's key (the same in each folder of a drive; different per drive) |
+| parts of a big folder's list | that folder | the list's name with `_pNN` added |
+| items found gone from the disk, until dismissed | top | another name worked out from the key |
+| a change in progress, while it is | top | `journal.idx` |
+| envelope | last 512 bytes of every file | |
+
+There's no `meta.json`: every file and every list carries the drive's lock.
 
 ## Keys
 
-* **Password → key-encryption key (KEK).** Argon2id with the settings
-  recorded in `meta.json` (`kdf`), over a random 16-byte salt.
-* **Master key.** 32 random bytes, made when the drive is. Stored only
-  wrapped: `meta.json`'s `wrapped` is XChaCha20-Poly1305 of the master key
-  under the KEK. A wrong password fails the wrap's tag, which is how it's
-  told apart. Changing the password rewraps this one value.
+* **Master key.** 32 random bytes, made when the drive is. Everything else
+  is sealed with it.
+* **The lock.** The master key (and the drive's `region`), sealed with
+  XChaCha20-Poly1305 under a key derived from the password: Argon2id, with
+  the settings this format fixes (19 MiB, 2 passes, 1 lane), over the
+  drive's random 16-byte salt. 104 bytes:
+  `salt (16) || generation (8, LE) || nonce (24) || sealed master key and
+  region (40) || tag (16)`. The salt and generation are in the clear: the
+  salt is where the password's key starts from, and the generation counts
+  password changes. Each copy is sealed afresh, so only the salt and the
+  generation repeat across a drive. That's the price of recovering any one
+  file with its password alone: two files of the same drive can be shown to
+  belong together.
 * **File key.** 32 random bytes per file, made when the file is. It encrypts
   that file's ends and nothing else. It's kept in the file's list entry and
   in its envelope, both sealed with the master key.
 
+**Unlocking** reads the lock from the last 512 bytes of the files in the
+drive's folder (top folder first): a lock's generation is a small number,
+so the bytes at that place in anything else almost never pass for one, and
+a drive's locks share a salt. One Argon2id step with the password, then the
+lock opens or the password is wrong. If the password opens only an older
+generation than the drive's newest, the password has been changed and the
+user is told so.
+
+**Changing the password** makes a new salt and the next generation, and
+rewrites the lock in every list (the top folder's first) and every file's
+envelope; nothing else changes. A marker at the top (a name worked out
+from the key) says a change is under way, so if it's interrupted, opening
+the drive with the new password finishes it.
+
 ## Sealing
 
-Lists, envelopes and journals are sealed with XChaCha20-Poly1305 under the
-master key: `24-byte random nonce || ciphertext || 16-byte tag`. Each kind
-binds a label as associated data (`cloak-list-v2`, `cloak-envelope-v2`,
-`cloak-journal-v2`), so one can't be passed off as another. Anything that
+Lists, envelopes, the missing-items record and journals are sealed with
+XChaCha20-Poly1305 under the master key: `24-byte random nonce ||
+ciphertext || 16-byte tag`. Each kind binds a label as associated data
+(`cloak-list-v3`, `cloak-envelope-v3`, `cloak-missing-v3`,
+`cloak-journal-v3`), so one can't be passed off as another. Anything that
 fails its tag is damaged or tampered with and is reported as such, never
 read as garbage.
 
@@ -54,8 +80,8 @@ need it: they never encrypt different bytes at an offset already used.
 
 ## Envelope (512 bytes)
 
-`24-byte nonce || sealed 472 bytes || 16-byte tag`, sealed with the master
-key. The 472 plaintext bytes:
+`lock (104) || 24-byte nonce || sealed 368 bytes || 16-byte tag`, the
+sealed part under the master key. The 368 plaintext bytes:
 
 | Bytes | Field |
 |---|---|
@@ -67,9 +93,8 @@ key. The 472 plaintext bytes:
 | 255 | real name, UTF-8, zero-padded |
 | rest | zeros |
 
-There's no plaintext marker: a file is recognized by its envelope opening
-under a key. Every envelope is the same size, so the name's length doesn't
-show.
+There's no plaintext marker. Every envelope is the same size, so the name's
+length doesn't show.
 
 **Names are lazy.** A rename changes only the list. The envelope's name is
 brought up to date the next time the envelope is rewritten (a new nonce,
@@ -78,10 +103,12 @@ list is authoritative; the envelope is for recovery and adoption.
 
 ## Lists
 
-JSON, sealed as above: `children` (each with its real name, dull name,
-kind, file ID, file key, content nonce and a size hint), and `name`: the
-folder's own real name (none for the top). A big list is split into parts as
-before; the folder's own name is in `manifest.idx`.
+JSON, sealed as above, followed by a 512-byte tail shaped like an envelope:
+the drive's lock, then random bytes. So every hidden file of a drive, list
+or not, carries the lock in the same place. The JSON holds `children` (each
+with its real name, dull name, kind, file ID, file key, content nonce and a
+size hint) and `name`: the folder's own real name (none for the top). A big
+list is split into parts; the folder's own name is in the main list.
 
 ## Strays
 
@@ -91,35 +118,34 @@ checked against its list in memory:
 * **On disk, not listed:** a stray. A folder whose list opens under the
   master key, or a file whose envelope does, came from elsewhere in this
   drive and is added to the list under its real name (`(conflict N)` added
-  if the name is taken). Anything else is from another drive: it's left
-  untouched, never shown or deleted, and counted for the app.
+  if the name is taken). Anything else that carries a lock is from another
+  drive: it's left untouched, never shown or deleted, and counted for the
+  app. Bringing it in needs only that drive's password, not its folder:
+  the stray's own lock gives that drive's master key. Each envelope (and
+  each list, for a folder) is then sealed again for this drive; a file's
+  data and file key don't change, so it costs about 512 bytes per file.
+  Another drive's list file copied in with its files is removed once they
+  are brought in.
 * **Listed, not on disk:** moved out or deleted outside cloak; the entry is
-  dropped and recorded in `missing.idx` at the top (sealed, label
-  `cloak-missing-v2`: its path, whether it's a folder, when it went), for the
-  app to show. If it comes back it's taken in as a stray and its record
-  clears; a move between two folders of the drive isn't recorded, whichever
-  folder is seen first. Dismissing the record deletes `missing.idx`.
+  dropped and recorded (sealed: its path, whether it's a folder, when it
+  went), for the app to show. If it comes back it's taken in as a stray and
+  its record clears; a move between two folders of the drive isn't
+  recorded, whichever folder is seen first.
 
 **A list that won't open** (damaged, or another drive's list copied over
-this one, as happens when a folder's contents are copied together with its
-`manifest.idx`) is set aside as `unreadable-list-<time>-manifest.idx.bak`,
-never deleted, and the folder's list is rebuilt the same way: its files by
-their envelopes, its subfolders by their own lists (or, if a subfolder's
-list is unreadable too but it holds something this drive's key opens, it's
-repaired as well), its own name from its parent's list. A folder whose name
-was only in unreadable lists comes back as "Recovered folder". Anything
-from the other drive waits to be brought in.
+it) is set aside as `unreadable-list-<time>-<name>.bak`, never deleted, and
+the folder's list is rebuilt the same way: its files by their envelopes,
+its subfolders by their own lists (repaired too when unreadable but holding
+this drive's files), its own name from its parent's list. A folder whose
+name was only in unreadable lists comes back as "Recovered folder". A
+missing top list is simply rebuilt: the drive still unlocks from any file.
 
-A folder is only rescanned when its modified time has changed. Bringing in
-another drive's strays (`cloak adopt`) needs both drives' passwords: each
-envelope (and each list, for a folder) is opened with the other drive's
-master key and sealed again with this one's. A file's data and file key
-don't change, so it costs about 512 bytes per file.
+A folder is only rescanned when its modified time has changed.
 
 ## Crash safety
 
-As in version 1 (atomic list writes, the journal for moves and purges, and
-undo records for bytes that move between encrypted and plain), plus:
+Atomic list writes, the journal for moves and purges, and undo records for
+bytes that move between encrypted and plain, plus:
 
 * **New nonce:** the file's original ends and envelope are journaled,
   then re-encrypted and the file synced, then its list saved. After a crash,
@@ -127,8 +153,11 @@ undo records for bytes that move between encrypted and plain), plus:
 * **Envelope rewrites** (adoption) journal the old envelope first.
 * **Resizing** journals the old envelope along with the other bytes it
   undoes.
+* **Password changes** rewrite only locks: a torn write there leaves the
+  rest of an envelope, and the file's list entry, as they were. The change
+  is resumed on the next open with the new password.
 
-## Version 1
+## Earlier versions
 
-Drives made by earlier test versions (`meta.json` without `"version": 2`)
-aren't opened: the app says so rather than reporting a wrong password.
+Drives made by earlier test versions (with a `meta.json`) aren't opened:
+the app says so rather than reporting a wrong password.

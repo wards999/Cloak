@@ -22,8 +22,8 @@
 //! `manifest.idx` is one a sync tool hasn't delivered yet, so until they agree
 //! every part is checked on each use, not just `manifest.idx`.
 
-use crate::crypto::Key;
 use crate::durable;
+use crate::lock::Keys;
 use crate::manifest::{self, part_name, part_of, seal, Child, Manifest, PARTS};
 use crate::names;
 use rand::RngCore;
@@ -131,11 +131,11 @@ fn file_id(_: &File, _: &Metadata) -> io::Result<(u64, u64)> {
 /// match it yet) of each part.
 type Stamps = Vec<Option<Stamp>>;
 
-fn current_stamps(dir: &Path, parts: usize, settled: bool) -> io::Result<Stamps> {
-    let mut out = vec![Stamp::current(&Manifest::path_in(dir))?];
+fn current_stamps(dir: &Path, keys: &Keys, parts: usize, settled: bool) -> io::Result<Stamps> {
+    let mut out = vec![Stamp::current(&Manifest::path_in(dir, keys))?];
     if !settled {
         for i in 0..parts {
-            out.push(Stamp::current(&dir.join(part_name(i)))?);
+            out.push(Stamp::current(&dir.join(part_name(keys, i)))?);
         }
     }
     Ok(out)
@@ -170,8 +170,8 @@ pub struct Listing {
 
 /// Read `dir`'s list in either form. A directory with no `manifest.idx` is
 /// empty.
-pub fn read_listing(dir: &Path, key: &Key) -> io::Result<Listing> {
-    let Some((stamp, bytes)) = read_stamped(&Manifest::path_in(dir))? else {
+pub fn read_listing(dir: &Path, keys: &Keys) -> io::Result<Listing> {
+    let Some((stamp, bytes)) = read_stamped(&Manifest::path_in(dir, keys))? else {
         return Ok(Listing {
             children: Vec::new(),
             name: None,
@@ -181,7 +181,7 @@ pub fn read_listing(dir: &Path, key: &Key) -> io::Result<Listing> {
             settled: true,
         });
     };
-    let header = Manifest::from_sealed(bytes, key)?;
+    let header = Manifest::from_sealed(bytes, keys)?;
     let parts = header.parts.len();
     let name = header.name;
     let mut children = header.children;
@@ -189,9 +189,9 @@ pub fn read_listing(dir: &Path, key: &Key) -> io::Result<Listing> {
     let mut settled = true;
     let mut seen: HashSet<String> = children.iter().map(|c| c.boring.clone()).collect();
     for (i, &tag) in header.parts.iter().enumerate() {
-        match read_stamped(&dir.join(part_name(i)))? {
+        match read_stamped(&dir.join(part_name(keys, i)))? {
             Some((s, bytes)) => {
-                let part = Manifest::from_sealed(bytes, key)?;
+                let part = Manifest::from_sealed(bytes, keys)?;
                 settled &= part.tag == tag;
                 stamps.push(Some(s));
                 children.extend(part.children.into_iter().filter(|c| seen.insert(c.boring.clone())));
@@ -224,8 +224,8 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-fn write_sealed(path: &Path, key: &Key, out: &Out) -> io::Result<()> {
-    durable::write_atomic(path, &seal(serde_json::to_vec(out)?, key))
+fn write_sealed(path: &Path, keys: &Keys, out: &Out) -> io::Result<()> {
+    durable::write_atomic(path, &seal(serde_json::to_vec(out)?, keys))
 }
 
 /// Write `dir`'s list. With `parts` > 0 it is split: the parts in `touched`
@@ -233,7 +233,7 @@ fn write_sealed(path: &Path, key: &Key, out: &Out) -> io::Result<()> {
 /// and then `manifest.idx`.
 pub fn write_listing(
     dir: &Path,
-    key: &Key,
+    keys: &Keys,
     name: Option<&str>,
     children: &[Child],
     parts: usize,
@@ -242,7 +242,7 @@ pub fn write_listing(
 ) -> io::Result<()> {
     if parts == 0 {
         let out = Out { children: children.iter().collect(), name, parts: Vec::new(), tag: 0 };
-        return write_sealed(&Manifest::path_in(dir), key, &out);
+        return write_sealed(&Manifest::path_in(dir, keys), keys, &out);
     }
     let mut groups: Vec<Vec<&Child>> = vec![Vec::new(); parts];
     for c in children {
@@ -254,10 +254,10 @@ pub fn write_listing(
             continue;
         }
         let tag = rand::thread_rng().next_u64() | 1;
-        write_sealed(&dir.join(part_name(i)), key, &Out { children: group, name: None, parts: Vec::new(), tag })?;
+        write_sealed(&dir.join(part_name(keys, i)), keys, &Out { children: group, name: None, parts: Vec::new(), tag })?;
         tags[i] = tag;
     }
-    write_sealed(&Manifest::path_in(dir), key, &Out { children: Vec::new(), name, parts: tags.clone(), tag: 0 })
+    write_sealed(&Manifest::path_in(dir, keys), keys, &Out { children: Vec::new(), name, parts: tags.clone(), tag: 0 })
 }
 
 /// A directory's list in memory, indexed by real and by boring name.
@@ -425,18 +425,18 @@ impl DirCache {
     }
 
     /// The list of on-disk directory `dir`, including unsaved edits.
-    pub fn load(&self, dir: &Path, key: &Key) -> io::Result<Arc<Dir>> {
+    pub fn load(&self, dir: &Path, keys: &Keys) -> io::Result<Arc<Dir>> {
         let mut dirs = self.map();
-        self.refresh(&mut dirs, dir, key, false)?;
+        self.refresh(&mut dirs, dir, keys, false)?;
         Ok(dirs[dir].dir.clone())
     }
 
     /// Change `dir`'s list in memory; it is written out by [`flush`](Self::flush).
     /// Holding another `Arc` of the list from [`load`](Self::load) meanwhile
     /// works but makes this copy the whole list.
-    pub fn edit<R>(&self, dir: &Path, key: &Key, f: impl FnOnce(&mut Dir) -> R) -> io::Result<R> {
+    pub fn edit<R>(&self, dir: &Path, keys: &Keys, f: impl FnOnce(&mut Dir) -> R) -> io::Result<R> {
         let mut dirs = self.map();
-        self.refresh(&mut dirs, dir, key, false)?;
+        self.refresh(&mut dirs, dir, keys, false)?;
         let e = dirs.get_mut(dir).expect("refreshed");
         if e.dirty.is_none() {
             e.dirty = Some((Instant::now(), e.dir.clone()));
@@ -456,17 +456,17 @@ impl DirCache {
     }
 
     /// Write every list with unsaved edits.
-    pub fn flush(&self, key: &Key) -> io::Result<()> {
+    pub fn flush(&self, keys: &Keys) -> io::Result<()> {
         let dirty: Vec<PathBuf> =
             self.map().iter().filter(|(_, e)| e.dirty.is_some()).map(|(p, _)| p.clone()).collect();
         for dir in dirty {
-            self.flush_dir(&dir, key)?;
+            self.flush_dir(&dir, keys)?;
         }
         Ok(())
     }
 
     /// Write `dir`'s list if it has unsaved edits.
-    pub fn flush_dir(&self, dir: &Path, key: &Key) -> io::Result<()> {
+    pub fn flush_dir(&self, dir: &Path, keys: &Keys) -> io::Result<()> {
         let mut dirs = self.map();
         if !dirs.get(dir).is_some_and(|e| e.dirty.is_some()) {
             return Ok(());
@@ -476,7 +476,7 @@ impl DirCache {
             dirs.remove(dir);
             return Ok(());
         }
-        self.refresh(&mut dirs, dir, key, true)?; // fold in anything changed on disk first
+        self.refresh(&mut dirs, dir, keys, true)?; // fold in anything changed on disk first
         let e = dirs.get_mut(dir).expect("refreshed");
         let d = Arc::make_mut(&mut e.dir);
         // How to save: a big list in parts when few changed, so a rename in a
@@ -492,11 +492,11 @@ impl DirCache {
             d.tags = vec![0; PARTS];
         }
         let only = (!d.tags.iter().all(|&t| t == 0)).then_some(&touched);
-        if let Err(err) = write_listing(dir, key, d.name.as_deref(), &d.children, d.parts, &mut d.tags, only) {
+        if let Err(err) = write_listing(dir, keys, d.name.as_deref(), &d.children, d.parts, &mut d.tags, only) {
             d.touched = touched;
             return Err(err);
         }
-        e.stamps = current_stamps(dir, d.parts, true)?;
+        e.stamps = current_stamps(dir, keys, d.parts, true)?;
         e.checked = Instant::now();
         e.settled = true;
         e.dirty = None;
@@ -505,23 +505,23 @@ impl DirCache {
 
     /// Bring `dir`'s entry up to date with the disk, if it hasn't been checked
     /// within `recheck` (or always, with `force`).
-    fn refresh(&self, dirs: &mut HashMap<PathBuf, Entry>, dir: &Path, key: &Key, force: bool) -> io::Result<()> {
+    fn refresh(&self, dirs: &mut HashMap<PathBuf, Entry>, dir: &Path, keys: &Keys, force: bool) -> io::Result<()> {
         let Some(e) = dirs.get_mut(dir) else {
             if dirs.len() >= MAX_DIRS {
                 dirs.retain(|_, e| e.dirty.is_some());
             }
-            dirs.insert(dir.to_path_buf(), Entry::clean(read_listing(dir, key)?));
+            dirs.insert(dir.to_path_buf(), Entry::clean(read_listing(dir, keys)?));
             return Ok(());
         };
         if !force && e.checked.elapsed() < self.recheck {
             return Ok(());
         }
-        let now = current_stamps(dir, e.dir.parts, e.settled)?;
+        let now = current_stamps(dir, keys, e.dir.parts, e.settled)?;
         e.checked = Instant::now();
         if now == e.stamps {
             return Ok(());
         }
-        let theirs = read_listing(dir, key)?;
+        let theirs = read_listing(dir, keys)?;
         let Some((since, base)) = e.dirty.take() else {
             *e = Entry::clean(theirs);
             return Ok(());
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn sees_changes_made_behind_its_back() {
         let d = tempdir().unwrap();
-        let key = [3u8; 32];
+        let key = Keys::bare([3u8; 32], 0);
         let cache = DirCache::with_recheck(Duration::ZERO);
         assert!(cache.load(d.path(), &key).unwrap().children().is_empty());
 
@@ -577,14 +577,14 @@ mod tests {
         assert!(got.find("a.txt").is_none());
         assert_eq!(got.find("b.txt").unwrap().boring, "cache_0002.dat");
 
-        std::fs::remove_file(Manifest::path_in(d.path())).unwrap();
+        std::fs::remove_file(Manifest::path_in(d.path(), &key)).unwrap();
         assert!(cache.load(d.path(), &key).unwrap().children().is_empty());
     }
 
     #[test]
     fn edits_wait_for_flush_and_merge_with_outside_changes() {
         let d = tempdir().unwrap();
-        let key = [3u8; 32];
+        let key = Keys::bare([3u8; 32], 0);
         let cache = DirCache::with_recheck(Duration::ZERO);
         cache.edit(d.path(), &key, |m| {
             m.push(child("keep.txt", "cache_0001.dat"));
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn big_lists_split_and_save_only_changed_parts() {
         let d = tempdir().unwrap();
-        let key = [3u8; 32];
+        let key = Keys::bare([3u8; 32], 0);
         let cache = DirCache::with_recheck(Duration::ZERO);
         cache.edit(d.path(), &key, |m| {
             for i in 0..SPLIT_AT + 10 {
@@ -618,21 +618,21 @@ mod tests {
         }).unwrap();
         cache.flush(&key).unwrap();
         // A bulk change is saved as one file...
-        assert!(!d.path().join(part_name(0)).exists());
+        assert!(!d.path().join(part_name(&key, 0)).exists());
         assert_eq!(Manifest::load(d.path(), &key).unwrap().children.len(), SPLIT_AT + 10);
         // ...and the next small one splits it.
         cache.edit(d.path(), &key, |m| m.push(child("one more", "cache_999999.dat"))).unwrap();
         cache.flush(&key).unwrap();
-        assert!(d.path().join(part_name(PARTS - 1)).exists());
+        assert!(d.path().join(part_name(&key, PARTS - 1)).exists());
 
-        let before: Vec<_> = (0..PARTS).map(|i| std::fs::read(d.path().join(part_name(i))).unwrap()).collect();
+        let before: Vec<_> = (0..PARTS).map(|i| std::fs::read(d.path().join(part_name(&key, i))).unwrap()).collect();
         cache.edit(d.path(), &key, |m| {
             let p = m.position("f7").unwrap();
             m.rename(p, "seven".into());
         }).unwrap();
         cache.flush(&key).unwrap();
         let changed = (0..PARTS)
-            .filter(|&i| std::fs::read(d.path().join(part_name(i))).unwrap() != before[i])
+            .filter(|&i| std::fs::read(d.path().join(part_name(&key, i))).unwrap() != before[i])
             .count();
         assert_eq!(changed, 1);
 
@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn a_part_arriving_late_is_noticed() {
         let d = tempdir().unwrap();
-        let key = [3u8; 32];
+        let key = Keys::bare([3u8; 32], 0);
         let writer = DirCache::with_recheck(Duration::ZERO);
         writer.edit(d.path(), &key, |m| {
             for i in 0..SPLIT_AT + 10 {
@@ -660,18 +660,18 @@ mod tests {
         // The writer renames f7; a sync tool delivers manifest.idx first and
         // the changed part a moment later.
         let p = part_of("cache_000007.dat", PARTS);
-        let old_part = std::fs::read(d.path().join(part_name(p))).unwrap();
+        let old_part = std::fs::read(d.path().join(part_name(&key, p))).unwrap();
         writer.edit(d.path(), &key, |m| {
             let i = m.position("f7").unwrap();
             m.rename(i, "seven".into());
         }).unwrap();
         writer.flush(&key).unwrap();
-        let new_part = std::fs::read(d.path().join(part_name(p))).unwrap();
-        std::fs::write(d.path().join(part_name(p)), &old_part).unwrap();
+        let new_part = std::fs::read(d.path().join(part_name(&key, p))).unwrap();
+        std::fs::write(d.path().join(part_name(&key, p)), &old_part).unwrap();
 
         let reader = DirCache::with_recheck(Duration::ZERO);
         assert!(reader.load(d.path(), &key).unwrap().find("f7").is_some());
-        std::fs::write(d.path().join(part_name(p)), &new_part).unwrap();
+        std::fs::write(d.path().join(part_name(&key, p)), &new_part).unwrap();
         let now = reader.load(d.path(), &key).unwrap();
         assert!(now.find("f7").is_none());
         assert!(now.find("seven").is_some());

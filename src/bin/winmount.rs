@@ -153,6 +153,24 @@ mod imp {
 
     /// Convert a WinFsp path (`\`, `\name`, `\a\b`) to a logical store path
     /// (`""`, `name`, `a/b`), undoing the display mapping of each component.
+    /// Don't cache a new file's data in this volume while it's being
+    /// written: its writes come straight here. A copy (Explorer's too) would
+    /// otherwise hold the data twice, in this volume's cache and then the
+    /// backing disk's, so Windows holds the copy back sooner, and on closing
+    /// the file wait while it's all handed over. The backing disk still
+    /// caches the writes. Files opened later are cached as usual.
+    fn write_new_files_through() {
+        // SAFETY: called inside a WinFsp create operation, where the
+        // operation context's response is the create reply being built.
+        unsafe {
+            if let Some(ctx) = winfsp_sys::FspFileSystemGetOperationContext().as_ref() {
+                if let Some(rsp) = ctx.Response.as_mut() {
+                    rsp.Rsp.Create.Opened.set_DisableCache(1);
+                }
+            }
+        }
+    }
+
     fn path_of(file_name: &U16CStr) -> String {
         file_name
             .to_string_lossy()
@@ -466,6 +484,7 @@ mod imp {
                 set_normalized_name(file_info, &path, file_name);
                 let id = self.store().open_file(&path).map_err(fsp)?;
                 self.file_info(id, file_info.as_mut())?;
+                write_new_files_through();
                 Ok(Handle::File(path, id))
             }
         }
@@ -680,7 +699,8 @@ mod imp {
             // Let Windows cache file data and file details: reads get its
             // read-ahead and small writes are gathered, instead of every 4 KiB
             // going through us. Every change goes through this volume, so the
-            // cache stays correct.
+            // cache stays correct. (Not while a new file is being written:
+            // see `write_new_files_through`.)
             .file_info_timeout(u32::MAX)
             // ...but hand a file's cached writes to us as soon as the app
             // closes it, so closed files are on the backing store like before

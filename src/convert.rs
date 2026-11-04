@@ -30,7 +30,8 @@ use crate::boring::{generate_unique, Contains};
 use crate::crypto::{self, protected_ranges, transform_region, Key, Nonce};
 use crate::dircache::read_listing;
 use crate::durable;
-use crate::engine::{key_from_meta, write_new_meta};
+use crate::engine::unlock;
+use crate::lock::{self, Keys};
 use crate::envelope::LEN as ENVELOPE;
 use crate::manifest::{is_conflict_copy, is_list_file, Child, Kind, Manifest};
 use crate::names;
@@ -48,11 +49,11 @@ pub const CONVERTING: &str = "converting.idx";
 pub const UNCONVERTING: &str = "unconverting.idx";
 /// The one file in flight, while it is.
 const JOURNAL: &str = "convert-journal.idx";
-const JOURNAL_LABEL: &[u8] = b"cloak-convert-journal-v2";
-const META: &str = "meta.json";
+const JOURNAL_LABEL: &[u8] = b"cloak-convert-journal-v3";
 
-/// Names a drive keeps for itself at its top level (besides folder lists).
-const ROOT_RESERVED: &[&str] = &[META, "journal.idx", "missing.idx", CONVERTING, UNCONVERTING, JOURNAL];
+/// Names a drive keeps for itself at its top level, whatever its key
+/// (besides those it works out from its key: its lists and records).
+const ROOT_RESERVED: &[&str] = &["journal.idx", CONVERTING, UNCONVERTING, JOURNAL];
 
 /// Is a conversion either way under way in `dir`?
 pub fn in_progress(dir: &Path) -> bool {
@@ -65,15 +66,19 @@ fn is_litter(name: &str) -> bool {
     matches!(lower.as_str(), ".ds_store" | "thumbs.db" | "ehthumbs.db" | "desktop.ini") || name.starts_with("._")
 }
 
-/// Does a drive use this name for its own files (a folder list, or at the
-/// top `meta.json` and the journals), or a crash's side file of one?
-pub(crate) fn is_reserved(name: &str, at_root: bool) -> bool {
+/// Does a drive use this name for its own files, or a crash's side file of
+/// one? With the drive's `keys`, that includes the names worked out from its
+/// key (its folder lists, and at the top its record of missing items);
+/// without them, only the fixed ones (the journals and markers).
+pub(crate) fn is_reserved(keys: Option<&Keys>, name: &str, at_root: bool) -> bool {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(durable::SIDE_SUFFIX).unwrap_or(&lower);
-    is_list_file(stem)
-        || is_conflict_copy(stem)
-        || stem.starts_with("unreadable-list-")
-        || (at_root && ROOT_RESERVED.contains(&stem))
+    let keyed = keys.is_some_and(|k| {
+        is_list_file(&k.master, stem)
+            || is_conflict_copy(&k.master, stem)
+            || (at_root && stem == lock::names(&k.master).missing.to_ascii_lowercase())
+    });
+    keyed || stem.starts_with("unreadable-list-") || (at_root && ROOT_RESERVED.contains(&stem))
 }
 
 /// The real name a name on disk stands for: on Windows, the characters it
@@ -139,11 +144,11 @@ pub fn scan(dir: &Path, region: u64) -> io::Result<Report> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no such folder"));
     }
     let mut report = Report::default();
-    if dir.join(CONVERTING).exists() && dir.join(META).exists() {
+    if dir.join(CONVERTING).exists() && lock::holds_locks(dir) {
         report.resume = true;
         return Ok(report);
     }
-    if dir.join(META).exists() {
+    if lock::holds_locks(dir) || dir.join("meta.json").exists() {
         report.problem("", "this folder is already a cloak drive");
         return Ok(report);
     }
@@ -174,7 +179,7 @@ fn scan_dir(dir: &Path, rel: &str, region: u64, report: &mut Report) -> io::Resu
             report.litter.push(path);
             continue;
         }
-        if is_reserved(&name, at_root) {
+        if is_reserved(None, &name, at_root) {
             report.problem(&path, "cloak uses this name for its own files; rename it");
             continue;
         }
@@ -256,9 +261,8 @@ fn interrupted() -> io::Error {
 
 fn convert_until(dir: &Path, passphrase: &str, region: u64, progress: Progress, stop: Option<Stop>) -> io::Result<()> {
     let marker = dir.join(CONVERTING);
-    let meta = dir.join(META);
-    let (key, region) = if marker.exists() && meta.exists() {
-        key_from_meta(&fs::read(&meta)?, passphrase)?
+    let keys = if marker.exists() && lock::holds_locks(dir) {
+        unlock(dir, passphrase)?
     } else {
         if marker.exists() {
             fs::remove_file(&marker)?; // stopped before anything was changed
@@ -270,13 +274,25 @@ fn convert_until(dir: &Path, passphrase: &str, region: u64, progress: Progress, 
             let more = if more > 0 { format!(" (and {more} more)") } else { String::new() };
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{what}{more}")));
         }
-        // The marker goes first: a folder with meta.json and no marker would
-        // open as an empty drive.
+        // The marker goes first: a folder with a drive's top list and no
+        // marker would open as an empty drive.
         durable::write_synced(&marker, b"")?;
         durable::sync_dir(dir)?;
-        (write_new_meta(dir, passphrase, region)?, region)
+        // A key whose list and record names no file here already has.
+        let taken = all_names(dir)?;
+        let keys = loop {
+            let k = Keys::new(passphrase, region)?;
+            let n = lock::names(&k.master);
+            if !taken.contains(&n.list.to_ascii_lowercase()) && !taken.contains(&n.missing.to_ascii_lowercase()) {
+                break k;
+            }
+        };
+        // The top list, carrying the drive's lock: from here on the folder
+        // is a drive (being converted) that the password opens.
+        Manifest::default().save(dir, &keys)?;
+        keys
     };
-    let mut run = Run::new(dir, key, region, progress, stop)?;
+    let mut run = Run::new(dir, keys, progress, stop)?;
     run.recover()?;
     run.convert_dir(dir, true, None)?;
     fs::remove_file(&marker)?;
@@ -285,46 +301,41 @@ fn convert_until(dir: &Path, passphrase: &str, region: u64, progress: Progress, 
 
 fn unconvert_until(dir: &Path, passphrase: &str, progress: Progress, stop: Option<Stop>) -> io::Result<()> {
     let marker = dir.join(UNCONVERTING);
-    let meta = dir.join(META);
-    if !meta.exists() {
-        if marker.exists() {
-            return fs::remove_file(&marker); // finished all but the marker
-        }
-        return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
+    if !lock::holds_locks(dir) && marker.exists() {
+        return fs::remove_file(&marker); // finished all but the marker
     }
     if dir.join(CONVERTING).exists() {
         return Err(io::Error::other("this folder is part-way through being converted; finish converting it first"));
     }
-    let (key, region) = key_from_meta(&fs::read(&meta)?, passphrase)?;
+    let keys = unlock(dir, passphrase)?;
     if !marker.exists() {
         // Let the engine finish anything a crash left half done and fold in
         // sync tools' copies of lists, so the lists read here are whole.
-        drop(Store::open(dir, key, region)?);
-        check_names_out(dir, &key, true)?;
+        drop(Store::open_with_keys(dir, keys.clone())?);
+        check_names_out(dir, &keys, true)?;
         durable::write_synced(&marker, b"")?;
         durable::sync_dir(dir)?;
     }
-    let mut run = Run::new(dir, key, region, progress, stop)?;
+    let mut run = Run::new(dir, keys, progress, stop)?;
     run.recover()?;
     run.unconvert_dir(dir, true)?;
-    fs::remove_file(&meta)?;
     fs::remove_file(&marker)?;
     durable::sync_dir(dir)
 }
 
 /// Refuse to start turning a drive back if a real name would land on a name
 /// cloak is still using in that folder while it works.
-fn check_names_out(dir: &Path, key: &Key, at_root: bool) -> io::Result<()> {
-    for c in read_listing(dir, key)?.children {
+fn check_names_out(dir: &Path, keys: &Keys, at_root: bool) -> io::Result<()> {
+    for c in read_listing(dir, keys)?.children {
         let out = disk_name(&c.real);
-        if is_reserved(&out, at_root) {
+        if is_reserved(Some(keys), &out, at_root) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("“{}” has a name cloak uses for its own files; rename it in the drive first", c.real),
             ));
         }
         if c.is_dir() && dir.join(&c.boring).is_dir() {
-            check_names_out(&dir.join(&c.boring), key, false)?;
+            check_names_out(&dir.join(&c.boring), keys, false)?;
         }
     }
     Ok(())
@@ -366,7 +377,7 @@ enum Way {
 
 struct Run<'a> {
     root: PathBuf,
-    key: Key,
+    keys: Keys,
     region: u64,
     done: u64,
     total: u64,
@@ -375,9 +386,10 @@ struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
-    fn new(root: &Path, key: Key, region: u64, progress: Progress<'a>, stop: Option<Stop>) -> io::Result<Self> {
-        let total = count_files(root, true)?;
-        Ok(Run { root: root.to_path_buf(), key, region, done: 0, total, progress, stop })
+    fn new(root: &Path, keys: Keys, progress: Progress<'a>, stop: Option<Stop>) -> io::Result<Self> {
+        let total = count_files(root, Some(&keys), true)?;
+        let region = keys.region;
+        Ok(Run { root: root.to_path_buf(), keys, region, done: 0, total, progress, stop })
     }
 
     fn tick(&mut self, files: u64) -> io::Result<()> {
@@ -406,7 +418,7 @@ impl<'a> Run<'a> {
         };
         // Unreadable means it was torn while being written, before its file
         // was touched.
-        let opened = crypto::open(&self.key, JOURNAL_LABEL, &bytes);
+        let opened = crypto::open(&self.keys.master, JOURNAL_LABEL, &bytes);
         if let Some(j) = opened.ok().and_then(|b| serde_json::from_slice::<InFlight>(&b).ok()) {
             let from = self.root.join(&j.dir).join(&j.from);
             if from.exists() {
@@ -456,7 +468,7 @@ impl<'a> Run<'a> {
             ranges.push((data, env));
         }
         let j = InFlight { dir: self.rel(dir), from: from.into(), to: to.into(), ranges, len, accessed, modified };
-        durable::write_synced(&self.journal(), &crypto::seal(&self.key, JOURNAL_LABEL, &serde_json::to_vec(&j)?))?;
+        durable::write_synced(&self.journal(), &crypto::seal(&self.keys.master, JOURNAL_LABEL, &serde_json::to_vec(&j)?))?;
         for (s, mut buf) in j.ranges.into_iter().filter(|(s, _)| *s < data) {
             transform_region(&crypt.0, &crypt.1, s, &mut buf);
             f.seek(SeekFrom::Start(s))?;
@@ -482,8 +494,8 @@ impl<'a> Run<'a> {
 
     /// Convert the folder `dir`, whose real name is `name` (none for the top).
     fn convert_dir(&mut self, dir: &Path, at_root: bool, name: Option<&str>) -> io::Result<()> {
-        let listed = crate::manifest::Manifest::path_in(dir).exists();
-        let mut plan: Vec<Child> = if listed { read_listing(dir, &self.key)?.children } else { Vec::new() };
+        let listed = crate::manifest::Manifest::path_in(dir, &self.keys).exists();
+        let mut plan: Vec<Child> = if listed { read_listing(dir, &self.keys)?.children } else { Vec::new() };
 
         // What's on disk: boring names already done, real names to do.
         let mut on_disk: Vec<(String, fs::FileType)> = Vec::new();
@@ -492,7 +504,7 @@ impl<'a> Run<'a> {
             let name = entry.file_name().to_str().map(str::to_string).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("a name in {} isn't valid text", dir.display()))
             })?;
-            if !is_reserved(&name, at_root) {
+            if !is_reserved(Some(&self.keys), &name, at_root) {
                 on_disk.push((name, entry.file_type()?));
             }
         }
@@ -545,13 +557,13 @@ impl<'a> Run<'a> {
         changed |= plan.len() != before;
         if changed {
             Manifest { children: plan.clone(), name: name.map(str::to_string), ..Default::default() }
-                .save(dir, &self.key)?;
+                .save(dir, &self.keys)?;
         }
 
         for c in plan.iter().filter(|c| !c.is_dir()) {
             if !dir.join(&c.boring).exists() {
                 let from = &real_on_disk[&names::fold(&c.real)];
-                let env = c.envelope().seal(&self.key);
+                let env = c.envelope().seal(&self.keys.master, &self.keys.lock());
                 self.process_file(dir, from, &c.boring, c.crypt(), Way::In(env))?;
             }
             self.tick(1)?;
@@ -559,7 +571,7 @@ impl<'a> Run<'a> {
         for c in plan.iter().filter(|c| c.is_dir()) {
             let done = dir.join(&c.boring);
             if done.exists() {
-                self.tick(count_files(&done, false)?)?;
+                self.tick(count_files(&done, Some(&self.keys), false)?)?;
                 continue;
             }
             let from = dir.join(&real_on_disk[&names::fold(&c.real)]);
@@ -571,7 +583,7 @@ impl<'a> Run<'a> {
     }
 
     fn unconvert_dir(&mut self, dir: &Path, at_root: bool) -> io::Result<()> {
-        let children = read_listing(dir, &self.key)?.children;
+        let children = read_listing(dir, &self.keys)?.children;
         for c in children.iter().filter(|c| !c.is_dir()) {
             if dir.join(&c.boring).exists() {
                 self.process_file(dir, &c.boring, &disk_name(&c.real), c.crypt(), Way::Out)?;
@@ -585,20 +597,15 @@ impl<'a> Run<'a> {
                 fs::rename(&from, dir.join(disk_name(&c.real)))?;
                 durable::sync_dir(dir)?;
             } else {
-                self.tick(count_files(&dir.join(disk_name(&c.real)), false)?)?;
+                self.tick(count_files(&dir.join(disk_name(&c.real)), Some(&self.keys), false)?)?;
             }
         }
         // The folder's list (and any sync tool's copies of it) last.
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if is_reserved(&name, false) && entry.file_type()?.is_file() {
+            if is_reserved(Some(&self.keys), &name, at_root) && entry.file_type()?.is_file() && name != UNCONVERTING {
                 fs::remove_file(entry.path())?;
-            }
-        }
-        if at_root {
-            for name in ["journal.idx", "journal.idx.new", "meta.json.new", "missing.idx", "missing.idx.new"] {
-                let _ = fs::remove_file(dir.join(name));
             }
         }
         durable::sync_dir(dir)
@@ -606,22 +613,38 @@ impl<'a> Run<'a> {
 }
 
 /// Files under `dir`, leaving out cloak's own and clutter.
-fn count_files(dir: &Path, at_root: bool) -> io::Result<u64> {
+fn count_files(dir: &Path, keys: Option<&Keys>, at_root: bool) -> io::Result<u64> {
     let mut n = 0;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_reserved(&name, at_root) || is_litter(&name) {
+        if is_reserved(keys, &name, at_root) || is_litter(&name) {
             continue;
         }
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            n += count_files(&entry.path(), false)?;
+            n += count_files(&entry.path(), keys, false)?;
         } else if ft.is_file() {
             n += 1;
         }
     }
     Ok(n)
+}
+
+/// Every name in `dir` and below, lowercased.
+fn all_names(dir: &Path) -> io::Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(f) = folders.pop() {
+        for e in fs::read_dir(&f)? {
+            let e = e?;
+            out.insert(e.file_name().to_string_lossy().to_ascii_lowercase());
+            if e.file_type()?.is_dir() {
+                folders.push(e.path());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Put a file's times back after changing it (best effort: some disks keep
@@ -718,8 +741,7 @@ mod tests {
         let store = Store::open_with_passphrase(d.path(), "pw").unwrap();
         let m = store.metadata("large.bin").unwrap().unwrap();
         assert_eq!(m.modified, mtime);
-        let listing = read_listing(d.path(), &key_from_meta(&fs::read(d.path().join(META)).unwrap(), "pw").unwrap().0)
-            .unwrap();
+        let listing = read_listing(d.path(), &unlock(d.path(), "pw").unwrap()).unwrap();
         let large = listing.children.iter().find(|c| c.real == "large.bin").unwrap();
         let raw = fs::read(d.path().join(&large.boring)).unwrap();
         let original = &files.iter().find(|f| f.0 == "large.bin").unwrap().1;
@@ -746,8 +768,7 @@ mod tests {
         fs::write(d.path().join("Photos/CAF\u{c9}.JPG"), b"clash").unwrap();
         let clash = fs::read_dir(d.path().join("Photos")).unwrap().count() == 4;
         fs::write(d.path().join("meta.json"), b"{}").unwrap();
-        fs::create_dir_all(d.path().join("sub")).unwrap();
-        fs::write(d.path().join("sub/manifest.idx"), b"mine").unwrap();
+        fs::write(d.path().join("journal.idx"), b"mine").unwrap();
         let before = snapshot(d.path());
 
         // A meta.json at the top reads as an existing drive.
@@ -759,7 +780,7 @@ mod tests {
         let report = scan(d.path(), REGION).unwrap();
         let paths: Vec<&str> = report.problems.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(report.problems.len(), 1 + clash as usize, "{:?}", report.problems);
-        assert!(paths.contains(&"sub/manifest.idx"));
+        assert!(paths.contains(&"journal.idx"));
         assert_eq!(paths.iter().any(|p| p.starts_with("Photos/")), clash);
         assert_eq!(report.litter, vec!["Photos/.DS_Store".to_string()]);
         assert_eq!(report.files, 6); // fill's 6: the clash and sub's file are problems instead

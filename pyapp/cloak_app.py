@@ -577,10 +577,6 @@ class CreateDialog(FocusedDialog):
             return self.problem("The passwords don't match.", self.pw2)
         loc = os.path.normpath(loc)
         folder = Path(loc)
-        if (folder / "meta.json").exists():
-            return self.problem(
-                "That folder is already a cloak drive. Choose an empty folder, or use "
-                "Add existing to add this drive to your list.", self.loc)
         if folder.is_file():
             return self.problem("That's a file. Choose a folder for the drive.", self.loc)
         if folder.is_dir() and any(folder.iterdir()):
@@ -655,17 +651,20 @@ class AddExistingDialog(FocusedDialog):
         self.loc = LineEdit(self); self.loc.setPlaceholderText("The drive's folder")
         self.pick = PushButton("Choose folder…", self)
         self.name = LineEdit(self); self.name.setPlaceholderText("Name for this drive")
+        # A drive has nothing to recognize it by but its password.
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("The drive's password")
         row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addLayout(row)
         self.viewLayout.addWidget(self.name)
+        self.viewLayout.addWidget(self.pw)
         self.finish_layout()
         self.yesButton.setText("Add drive")
+        self.busy_text = "Checking…"
         self.cancelButton.setText("Cancel")
         self.widget.setMinimumWidth(430)
         self.pick.clicked.connect(self._choose)
-        self.name.returnPressed.connect(self.yesButton.click)
-        self.loc.returnPressed.connect(self.yesButton.click)
+        self.pw.returnPressed.connect(self.yesButton.click)
         self.first = self.pick
         self.added = None  # (name, folder) once checked
 
@@ -686,11 +685,18 @@ class AddExistingDialog(FocusedDialog):
         loc = os.path.normpath(loc)
         if not os.path.isdir(loc):
             return self.problem("That folder doesn't exist.", self.loc)
-        if not (Path(loc) / "meta.json").exists():
-            return self.problem(
-                "That folder isn't a cloak drive. Choose the folder you created the drive in.", self.loc)
         if loc in self.known:
             return self.problem("That drive is already in your list.", self.loc)
+        if not self.pw.text():
+            return self.problem("Enter the drive's password.", self.pw)
+        try:
+            verify(loc, self.pw.text())
+        except RuntimeError as e:
+            msg = str(e)
+            if msg == "no drive here":
+                return self.problem(
+                    "That folder isn't a cloak drive. Choose the folder you created the drive in.", self.loc)
+            return self.problem(msg[:1].upper() + msg[1:] + ".", self.pw)
         self.added = (self.name.text().strip() or Path(loc).name, loc)
         return True
 
@@ -893,7 +899,7 @@ class AdoptDialog(FocusedDialog):
         self.intro.setWordWrap(True)
         self.pw = PasswordField(self); self.pw.setPlaceholderText(f"Password for “{drive['name']}”")
         self.source = ComboBox(self)
-        self.source.addItems([d["name"] for d in others] + ["Another drive's folder…"])
+        self.source.addItems([d["name"] for d in others] + ["Another drive's folder…", "Just its password (folder gone)"])
         self.loc = LineEdit(self); self.loc.setPlaceholderText("The other drive's folder")
         self.pick = PushButton("Choose folder…", self)
         self.other_pw = PasswordField(self); self.other_pw.setPlaceholderText("That drive's password")
@@ -924,9 +930,9 @@ class AdoptDialog(FocusedDialog):
         self._source_chosen(self.source.currentIndex())
 
     def _source_chosen(self, i):
-        listed = i < len(self.others)
+        by_folder = i == len(self.others)
         for w in (self.loc, self.pick):
-            w.setVisible(not listed)
+            w.setVisible(by_folder)
         self._unchecked()
 
     def _unchecked(self, *_):
@@ -946,14 +952,19 @@ class AdoptDialog(FocusedDialog):
         if not self.pw.text():
             return self.problem("Enter this drive's password.", self.pw)
         i = self.source.currentIndex()
-        other = self.others[i]["path"] if i < len(self.others) else self.loc.text().strip()
-        if not other:
-            return self.problem("Choose the other drive's folder.", self.pick)
-        if not (Path(other) / "meta.json").exists():
-            return self.problem("That folder isn't a cloak drive (it has no drive header).", self.loc)
+        # Every waiting file carries its drive's locked key, so its password
+        # is enough: the other drive's folder, if there is one, isn't needed.
+        if i < len(self.others):
+            other = [self.others[i]["path"]]
+        elif i == len(self.others):
+            if not self.loc.text().strip():
+                return self.problem("Choose the other drive's folder.", self.pick)
+            other = [os.path.normpath(self.loc.text().strip())]
+        else:
+            other = []
         if not self.other_pw.text():
             return self.problem("Enter the other drive's password.", self.other_pw)
-        args = [self.path, other]
+        args = [self.path, *other]
         env = {"CLOAK_PASSPHRASE": self.pw.text(), "CLOAK_OTHER_PASSPHRASE": self.other_pw.text()}
         try:
             if self.checked != args:
@@ -1064,7 +1075,8 @@ class MissingDialog(FocusedDialog):
 
 
 class PasswordDialog(FocusedDialog):
-    """Change a drive's password: instant, as only its header changes."""
+    """Change a drive's password: every file and folder carries the key
+    locked with it, so each is updated (a moment per file; resumable)."""
 
     def __init__(self, parent, drive):
         super().__init__(parent)
@@ -1073,7 +1085,9 @@ class PasswordDialog(FocusedDialog):
         self.old = PasswordField(self); self.old.setPlaceholderText("Current password")
         self.new = PasswordField(self); self.new.setPlaceholderText("New password")
         self.new2 = PasswordField(self); self.new2.setPlaceholderText("Confirm new password")
-        for w in (self.titleLabel, self.old, self.new, self.new2):
+        self.bar = ProgressBar(self); self.bar.hide()
+        self.count = CaptionLabel("", self); self.count.hide()
+        for w in (self.titleLabel, self.old, self.new, self.new2, self.bar, self.count):
             self.viewLayout.addWidget(w)
         self.finish_layout()
         self.yesButton.setText("Change password")
@@ -1091,9 +1105,17 @@ class PasswordDialog(FocusedDialog):
             return self.problem("Enter a new password.", self.new)
         if self.new.text() != self.new2.text():
             return self.problem("The new passwords don't match.", self.new2)
+        self.bar.setValue(0); self.bar.show()
+        self.count.setText("Starting…"); self.count.show()
+
+        def progress(done, total):
+            _show_progress(self.bar, self.count, "Updated", done, total)
+
         try:
-            engine(["passwd", self.path], CLOAK_PASSPHRASE=self.old.text(), CLOAK_NEW_PASSPHRASE=self.new.text())
+            engine_with_progress(["passwd", self.path], progress,
+                                 CLOAK_PASSPHRASE=self.old.text(), CLOAK_NEW_PASSPHRASE=self.new.text())
         except RuntimeError as e:
+            self.bar.hide(); self.count.hide()
             msg = str(e)
             return self.problem(msg[:1].upper() + msg[1:] + ".", self.old)
         self.succeeded = True
@@ -1106,8 +1128,8 @@ def _documents():
 
 
 class BackupDialog(FocusedDialog):
-    """Back up the recovery files (drive header and folder lists) of
-    `drives` into one password-protected file."""
+    """Back up the folder lists of `drives` into one password-protected file
+    (each drive's own password is needed to find its lists)."""
 
     def __init__(self, parent, drives):
         super().__init__(parent)
@@ -1116,8 +1138,8 @@ class BackupDialog(FocusedDialog):
         title = f"Back up “{drives[0]['name']}”" if one else f"Back up all {len(drives)} drives"
         self.titleLabel = SubtitleLabel(title, self)
         what = CaptionLabel(
-            "Saves the files needed to open " + ("this drive" if one else "these drives")
-            + " if they're lost or damaged: the drive header and every folder list. "
+            "Saves every folder list of " + ("this drive" if one else "these drives")
+            + ": the exact names of everything in them, in case a list is lost or damaged. "
             "Not your files themselves; keep a normal backup of the drive's folder for "
             "those. Store this somewhere other than the drive's own disk.", self)
         what.setWordWrap(True)
@@ -1127,10 +1149,16 @@ class BackupDialog(FocusedDialog):
         self.pick = PushButton("Save as…", self)
         self.pw = PasswordField(self); self.pw.setPlaceholderText("Password for this backup")
         self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
+        self.drive_pws = []
+        for d in drives:
+            f = PasswordField(self); f.setPlaceholderText(f"Password for “{d['name']}”")
+            self.drive_pws.append(f)
         row = QHBoxLayout(); row.addWidget(self.out); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(what)
         self.viewLayout.addLayout(row)
+        for f in self.drive_pws:
+            self.viewLayout.addWidget(f)
         self.viewLayout.addWidget(self.pw)
         self.viewLayout.addWidget(self.pw2)
         self.finish_layout()
@@ -1139,7 +1167,7 @@ class BackupDialog(FocusedDialog):
         self.widget.setMinimumWidth(470)
         self.pick.clicked.connect(self._choose)
         self.pw2.returnPressed.connect(self.yesButton.click)
-        self.first = self.pw
+        self.first = self.drive_pws[0] if self.drive_pws else self.pw
         self.busy_text = "Backing up…"
         self.outcome = None
 
@@ -1156,6 +1184,9 @@ class BackupDialog(FocusedDialog):
             out += ".cloakbak"
         if not os.path.isdir(os.path.dirname(os.path.abspath(out))):
             return self.problem("That folder doesn't exist.", self.out)
+        for d, f in zip(self.drives, self.drive_pws):
+            if not f.text():
+                return self.problem(f"Enter the password for “{d['name']}”.", f)
         if not self.pw.text():
             return self.problem("Choose a password for the backup.", self.pw)
         if self.pw.text() != self.pw2.text():
@@ -1164,7 +1195,8 @@ class BackupDialog(FocusedDialog):
         for d in self.drives:
             args += [d["name"], d["path"]]
         try:
-            self.outcome = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text())
+            self.outcome = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text(),
+                                  CLOAK_DRIVE_PASSPHRASES=json.dumps([f.text() for f in self.drive_pws]))
         except RuntimeError as e:
             return self.problem(f"Couldn't make the backup: {e}", self.out)
         self.outcome["file"] = out

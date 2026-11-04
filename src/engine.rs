@@ -20,7 +20,7 @@ use crate::crypto::{self, protected_ranges, transform_region, Key, Nonce};
 use crate::dircache::{read_listing, write_listing, Dir, DirCache};
 use crate::durable;
 use crate::envelope::{self, Envelope, LEN as ENVELOPE};
-use crate::key::{self, SALT_LEN};
+use crate::lock::{self, Keys};
 use crate::manifest::{self, Child};
 use crate::names;
 use serde::{Deserialize, Serialize};
@@ -33,74 +33,35 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The drive format this engine reads and writes (see `docs/FORMAT.md`).
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 
-const META_LABEL: &[u8] = b"cloak-meta-v2";
-const JOURNAL_LABEL: &[u8] = b"cloak-journal-v2";
+const JOURNAL_LABEL: &[u8] = b"cloak-journal-v3";
 
-/// Store-wide metadata persisted at the backing root (reserved name, distinct
-/// from a directory manifest).
-#[derive(Serialize, Deserialize)]
-struct StoreMeta {
-    version: u32,
-    salt: [u8; SALT_LEN],
-    region: u64,
-    /// The Argon2id settings the password's key is derived with.
-    kdf: key::KdfParams,
-    /// The master key, sealed with the password's key: a wrong password
-    /// fails its check.
-    wrapped: Vec<u8>,
-}
-
-fn parse_meta(meta: &[u8]) -> io::Result<StoreMeta> {
-    let damaged = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("damaged drive header: {e}"));
-    let value: serde_json::Value = serde_json::from_slice(meta).map_err(|e| damaged(e.to_string()))?;
-    if value.get("version").and_then(|v| v.as_u64()) != Some(FORMAT as u64) {
-        return Err(io::Error::new(
+/// The keys of the drive in `dir`, with its password, from the lock any of
+/// its files or folders carries (see [`crate::lock`]). `NotFound` ("no drive
+/// here") if nothing in the folder carries one, `PermissionDenied` for a
+/// wrong password (or one replaced by a password change).
+pub fn unlock(dir: &Path, password: &str) -> io::Result<Keys> {
+    match crate::lock::unlock_drive(dir, password) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound && dir.join("meta.json").exists() => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "this drive was made by an earlier test version of cloak, which this version can't open",
-        ));
+        )),
+        r => r,
     }
-    serde_json::from_value(value).map_err(|e| damaged(e.to_string()))
 }
 
-/// The master key and region for `passphrase`, from the bytes of a store's
-/// `meta.json`. `InvalidData` if they aren't a store header this version
-/// reads, `PermissionDenied` if the passphrase is wrong.
-pub fn key_from_meta(meta: &[u8], passphrase: &str) -> io::Result<(Key, u64)> {
-    let meta = parse_meta(meta)?;
-    let kek = key::derive_key(passphrase, &meta.salt, &meta.kdf)?;
-    let master = crypto::open(&kek, META_LABEL, &meta.wrapped)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "wrong password"))?;
-    let master: Key = master
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "damaged drive header: key"))?;
-    Ok((master, meta.region))
-}
-
-/// `meta.json` for a drive with `master` key, protected by `passphrase`.
-fn meta_for(master: &Key, passphrase: &str, region: u64) -> io::Result<Vec<u8>> {
-    let salt = key::random_salt();
-    let kdf = key::KdfParams::CURRENT;
-    let kek = key::derive_key(passphrase, &salt, &kdf)?;
-    let meta = StoreMeta { version: FORMAT, salt, region, kdf, wrapped: crypto::seal(&kek, META_LABEL, master) };
-    Ok(serde_json::to_vec_pretty(&meta)?)
-}
-
-/// Write a new drive's `meta.json` into `backing_dir`: a new random master
-/// key, wrapped for `passphrase`. Returns the master key.
-pub(crate) fn write_new_meta(backing_dir: &Path, passphrase: &str, region: u64) -> io::Result<Key> {
-    let master = envelope::new_key();
-    durable::write_atomic(&backing_dir.join("meta.json"), &meta_for(&master, passphrase, region)?)?;
-    Ok(master)
-}
-
-/// Change a drive's password: only `meta.json` changes (the master key is
-/// wrapped again), so it takes a moment whatever the drive holds.
-pub fn change_password(backing_dir: &Path, old: &str, new: &str) -> io::Result<()> {
-    let path = backing_dir.join("meta.json");
-    let (master, region) = key_from_meta(&std::fs::read(&path)?, old)?;
-    durable::write_atomic(&path, &meta_for(&master, new, region)?)
+/// Change a drive's password: every file's envelope and every folder's list
+/// gets the master key locked with `new` (its data is untouched). The top
+/// folder's list goes first, so from then on only `new` opens the drive; if
+/// the change is interrupted, opening with `new` finishes it.
+pub fn change_password(dir: &Path, old: &str, new: &str, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+    if new.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "the new password is empty"));
+    }
+    let keys = unlock(dir, old)?.relocked(new)?;
+    let mut store = Store::open_with_keys(dir, keys)?;
+    store.relock(progress)
 }
 
 /// What a path points at. The times are those of its boring file or directory
@@ -211,7 +172,10 @@ fn open_for_times(disk: &Path) -> io::Result<std::fs::File> {
 
 pub struct Store {
     backing_dir: PathBuf,
+    /// The drive's master key (`keys.master`), kept at hand.
     key: Key,
+    /// The drive's keys: what new envelopes and lists are locked with.
+    keys: Keys,
     region: u64,
     /// For each file written since it was last flushed: its length at that
     /// flush. Bytes below it were on disk before; bytes above are new and, like
@@ -242,6 +206,8 @@ pub struct Store {
     /// Files that already have a fresh nonce for the editing session under
     /// way (until their last close).
     renonced: HashSet<PathBuf>,
+    /// Open files already made sparse for a jump in size (see `update_blob`).
+    sparse: HashSet<PathBuf>,
     /// New files still empty, whose envelope (in `envelopes`) isn't on disk
     /// yet: it's written with their first data, or by `write_unwritten`.
     unwritten: HashSet<PathBuf>,
@@ -265,8 +231,7 @@ pub struct Store {
 type Crypt = (Key, Nonce);
 
 /// The drive's record of items that went missing (sealed, at the top).
-const MISSING: &str = "missing.idx";
-const MISSING_LABEL: &[u8] = b"cloak-missing-v2";
+const MISSING_LABEL: &[u8] = b"cloak-missing-v3";
 
 /// Something listed in the drive whose file or folder was found gone from
 /// the disk (moved out or deleted outside cloak). See [`Store::missing`].
@@ -378,14 +343,21 @@ fn not_found() -> io::Error {
 }
 
 impl Store {
-    /// Open (or create) a store with a raw master key.
+    /// Open (or create) a store with a raw master key and no password (its
+    /// files' locks then open with nothing but that key): for tests.
     pub fn open(backing_dir: impl AsRef<Path>, key: Key, region: u64) -> io::Result<Self> {
+        Self::open_with_keys(backing_dir, Keys::bare(key, region))
+    }
+
+    /// Open (or create) a store with its keys.
+    pub fn open_with_keys(backing_dir: impl AsRef<Path>, keys: Keys) -> io::Result<Self> {
         let backing_dir = backing_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&backing_dir)?;
         let store = Self {
             backing_dir,
-            key,
-            region,
+            key: keys.master,
+            region: keys.region,
+            keys,
             durable_len: HashMap::new(),
             handles: HashMap::new(),
             readers: Default::default(),
@@ -395,6 +367,7 @@ impl Store {
             doomed: Vec::new(),
             envelopes: HashMap::new(),
             renonced: HashSet::new(),
+            sparse: HashSet::new(),
             unwritten: HashSet::new(),
             foreign: Mutex::default(),
             missing: Mutex::default(),
@@ -408,9 +381,9 @@ impl Store {
         Ok(store)
     }
 
-    /// Create a brand-new drive protected by `passphrase`. Errors if a drive
-    /// already exists at `backing_dir` (so Create never clobbers an existing
-    /// one). Writes the salt, region, and an encrypted verifier token.
+    /// Create a brand-new drive protected by `passphrase` in `backing_dir`,
+    /// which must be empty (so Create never clobbers anything). The drive is
+    /// its top folder's list: it carries the locked master key.
     pub fn create_with_passphrase(
         backing_dir: impl AsRef<Path>,
         passphrase: &str,
@@ -418,36 +391,92 @@ impl Store {
     ) -> io::Result<Self> {
         let backing_dir = backing_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&backing_dir)?;
-        let meta_path = backing_dir.join("meta.json");
-        if meta_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a drive already exists here",
-            ));
+        if std::fs::read_dir(&backing_dir)?.next().is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "that folder isn't empty"));
         }
-        let derived = write_new_meta(&backing_dir, passphrase, region)?;
-        Self::open(backing_dir, derived, region)
+        let keys = Keys::new(passphrase, region)?;
+        write_listing(&backing_dir, &keys, None, &[], 0, &mut Vec::new(), None)?;
+        Self::open_with_keys(backing_dir, keys)
     }
 
     /// Open an existing drive. Errors if there is no drive at `backing_dir`
-    /// ("no drive here"), or if the passphrase is wrong ("wrong password"),
-    /// checked against the verifier token before any data is touched.
+    /// ("no drive here"), or if the passphrase is wrong ("wrong password").
+    /// Finishes a password change that was interrupted.
     pub fn open_with_passphrase(
         backing_dir: impl AsRef<Path>,
         passphrase: &str,
     ) -> io::Result<Self> {
         let backing_dir = backing_dir.as_ref().to_path_buf();
-        let meta_path = backing_dir.join("meta.json");
-        if !meta_path.exists() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
-        }
         if crate::convert::in_progress(&backing_dir) {
             return Err(io::Error::other(
                 "this folder is part-way through being converted; finish converting it first",
             ));
         }
-        let (derived, region) = key_from_meta(&std::fs::read(&meta_path)?, passphrase)?;
-        Self::open(backing_dir, derived, region)
+        let keys = unlock(&backing_dir, passphrase)?;
+        let mut store = Self::open_with_keys(backing_dir, keys)?;
+        if store.relock_marker().exists() {
+            store.relock(&mut |_, _| {})?;
+        }
+        Ok(store)
+    }
+
+    /// Where a password change under way is marked (a name the drive works
+    /// out from its key, like its lists).
+    fn relock_marker(&self) -> PathBuf {
+        self.backing_dir.join(format!("{}.new", lock::names(&self.key).missing))
+    }
+
+    /// Put this store's lock (its keys, after a password change) on every
+    /// list and envelope in the drive. The top list goes first; the rest
+    /// follow, marked as under way so a stopped change is finished on the
+    /// next open.
+    fn relock(&mut self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+        self.sync()?;
+        durable::write_synced(&self.relock_marker(), b"")?;
+        let mut folders = vec![self.backing_dir.clone()];
+        let mut files = Vec::new();
+        let mut lists = Vec::new();
+        while let Some(folder) = folders.pop() {
+            lists.push(folder.clone());
+            let dir = self.dir(&folder)?;
+            for c in dir.children() {
+                let p = folder.join(&c.boring);
+                if c.is_dir() {
+                    folders.push(p);
+                } else {
+                    files.push(p);
+                }
+            }
+        }
+        let total = (lists.len() + files.len()) as u64;
+        let mut done = 0;
+        for folder in &lists {
+            // Rewritten whole (one file), with the new lock.
+            let l = read_listing(folder, &self.keys)?;
+            write_listing(folder, &self.keys, l.name.as_deref(), &l.children, 0, &mut Vec::new(), None)?;
+            for i in 0..l.parts {
+                let _ = std::fs::remove_file(folder.join(manifest::part_name(&self.keys, i)));
+            }
+            self.dirs.forget(folder);
+            done += 1;
+            progress(done, total);
+        }
+        for file in &files {
+            // A file's lock is the first part of its envelope: only those bytes
+            // change. A torn write there leaves the rest of the envelope, and
+            // the file's entry in its list, as they were.
+            if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(file) {
+                let len = f.metadata()?.len();
+                if len >= ENVELOPE && Envelope::open(&self.key, &envelope::read_tail(file)?).is_ok() {
+                    write_all_at(&f, &self.keys.lock(), len - ENVELOPE)?;
+                }
+            }
+            done += 1;
+            progress(done, total);
+        }
+        self.envelopes.clear();
+        std::fs::remove_file(self.relock_marker())?;
+        durable::sync_dir(&self.backing_dir)
     }
 
     /// The folder the drive lives in.
@@ -600,8 +629,8 @@ impl Store {
     /// what's on disk: this drive's files and folders by their envelopes and
     /// own names, the folder's own name from its parent's list.
     fn dir(&self, folder: &Path) -> io::Result<Arc<Dir>> {
-        match self.dirs.load(folder, &self.key) {
-            Err(e) if e.kind() == io::ErrorKind::InvalidData && manifest::Manifest::path_in(folder).exists() => {
+        match self.dirs.load(folder, &self.keys) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData && manifest::Manifest::path_in(folder, &self.keys).exists() => {
                 self.set_aside_list(folder)?;
                 if let Some(found) = scan(folder) {
                     self.reconcile(folder, &found)?;
@@ -609,10 +638,10 @@ impl Store {
                 if folder != self.backing_dir {
                     let name = self.real_path_of(folder).and_then(|p| p.rsplit('/').next().map(str::to_string));
                     if let Some(name) = name.filter(|n| !n.is_empty()) {
-                        self.dirs.edit(folder, &self.key, |d| d.set_name(Some(name)))?;
+                        self.dirs.edit(folder, &self.keys, |d| d.set_name(Some(name)))?;
                     }
                 }
-                self.dirs.load(folder, &self.key)
+                self.dirs.load(folder, &self.keys)
             }
             r => r,
         }
@@ -625,7 +654,7 @@ impl Store {
         rd.flatten().any(|e| match e.file_type() {
             Ok(t) if t.is_file() => Envelope::read(&e.path(), &self.key).is_ok(),
             Ok(t) if t.is_dir() => {
-                manifest::Manifest::path_in(&e.path()).exists() && read_listing(&e.path(), &self.key).is_ok()
+                manifest::Manifest::path_in(&e.path(), &self.keys).exists() && read_listing(&e.path(), &self.keys).is_ok()
             }
             _ => false,
         })
@@ -636,7 +665,7 @@ impl Store {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         for e in std::fs::read_dir(folder)?.flatten() {
             let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
-            if manifest::is_list_file(&name) {
+            if manifest::is_list_file(&self.key, &name) {
                 std::fs::rename(e.path(), folder.join(format!("unreadable-list-{stamp}-{name}.bak")))?;
             }
         }
@@ -713,17 +742,25 @@ impl Store {
         for (name, m) in found {
             let Some(name) = name.to_str() else { continue };
             if dir.has_boring(name)
-                || crate::convert::is_reserved(name, at_root)
+                || crate::convert::is_reserved(Some(&self.keys), name, at_root)
                 || self.doomed.iter().any(|(d, b)| d == folder && b == name)
             {
                 continue;
             }
             let path = folder.join(name);
             if m.is_dir() {
-                if !manifest::Manifest::path_in(&path).exists() {
-                    continue; // not a drive's folder
+                if !manifest::Manifest::path_in(&path, &self.keys).exists() {
+                    // Without this drive's list: this drive's folder whose
+                    // list was lost (rebuilt when it's opened), another
+                    // drive's folder (its files carry a lock), or neither.
+                    if self.holds_ours(&path) {
+                        adopt.push(Child::dir(RECOVERED.into(), name.into()));
+                    } else if carries_a_lock(&path) {
+                        foreign.insert(name.to_string());
+                    }
+                    continue;
                 }
-                match read_listing(&path, &self.key) {
+                match read_listing(&path, &self.keys) {
                     Ok(l) => adopt.push(Child::dir(l.name.unwrap_or_else(|| RECOVERED.into()), name.into())),
                     // Its list won't open, but what's in it does: this drive's
                     // folder with a damaged list. Repair it and take it in.
@@ -738,9 +775,10 @@ impl Store {
             } else if m.is_file() && m.len() >= ENVELOPE {
                 match Envelope::read(&path, &self.key) {
                     Ok(e) => adopt.push(Child::from_envelope(e, name.into(), m.len() - ENVELOPE)),
-                    Err(_) => {
+                    Err(_) if lock::lock_of_file(&path).is_some_and(|l| plausible(&l)) => {
                         foreign.insert(name.to_string());
                     }
+                    Err(_) => {} // not a drive's file at all
                 }
             }
         }
@@ -753,7 +791,7 @@ impl Store {
         drop(dir);
         self.note_missing(folder, &gone, &adopt)?;
         if !adopt.is_empty() || !gone.is_empty() {
-            self.dirs.edit(folder, &self.key, |d| {
+            self.dirs.edit(folder, &self.keys, |d| {
                 for c in &gone {
                     if let Some(p) = d.position_of_boring(&c.boring) {
                         d.remove(p);
@@ -848,6 +886,12 @@ impl Store {
         self.save_missing(&missing)
     }
 
+    /// The record of missing items, at the top (a name worked out from the
+    /// drive's key).
+    fn missing_path(&self) -> PathBuf {
+        self.backing_dir.join(lock::names(&self.key).missing)
+    }
+
     fn load_missing(&self) -> Vec<Missing> {
         #[derive(Deserialize)]
         struct Saved {
@@ -855,7 +899,7 @@ impl Store {
             m: Missing,
             id: crate::envelope::FileId,
         }
-        let Ok(bytes) = std::fs::read(self.backing_dir.join(MISSING)) else {
+        let Ok(bytes) = std::fs::read(self.missing_path()) else {
             return Vec::new();
         };
         let Ok(plain) = crypto::open(&self.key, MISSING_LABEL, &bytes) else {
@@ -866,7 +910,7 @@ impl Store {
     }
 
     fn save_missing(&self, missing: &[Missing]) -> io::Result<()> {
-        let path = self.backing_dir.join(MISSING);
+        let path = self.missing_path();
         if missing.is_empty() {
             return match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -881,6 +925,41 @@ impl Store {
         }
         let saved: Vec<Saved> = missing.iter().map(|m| Saved { m, id: m.id }).collect();
         durable::write_atomic(&path, &crypto::seal(&self.key, MISSING_LABEL, &serde_json::to_vec(&saved)?))
+    }
+
+    /// The master keys of the other drives the strays here came from that
+    /// `password` opens: each stray carries its drive's lock, so neither that
+    /// drive nor its folder is needed. One slow password check per drive.
+    pub fn keys_for_strays(&self, password: &str) -> io::Result<Vec<Key>> {
+        self.sweep()?;
+        let strays: Vec<PathBuf> = lock(&self.foreign)
+            .iter()
+            .flat_map(|(d, names)| names.iter().map(move |n| d.join(n)))
+            .collect();
+        let mut locks = Vec::new();
+        for p in strays {
+            let found = if p.is_dir() { first_lock_in(&p) } else { lock::lock_of_file(&p) };
+            locks.extend(found.filter(plausible));
+        }
+        let mut keys: Vec<Key> = Vec::new();
+        let mut tried: Vec<crate::key::Salt> = Vec::new();
+        for l in &locks {
+            let Some((salt, _)) = lock::peek(l) else { continue };
+            if tried.contains(&salt) {
+                continue;
+            }
+            tried.push(salt);
+            let kek = lock::kek_for(password, &salt)?;
+            for l2 in locks.iter().filter(|l2| lock::peek(l2.as_slice()).is_some_and(|(s, _)| s == salt)) {
+                if let Ok((master, _, _)) = lock::open_with(&kek, l2) {
+                    if !keys.contains(&master) {
+                        keys.push(master);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(keys)
     }
 
     /// What [`adopt_from`](Self::adopt_from) would bring in with `other`,
@@ -898,8 +977,13 @@ impl Store {
         let mut left = 0;
         for (folder, name) in strays {
             let path = folder.join(&name);
+            let theirs = Keys::bare(*other, 0);
+            if !path.is_dir() && is_other_list(&theirs, &name) {
+                continue; // that drive's own list, copied in: nothing to bring in
+            }
             let item = if path.is_dir() {
-                read_listing(&path, other).ok().map(|l| Found {
+                let listed = manifest::Manifest::path_in(&path, &theirs).exists();
+                listed.then(|| read_listing(&path, &theirs).ok()).flatten().map(|l| Found {
                     path: String::new(),
                     name: l.name.unwrap_or_else(|| RECOVERED.into()),
                     is_dir: true,
@@ -917,7 +1001,7 @@ impl Store {
                 None => left += 1,
             }
         }
-        found.sort_by(|a, b| names::fold(&a.path).cmp(&names::fold(&b.path)));
+        found.sort_by_key(|f| names::fold(&f.path));
         Ok((found, left))
     }
 
@@ -951,11 +1035,21 @@ impl Store {
             .flat_map(|(d, names)| names.iter().map(move |n| (d.clone(), n.clone())))
             .collect();
         let (mut adopted, mut left) = (0, 0);
+        let theirs = Keys::bare(*other, 0);
         for (folder, name) in strays {
             let path = folder.join(&name);
+            if !path.is_dir() && is_other_list(&theirs, &name) {
+                // That drive's own list, copied in: of no use here once its
+                // files are brought in (each by its own envelope).
+                std::fs::remove_file(&path)?;
+                if let Some(set) = lock(&self.foreign).get_mut(&folder) {
+                    set.remove(&name);
+                }
+                continue;
+            }
             let child = if path.is_dir() {
                 if self.rekey_tree(&path, other)? {
-                    let l = read_listing(&path, &self.key)?;
+                    let l = read_listing(&path, &self.keys)?;
                     Some(Child::dir(l.name.unwrap_or_else(|| RECOVERED.into()), name.clone()))
                 } else {
                     None
@@ -966,7 +1060,7 @@ impl Store {
             };
             match child {
                 Some(c) => {
-                    self.dirs.edit(&folder, &self.key, |d| {
+                    self.dirs.edit(&folder, &self.keys, |d| {
                         if !d.has_boring(&c.boring) {
                             d.push(c);
                         }
@@ -1001,7 +1095,7 @@ impl Store {
         let mut old = [0u8; ENVELOPE as usize];
         read_exact_at(&f, &mut old, at)?;
         self.write_journal(&Journal::Undo { blob: self.rel(path), len, ranges: vec![(at, old.to_vec())] })?;
-        write_all_at(&f, &e.seal(&self.key), at)?;
+        write_all_at(&f, &e.seal(&self.key, &self.keys.lock()), at)?;
         f.sync_data()?;
         self.clear_journal()?;
         Ok(Some(e))
@@ -1012,32 +1106,38 @@ impl Store {
     /// so an interrupted run is simply run again. False if the folder's
     /// list opens with neither key.
     fn rekey_tree(&self, dir: &Path, other: &Key) -> io::Result<bool> {
-        if !manifest::Manifest::path_in(dir).exists() {
-            return Ok(false);
-        }
-        let theirs = match read_listing(dir, &self.key) {
-            Ok(_) => None, // re-sealed already, by a run that stopped part-way
-            Err(_) => match read_listing(dir, other) {
+        let other = Keys::bare(*other, 0);
+        let ours = manifest::Manifest::path_in(dir, &self.keys);
+        let theirs = if ours.exists() && read_listing(dir, &self.keys).is_ok() {
+            None // re-sealed already, by a run that stopped part-way
+        } else if manifest::Manifest::path_in(dir, &other).exists() {
+            match read_listing(dir, &other) {
                 Ok(l) => Some(l),
                 Err(_) => return Ok(false),
-            },
+            }
+        } else {
+            return Ok(false);
         };
         for e in std::fs::read_dir(dir)?.flatten() {
             let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
-            if crate::convert::is_reserved(&name, false) {
+            if crate::convert::is_reserved(Some(&self.keys), &name, false)
+                || crate::convert::is_reserved(Some(&other), &name, false)
+            {
                 continue;
             }
             let ft = e.file_type()?;
             if ft.is_dir() {
-                self.rekey_tree(&e.path(), other)?;
+                self.rekey_tree(&e.path(), &other.master)?;
             } else if ft.is_file() {
-                self.rekey_file(&e.path(), other)?;
+                self.rekey_file(&e.path(), &other.master)?;
             }
         }
         if let Some(l) = theirs {
-            write_listing(dir, &self.key, l.name.as_deref(), &l.children, 0, &mut Vec::new(), None)?;
+            write_listing(dir, &self.keys, l.name.as_deref(), &l.children, 0, &mut Vec::new(), None)?;
+            // Then the other drive's list files go: this one's replace them.
+            let _ = std::fs::remove_file(manifest::Manifest::path_in(dir, &other));
             for i in 0..l.parts {
-                let _ = std::fs::remove_file(dir.join(manifest::part_name(i)));
+                let _ = std::fs::remove_file(dir.join(manifest::part_name(&other, i)));
             }
         }
         Ok(true)
@@ -1103,8 +1203,8 @@ impl Store {
         std::fs::create_dir(&disk)?;
         // Its own list first, with its name, so the folder describes itself
         // from the start.
-        write_listing(&disk, &self.key, Some(&name), &[], 0, &mut Vec::new(), None)?;
-        self.dirs.edit(&parent_disk, &self.key, |d| d.push(Child::dir(name, boring)))?;
+        write_listing(&disk, &self.keys, Some(&name), &[], 0, &mut Vec::new(), None)?;
+        self.dirs.edit(&parent_disk, &self.keys, |d| d.push(Child::dir(name, boring)))?;
         self.tick()
     }
 
@@ -1131,14 +1231,14 @@ impl Store {
         // reopening a file just written waits for the antivirus scan.
         let blob = parent_disk.join(&boring);
         let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&blob)?;
-        let env = child.envelope().seal(&self.key);
+        let env = child.envelope().seal(&self.key, &self.keys.lock());
         self.unwritten.insert(blob.clone());
         if self.handles.len() >= MAX_HANDLES {
             self.handles.clear();
         }
         self.handles.insert(blob.clone(), f);
         self.envelopes.insert(blob, env);
-        self.dirs.edit(&parent_disk, &self.key, |d| d.push(child))?;
+        self.dirs.edit(&parent_disk, &self.keys, |d| d.push(child))?;
         self.tick()?;
         Ok(boring)
     }
@@ -1350,17 +1450,17 @@ impl Store {
             write_all_at(f, &buf, s)?;
         }
         entry.nonce = nonce;
-        let env = entry.envelope().seal(&self.key);
+        let env = entry.envelope().seal(&self.key, &self.keys.lock());
         write_all_at(f, &env, len)?;
         self.envelopes.insert(blob.to_path_buf(), env);
         self.unwritten.remove(blob);
         f.sync_data()?;
-        self.dirs.edit(&dir, &self.key, |d| {
+        self.dirs.edit(&dir, &self.keys, |d| {
             if let Some(p) = d.position_of_boring(&boring) {
                 d.child_mut(p).nonce = nonce;
             }
         })?;
-        self.dirs.flush_dir(&dir, &self.key)?;
+        self.dirs.flush_dir(&dir, &self.keys)?;
         if journaled {
             self.clear_journal()?;
         }
@@ -1426,6 +1526,7 @@ impl Store {
         }
         self.durable_len.remove(blob);
         self.handles.remove(blob);
+        self.sparse.remove(blob);
         self.envelopes.remove(blob);
         self.renonced.remove(blob);
         readers_mut(&mut self.readers).remove(blob);
@@ -1526,6 +1627,17 @@ impl Store {
         // write (data then envelope) extends the file itself, and any gap
         // before it reads as zeros.
         let extends = new > old && !data.is_empty() && end == new;
+        // A jump in size puts the tail end and envelope far past the old end.
+        // Windows would first fill the gap with zeros on the disk, and then
+        // the app writes its data over them (a copy sets the file's full size
+        // before writing it): every byte twice. A sparse file leaves the gap
+        // as a hole instead, which reads as the same zeros. It stays sparse:
+        // making it normal again on close would write zeros wherever the
+        // app's data hasn't reached the disk yet, the same double write.
+        let gap_to = if extends { offset } else { new };
+        if gap_to >= old + SPARSE_MIN && !self.sparse.contains(blob) && set_sparse(f, true).is_ok() {
+            self.sparse.insert(blob.to_path_buf());
+        }
         if new != old && !extends {
             f.set_len(new + ENVELOPE)?;
         }
@@ -1544,9 +1656,14 @@ impl Store {
         // 3. The data itself, and the envelope at the new end (in the same
         //    write when the data reaches it, as when appending).
         let mut env = env;
-        if !data.is_empty() {
+        let encrypted = clip(&protected_ranges(new, n), offset, end);
+        if !data.is_empty() && encrypted.is_empty() && (env.is_none() || end != new || data.len() > 64 * 1024) {
+            // All in the plain middle: straight from the app's buffer, not a
+            // copy of it (the envelope, if it moves, follows in its own write).
+            write_all_at(f, data, offset)?;
+        } else if !data.is_empty() {
             let mut buf = data.to_vec();
-            for (s, e) in clip(&protected_ranges(new, n), offset, end) {
+            for (s, e) in encrypted {
                 let (ls, le) = ((s - offset) as usize, (e - offset) as usize);
                 transform_region(key, nonce, s, &mut buf[ls..le]);
             }
@@ -1580,7 +1697,7 @@ impl Store {
         }
         let child = self
             .dirs
-            .edit(&parent_disk, &self.key, |d| d.position(&name).map(|p| d.remove(p)))?
+            .edit(&parent_disk, &self.keys, |d| d.position(&name).map(|p| d.remove(p)))?
             .ok_or_else(not_found)?;
         self.durable_len.remove(&parent_disk.join(&child.boring));
         self.doomed.push((parent_disk, child.boring));
@@ -1668,7 +1785,7 @@ impl Store {
         // others; a replaced entry is deleted from the disk after that.
         if same_parent {
             let gone = replaced.clone();
-            self.dirs.edit(&old_parent_disk, &self.key, |d| {
+            self.dirs.edit(&old_parent_disk, &self.keys, |d| {
                 if let Some(p) = gone.as_deref().and_then(|r| d.position_of_boring(r)) {
                     d.remove(p);
                 }
@@ -1709,7 +1826,7 @@ impl Store {
 
     /// Record a folder's real name in its own list (saved with the others).
     fn name_folder(&mut self, disk: &Path, name: &str) -> io::Result<()> {
-        self.dirs.edit(disk, &self.key, |d| d.set_name(Some(name.to_string())))?;
+        self.dirs.edit(disk, &self.keys, |d| d.set_name(Some(name.to_string())))?;
         self.tick()
     }
 
@@ -1856,7 +1973,7 @@ impl Store {
             result = self.write_journal(&purge);
         }
         if result.is_ok() {
-            result = self.dirs.flush(&self.key);
+            result = self.dirs.flush(&self.keys);
         }
         if let Err(e) = result {
             self.doomed.splice(0..0, doomed);
@@ -1919,7 +2036,7 @@ impl Store {
                 // Destination first: until the source entry goes, a crash
                 // leaves the item listed twice at worst, never not at all.
                 let same = from_dir == to_dir;
-                self.dirs.edit(&to_dir, &self.key, |d| {
+                self.dirs.edit(&to_dir, &self.keys, |d| {
                     let gone = [Some(&child.boring), replaced.as_ref(), same.then_some(from_boring)];
                     for b in gone.into_iter().flatten() {
                         if let Some(p) = d.position_of_boring(b) {
@@ -1928,14 +2045,14 @@ impl Store {
                     }
                     d.push(child.clone());
                 })?;
-                self.dirs.flush_dir(&to_dir, &self.key)?;
+                self.dirs.flush_dir(&to_dir, &self.keys)?;
                 if !same {
-                    self.dirs.edit(&from_dir, &self.key, |d| {
+                    self.dirs.edit(&from_dir, &self.keys, |d| {
                         if let Some(p) = d.position_of_boring(from_boring) {
                             d.remove(p);
                         }
                     })?;
-                    self.dirs.flush_dir(&from_dir, &self.key)?;
+                    self.dirs.flush_dir(&from_dir, &self.keys)?;
                 }
                 durable::sync_dir(&to_dir)?;
                 durable::sync_dir(&from_dir)
@@ -1958,7 +2075,7 @@ impl Store {
     fn merge_all_conflicts(&self) -> io::Result<()> {
         let mut dirs = vec![self.backing_dir.clone()];
         while let Some(dir) = dirs.pop() {
-            manifest::merge_conflicts(&dir, &self.key)?;
+            manifest::merge_conflicts(&dir, &self.keys)?;
             for e in std::fs::read_dir(&dir)?.flatten() {
                 if e.file_type().is_ok_and(|t| t.is_dir()) {
                     dirs.push(e.path());
@@ -2027,6 +2144,39 @@ fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
+fn plausible(l: &[u8; lock::LEN]) -> bool {
+    lock::plausible(l)
+}
+
+/// Is `name` one of the list files of the drive with `keys`?
+fn is_other_list(keys: &Keys, name: &str) -> bool {
+    manifest::is_list_file(&keys.master, name) || manifest::is_conflict_copy(&keys.master, name)
+}
+
+/// Does anything in the disk folder `dir` carry a drive's lock?
+fn carries_a_lock(dir: &Path) -> bool {
+    first_lock_in(dir).is_some()
+}
+
+/// The first lock found in the disk folder `dir` or below.
+fn first_lock_in(dir: &Path) -> Option<[u8; lock::LEN]> {
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(f) = folders.pop() {
+        for e in std::fs::read_dir(&f).ok()?.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => folders.push(e.path()),
+                Ok(t) if t.is_file() => {
+                    if let Some(l) = lock::lock_of_file(&e.path()).filter(plausible) {
+                        return Some(l);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// The name given to a folder found without one.
 const RECOVERED: &str = "Recovered folder";
 
@@ -2062,6 +2212,55 @@ fn restore(path: &Path, len: u64, ranges: &[(u64, Vec<u8>)]) -> io::Result<()> {
     }
     f.set_len(len)?;
     f.sync_data()
+}
+
+/// A jump in a file's size at least this big is left as a hole.
+const SPARSE_MIN: u64 = 1 << 20;
+
+/// Mark a file sparse (or not). Only Windows needs it: elsewhere a file grows
+/// with a hole anyway.
+#[cfg(windows)]
+fn set_sparse(f: &std::fs::File, sparse: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            device: *mut std::ffi::c_void,
+            code: u32,
+            input: *const std::ffi::c_void,
+            input_len: u32,
+            output: *mut std::ffi::c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    let flag: u8 = sparse.into(); // FILE_SET_SPARSE_BUFFER
+    let mut returned = 0u32;
+    // SAFETY: a valid open handle, a 1-byte input buffer that outlives the
+    // call, no output, and a synchronous handle (no OVERLAPPED).
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            (&flag as *const u8).cast(),
+            1,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_sparse(_: &std::fs::File, _: bool) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// A file's data length: its length on disk less its envelope.
@@ -2315,40 +2514,40 @@ mod tests {
     }
 
     #[test]
-    fn password_settings_are_recorded_and_old_formats_refused() {
+    fn a_drive_folder_has_no_plain_text_and_old_formats_are_named() {
         let d = tempdir().unwrap();
         {
             let mut s = Store::create_with_passphrase(d.path(), "right", 64).unwrap();
-            s.create("note.txt").unwrap();
-            s.write_at("note.txt", 0, b"kept").unwrap();
+            s.mkdir("Docs").unwrap();
+            s.create("Docs/note.txt").unwrap();
+            s.write_at("Docs/note.txt", 0, b"kept").unwrap();
         }
-        let meta_path = d.path().join("meta.json");
-        let mut meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
-        assert_eq!(
-            serde_json::from_value::<key::KdfParams>(meta["kdf"].clone()).unwrap(),
-            key::KdfParams::CURRENT
-        );
-
+        // No meta.json, no manifest.idx, nothing readable: dull names only.
+        let mut all = Vec::new();
+        let mut folders = vec![d.path().to_path_buf()];
+        while let Some(f) = folders.pop() {
+            for e in std::fs::read_dir(&f).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    folders.push(e.path());
+                } else {
+                    let bytes = std::fs::read(e.path()).unwrap();
+                    assert!(!bytes.starts_with(b"{"), "{:?} looks like plain JSON", e.file_name());
+                }
+                all.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+        assert!(all.iter().all(|n| n.contains('_') && n != "manifest.idx" && n != "meta.json"), "{all:?}");
         let s = Store::open_with_passphrase(d.path(), "right").unwrap();
-        assert_eq!(s.read_all("note.txt").unwrap(), b"kept");
+        assert_eq!(s.read_all("Docs/note.txt").unwrap(), b"kept");
+        assert_eq!(Store::open_with_passphrase(d.path(), "wrong").err().map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
         drop(s);
 
-        // A drive from an earlier format is refused, saying why.
-        let mut old = meta.clone();
-        old["version"] = serde_json::json!(1);
-        std::fs::write(&meta_path, serde_json::to_vec(&old).unwrap()).unwrap();
-        let err = Store::open_with_passphrase(d.path(), "right").err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // A folder with no drive, and one from an earlier format.
+        let empty = tempdir().unwrap();
+        assert_eq!(Store::open_with_passphrase(empty.path(), "x").err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        std::fs::write(empty.path().join("meta.json"), br#"{"version":2}"#).unwrap();
+        let err = Store::open_with_passphrase(empty.path(), "x").err().unwrap();
         assert!(err.to_string().contains("earlier test version"), "{err}");
-
-        // Settings out of range are refused rather than tried.
-        meta["kdf"] = serde_json::json!({ "m_cost": u32::MAX, "t_cost": 2, "p_cost": 1 });
-        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-        assert_eq!(
-            Store::open_with_passphrase(d.path(), "right").err().map(|e| e.kind()),
-            Some(io::ErrorKind::InvalidData)
-        );
     }
 
     // ---- cross-platform names ---------------------------------------------
@@ -2495,7 +2694,7 @@ mod tests {
     /// envelope that describes it, after any mix of writes and resizes.
     fn assert_disk_matches(s: &Store, name: &str, plain: &[u8]) {
         assert_eq!(s.read_all(name).unwrap(), plain, "read back differs");
-        let manifest = s.dirs.load(&s.backing_dir, &s.key).unwrap();
+        let manifest = s.dirs.load(&s.backing_dir, &s.keys).unwrap();
         let child = manifest.find(name).unwrap();
         let mut want = plain.to_vec();
         crate::crypto::transform_ends(&child.key, &child.nonce, &mut want, s.region);
@@ -2559,7 +2758,7 @@ mod tests {
         }
         let plain = vec![0xABu8; 20_000];
         assert_disk_matches(&s, "big", &plain);
-        let child = s.dirs.load(&s.backing_dir, &s.key).unwrap().find("big").unwrap().clone();
+        let child = s.dirs.load(&s.backing_dir, &s.keys).unwrap().find("big").unwrap().clone();
         let disk = std::fs::read(s.backing_dir.join(&child.boring)).unwrap();
         assert!(disk[128..20_000 - 128].iter().all(|&b| b == 0xAB), "middle is plaintext");
         assert_ne!(&disk[..128], &plain[..128]);
@@ -2603,9 +2802,9 @@ mod tests {
         s.sync().unwrap();
         let a_disk = s.resolve_dir(&["a".into()]).unwrap();
         let b_disk = s.resolve_dir(&["b".into()]).unwrap();
-        let mut child = s.dirs.load(&a_disk, &s.key).unwrap().find("f.txt").unwrap().clone();
+        let mut child = s.dirs.load(&a_disk, &s.keys).unwrap().find("f.txt").unwrap().clone();
         let from_boring = child.boring.clone();
-        let replaced = s.dirs.load(&b_disk, &s.key).unwrap().find("g.txt").unwrap().boring.clone();
+        let replaced = s.dirs.load(&b_disk, &s.keys).unwrap().find("g.txt").unwrap().boring.clone();
         child.boring = "cache_0042.dat".into();
         child.real = "g.txt".into();
         s.write_journal(&Journal::Move {
@@ -2634,13 +2833,13 @@ mod tests {
         s.mkdir("dir").unwrap();
         s.create("dir/inner.txt").unwrap();
         s.sync().unwrap();
-        let boring = s.dirs.load(&s.backing_dir, &s.key).unwrap().find("dir").unwrap().boring.clone();
+        let boring = s.dirs.load(&s.backing_dir, &s.keys).unwrap().find("dir").unwrap().boring.clone();
         s.remove("dir").unwrap();
 
         // "Crash" after the list was saved but before the folder was deleted.
         let items = vec![(String::new(), boring.clone())];
         s.write_journal(&Journal::Purge { items }).unwrap();
-        s.dirs.flush(&s.key).unwrap();
+        s.dirs.flush(&s.keys).unwrap();
         let s = reopen(s);
         assert!(s.metadata("dir").unwrap().is_none());
         assert!(!d.path().join(&boring).exists(), "no orphaned data left on disk");
@@ -2654,7 +2853,7 @@ mod tests {
         s.write_at("old.txt", 0, b"kept").unwrap();
         s.create("doomed.txt").unwrap();
         s.sync().unwrap();
-        let boring = s.dirs.load(&s.backing_dir, &s.key).unwrap().find("doomed.txt").unwrap().boring.clone();
+        let boring = s.dirs.load(&s.backing_dir, &s.keys).unwrap().find("doomed.txt").unwrap().boring.clone();
 
         // Unsaved when the crash comes: a delete, a rename and a create.
         s.remove("doomed.txt").unwrap();
@@ -2678,10 +2877,10 @@ mod tests {
         let d = tempdir().unwrap();
         let mut s = store(d.path());
         s.create("a.txt").unwrap();
-        assert!(read_listing(d.path(), &s.key).unwrap().children.is_empty());
+        assert!(read_listing(d.path(), &s.keys).unwrap().children.is_empty());
         std::thread::sleep(SAVE_DELAY);
         s.tick().unwrap();
-        assert_eq!(read_listing(d.path(), &s.key).unwrap().children.len(), 1);
+        assert_eq!(read_listing(d.path(), &s.keys).unwrap().children.len(), 1);
     }
 
     #[test]
@@ -2691,7 +2890,7 @@ mod tests {
         s.create("a.txt").unwrap();
         s.write_at("a.txt", 0, b"x").unwrap();
         s.sync().unwrap();
-        let boring = s.dirs.load(&s.backing_dir, &s.key).unwrap().find("a.txt").unwrap().boring.clone();
+        let boring = s.dirs.load(&s.backing_dir, &s.keys).unwrap().find("a.txt").unwrap().boring.clone();
         s.remove("a.txt").unwrap();
         assert!(d.path().join(&boring).exists());
         // A new file may not take the name of one waiting to be deleted.
@@ -2883,7 +3082,7 @@ mod tests {
     // ---- format 2: keys, nonces, envelopes, strays -----------------------
 
     fn entry(s: &Store, folder: &Path, name: &str) -> Child {
-        s.dirs.load(folder, &s.key).unwrap().find(name).unwrap().clone()
+        s.dirs.load(folder, &s.keys).unwrap().find(name).unwrap().clone()
     }
 
     #[test]
@@ -2931,6 +3130,169 @@ mod tests {
     }
 
     #[test]
+    fn a_file_from_a_drive_that_is_gone_comes_in_with_just_its_password() {
+        let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut a = Store::create_with_passphrase(d1.path(), "pass-a", 128).unwrap();
+        a.create("letter.txt").unwrap();
+        a.write_at("letter.txt", 0, b"dear diary").unwrap();
+        a.sync().unwrap();
+        let boring = entry(&a, d1.path(), "letter.txt").boring;
+        drop(a);
+        let mut b = Store::create_with_passphrase(d2.path(), "pass-b", 128).unwrap();
+        b.sync().unwrap();
+        drop(b);
+        // The hidden file into B, and A's folder gone for good.
+        std::fs::copy(d1.path().join(&boring), d2.path().join(&boring)).unwrap();
+        drop(d1);
+
+        let mut b = Store::open_with_passphrase(d2.path(), "pass-b").unwrap();
+        assert!(b.list_dir("").unwrap().is_empty());
+        assert_eq!(b.foreign_count(), 1);
+        assert!(b.keys_for_strays("wrong").unwrap().is_empty());
+        let keys = b.keys_for_strays("pass-a").unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(b.adopt_from(&keys[0]).unwrap(), (1, 0));
+        assert_eq!(b.read_all("letter.txt").unwrap(), b"dear diary");
+    }
+
+    #[test]
+    fn a_copy_that_sets_the_size_first_reads_back_and_leaves_a_hole() {
+        // How Windows copies a file: its full size first, then the data in order.
+        let d = tempdir().unwrap();
+        let mut s = Store::create_with_passphrase(d.path(), "pw", 128).unwrap();
+        let len = 5 * 1024 * 1024 + 777;
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4096) as u8).collect();
+        s.create("big.bin").unwrap();
+        let id = s.open_file("big.bin").unwrap();
+        s.truncate_file(id, len as u64).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let (blob, _) = s.opened(id).unwrap();
+            assert_ne!(std::fs::metadata(&blob).unwrap().file_attributes() & 0x200, 0, "sparse");
+        }
+        assert_eq!(s.read_file(id, len as u64 - 10, 10).unwrap(), vec![0; 10], "unwritten reads as zeros");
+        for (i, chunk) in data.chunks(1 << 20).enumerate() {
+            s.write_file(id, (i << 20) as u64, chunk).unwrap();
+        }
+        s.release_file(id);
+        assert_eq!(s.read_all("big.bin").unwrap(), data);
+        drop(s);
+        let s = Store::open_with_passphrase(d.path(), "pw").unwrap();
+        assert_eq!(s.read_all("big.bin").unwrap(), data, "after reopening");
+    }
+
+    #[test]
+    fn another_drives_files_copied_in_dont_take_over_the_drive() {
+        let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+        {
+            let mut v1 = Store::create_with_passphrase(d1.path(), "test1", 128).unwrap();
+            for i in 0..12 {
+                let p = format!("f{i}.txt");
+                v1.create(&p).unwrap();
+                v1.write_at(&p, 0, p.as_bytes()).unwrap();
+            }
+        }
+        drop(Store::create_with_passphrase(d2.path(), "test2", 128).unwrap());
+        // v2 is empty; v1's hidden files (not its list) copied into it, so
+        // v1's lock outnumbers v2's twelve to one.
+        let v1_list = unlock(d1.path(), "test1").unwrap().list_name().to_string();
+        for e in std::fs::read_dir(d1.path()).unwrap().flatten() {
+            if e.file_name().to_string_lossy() != v1_list {
+                std::fs::copy(e.path(), d2.path().join(e.file_name())).unwrap();
+            }
+        }
+
+        let mut v2 = Store::open_with_passphrase(d2.path(), "test2").expect("v2's own password opens v2");
+        assert!(v2.list_dir("").unwrap().is_empty());
+        assert_eq!(v2.foreign_count(), 12, "v1's files wait");
+        let err = Store::open_with_passphrase(d2.path(), "test1").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "v1's password isn't v2's: {err}");
+
+        let keys = v2.keys_for_strays("test1").unwrap();
+        assert_eq!(v2.adopt_from(&keys[0]).unwrap(), (12, 0));
+        assert_eq!(v2.read_all("f3.txt").unwrap(), b"f3.txt");
+        drop(v2);
+        // Now they're v2's: v2's password still opens it, v1's still doesn't.
+        assert!(Store::open_with_passphrase(d2.path(), "test2").is_ok());
+        assert!(Store::open_with_passphrase(d2.path(), "test1").is_err());
+    }
+
+    #[test]
+    fn a_password_change_relocks_everything() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "old", 128).unwrap();
+            s.mkdir("Docs").unwrap();
+            for p in ["a.txt", "Docs/b.txt"] {
+                s.create(p).unwrap();
+                s.write_at(p, 0, p.as_bytes()).unwrap();
+            }
+        }
+        let mut seen = (0, 0);
+        change_password(d.path(), "old", "new", &mut |n, t| seen = (n, t)).unwrap();
+        assert_eq!(seen, (4, 4), "2 lists and 2 files");
+        // Every lock in the drive is the new one.
+        let mut folders = vec![d.path().to_path_buf()];
+        while let Some(f) = folders.pop() {
+            for e in std::fs::read_dir(&f).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    folders.push(e.path());
+                } else if let Some(l) = lock::lock_of_file(&e.path()) {
+                    assert!(lock::unlock_one(&l, "new").is_ok(), "{:?}", e.file_name());
+                    assert!(lock::unlock_one(&l, "old").is_err());
+                }
+            }
+        }
+        assert_eq!(Store::open_with_passphrase(d.path(), "old").err().map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+        let s = Store::open_with_passphrase(d.path(), "new").unwrap();
+        assert_eq!(s.read_all("Docs/b.txt").unwrap(), b"Docs/b.txt");
+    }
+
+    #[test]
+    fn an_interrupted_password_change_is_finished_by_the_new_password() {
+        let d = tempdir().unwrap();
+        let file;
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "old", 128).unwrap();
+            s.create("a.txt").unwrap();
+            s.write_at("a.txt", 0, b"A").unwrap();
+            s.sync().unwrap();
+            file = d.path().join(entry(&s, d.path(), "a.txt").boring);
+        }
+        // Stopped after the top list: its lock is new, the file's is old.
+        let keys = unlock(d.path(), "old").unwrap().relocked("new").unwrap();
+        let s = Store::open_with_keys(d.path(), keys.clone()).unwrap();
+        durable::write_synced(&s.relock_marker(), b"").unwrap();
+        let l = read_listing(d.path(), &keys).unwrap();
+        write_listing(d.path(), &keys, l.name.as_deref(), &l.children, 0, &mut Vec::new(), None).unwrap();
+        drop(s);
+        assert!(lock::unlock_one(&lock::lock_of_file(&file).unwrap(), "old").is_ok());
+
+        let err = Store::open_with_passphrase(d.path(), "old").err().unwrap();
+        assert!(err.to_string().contains("password was changed"), "{err}");
+        let s = Store::open_with_passphrase(d.path(), "new").unwrap();
+        assert!(!s.relock_marker().exists(), "finished");
+        assert!(lock::unlock_one(&lock::lock_of_file(&file).unwrap(), "new").is_ok());
+        assert_eq!(s.read_all("a.txt").unwrap(), b"A");
+    }
+
+    #[test]
+    fn a_drive_unlocks_without_its_top_list() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "pw", 128).unwrap();
+            s.create("a.txt").unwrap();
+            s.write_at("a.txt", 0, b"A").unwrap();
+        }
+        let keys = unlock(d.path(), "pw").unwrap();
+        std::fs::remove_file(manifest::Manifest::path_in(d.path(), &keys)).unwrap();
+        let s = Store::open_with_passphrase(d.path(), "pw").unwrap();
+        assert_eq!(s.list_dir("").unwrap().into_iter().map(|e| e.0).collect::<Vec<_>>(), ["a.txt"]);
+        assert_eq!(s.read_all("a.txt").unwrap(), b"A");
+    }
+
+    #[test]
     fn wrong_password_and_changing_it() {
         let d = tempdir().unwrap();
         {
@@ -2941,11 +3303,11 @@ mod tests {
         let wrong = Store::open_with_passphrase(d.path(), "nope").err().unwrap();
         assert_eq!(wrong.kind(), io::ErrorKind::PermissionDenied);
 
-        change_password(d.path(), "first", "second").unwrap();
+        change_password(d.path(), "first", "second", &mut |_, _| {}).unwrap();
         assert!(Store::open_with_passphrase(d.path(), "first").is_err());
         let s = Store::open_with_passphrase(d.path(), "second").unwrap();
         assert_eq!(s.read_all("note.txt").unwrap(), b"kept", "files untouched");
-        assert!(change_password(d.path(), "first", "x").is_err());
+        assert!(change_password(d.path(), "first", "x", &mut |_, _| {}).is_err());
     }
 
     #[test]
@@ -3090,7 +3452,7 @@ mod tests {
 
         s.clear_missing().unwrap();
         assert_eq!(s.missing_count(), 0);
-        assert!(!d.path().join(MISSING).exists());
+        assert!(!d.path().join(lock::names(&s.key).missing).exists());
     }
 
     #[test]
@@ -3122,7 +3484,7 @@ mod tests {
         s.rename_path("Photos", "Holiday").unwrap();
         s.sync().unwrap();
         drop(s);
-        std::fs::remove_file(d.path().join(manifest::MANIFEST_NAME)).unwrap();
+        std::fs::remove_file(manifest::Manifest::path_in(d.path(), &Keys::bare([9u8; 32], 128))).unwrap();
 
         let s = Store::open(d.path(), [9u8; 32], 128).unwrap();
         let mut top: Vec<String> = s.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
@@ -3217,12 +3579,12 @@ mod tests {
         let sub = d.path().join(entry(&s, d.path(), "Sub").boring);
         drop(s);
         // A changed byte in the top list, and the subfolder's list garbled.
-        let path = d.path().join(manifest::MANIFEST_NAME);
+        let path = manifest::Manifest::path_in(d.path(), &Keys::bare([9u8; 32], 128));
         let mut raw = std::fs::read(&path).unwrap();
         let mid = raw.len() / 2;
         raw[mid] ^= 1;
         std::fs::write(&path, raw).unwrap();
-        std::fs::write(sub.join(manifest::MANIFEST_NAME), b"not a list").unwrap();
+        std::fs::write(manifest::Manifest::path_in(&sub, &Keys::bare([9u8; 32], 128)), b"not a list").unwrap();
 
         let s = Store::open(d.path(), [9u8; 32], 128).unwrap();
         let mut top: Vec<String> = s.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
@@ -3248,18 +3610,18 @@ mod tests {
         s.sync().unwrap();
         let sub = d.path().join(entry(&s, d.path(), "Sub").boring);
         drop(s);
-        std::fs::write(sub.join(manifest::MANIFEST_NAME), b"not a list").unwrap();
+        std::fs::write(manifest::Manifest::path_in(&sub, &Keys::bare([9u8; 32], 128)), b"not a list").unwrap();
 
         let mut s = Store::open(d.path(), [9u8; 32], 128).unwrap();
         assert_eq!(s.list_dir("Sub").unwrap().into_iter().map(|e| e.0).collect::<Vec<_>>(), ["inner.txt"]);
         assert_eq!(s.read_all("Sub/inner.txt").unwrap(), b"in");
         s.sync().unwrap();
         drop(s);
-        assert_eq!(read_listing(&sub, &[9u8; 32]).unwrap().name.as_deref(), Some("Sub"), "named from its parent");
+        assert_eq!(read_listing(&sub, &Keys::bare([9u8; 32], 128)).unwrap().name.as_deref(), Some("Sub"), "named from its parent");
     }
 
     #[test]
-    fn another_drives_list_copied_over_this_ones() {
+    fn another_drives_files_and_list_copied_in() {
         let (da, db) = (tempdir().unwrap(), tempdir().unwrap());
         let mut a = other_store(da.path());
         a.create("from-a.txt").unwrap();
@@ -3278,12 +3640,16 @@ mod tests {
             }
         }
 
+        // Lists have names worked out from each drive's key, so A's list
+        // arrives beside B's rather than over it.
         let mut b = store(db.path());
         let names: Vec<String> = b.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
-        assert_eq!(names, ["mine.txt"], "this drive's own file is back");
+        assert_eq!(names, ["mine.txt"]);
         assert_eq!(b.read_all("mine.txt").unwrap(), b"B");
-        assert_eq!(b.foreign_count(), 1, "the other drive's file waits");
+        let (found, left) = b.preview_from(&[8u8; 32]).unwrap();
+        assert_eq!((found.len(), left), (1, 0), "A's file, not A's list");
         assert_eq!(b.adopt_from(&[8u8; 32]).unwrap(), (1, 0));
         assert_eq!(b.read_all("from-a.txt").unwrap(), b"A");
+        assert_eq!(b.foreign_count(), 0, "A's list is gone too");
     }
 }

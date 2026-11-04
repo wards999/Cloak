@@ -41,6 +41,15 @@ pub fn generate<R: Rng + ?Sized>(rng: &mut R) -> String {
     format!("{stem}_{n:04}.{ext}")
 }
 
+/// A boring name chosen by `bytes` rather than at random, so the same bytes
+/// always give the same name (for names a drive works out from its key).
+pub fn from_bytes(bytes: &[u8; 8]) -> String {
+    let stem = STEMS[bytes[0] as usize % STEMS.len()];
+    let ext = EXTS[bytes[1] as usize % EXTS.len()];
+    let n = u16::from_le_bytes([bytes[2], bytes[3]]) % 10_000;
+    format!("{stem}_{n:04}.{ext}")
+}
+
 /// Generate a name guaranteed not to collide with `existing` (the set of names
 /// already used in the backing store). Retries a bounded number of times, then
 /// widens the numeric space to guarantee termination.

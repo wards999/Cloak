@@ -38,16 +38,22 @@ If your threat model includes that, you want **full-file authenticated
 encryption** (VeraCrypt, gocryptfs, Cryptomator) instead — this tool is for the
 "casual glance / mild obscurity, keep it fast" end of the spectrum.
 
-What it does guarantee (drive format 2, see [`docs/FORMAT.md`](docs/FORMAT.md)):
+What it does guarantee (drive format 3, see [`docs/FORMAT.md`](docs/FORMAT.md)):
 - **Each file has its own key**, and its ends get a fresh nonce whenever an
   editing session changes them, so two copies of a file from either side of
   an edit (from sync history or a backup) don't give each other away.
-- **Lists, file envelopes and the drive header are authenticated**: a damaged
-  or tampered one is reported, never read as garbage. The plain middle of a
+- **Lists, file envelopes and locks are authenticated**: a damaged or
+  tampered one is reported, never read as garbage. The plain middle of a
   file has no integrity check, by design.
-- **Nothing hangs on one file**: every file ends with a sealed envelope (its
-  key, nonce and real name) and every folder's list records the folder's own
-  name, so a lost list is rebuilt from what's on disk.
+- **Nothing hangs on one file**: there's no `meta.json`. Every file and
+  every folder list carries the drive's key, locked with the password, and
+  every file's envelope holds its own key and real name, so a lost list is
+  rebuilt from what's on disk, and **any single hidden file can be recovered
+  with nothing but its drive's password**, even if the rest of the drive is
+  gone. The cost: files of one drive share their lock's salt, so they can be
+  shown to belong together.
+- **Nothing in a drive's folder is plain text or has a tell-tale name**:
+  folder lists have dull names worked out from the drive's key.
 
 ## Layout
 
@@ -60,7 +66,8 @@ src/key.rs      Argon2id passphrase -> key that unwraps the drive's master key
 src/engine.rs   Store: path/tree ops (mkdir / create / write_at / rename / move / remove)
 src/names.rs    cross-platform name rules (NFC, case folding, limits, Windows mapping)
 src/durable.rs  crash-safe metadata writes (side file + flush + rename)
-src/backup.rs   password-protected recovery backups of headers and folder lists
+src/backup.rs   password-protected recovery backups of folder lists
+src/lock.rs     the drive's master key, locked with the password, carried everywhere
 src/convert.rs  turn an existing folder into a drive in place (and back), crash-safe
 src/dircache.rs folder-list cache, delayed saving, and split lists for big folders
 src/inodes.rs   inode <-> path table for the fuser adapter
@@ -171,23 +178,25 @@ other programs shows up then, or on remount.
 
 ## Recovery backups
 
-Two kinds of file matter most: a drive's `meta.json` (without it no password
-can open the drive) and each folder's list, `manifest.idx` (without it that
-folder's names, and the keys to the encrypted ends of its files, are gone).
-The app can back these up, for one drive (the save button on its card) or
+A drive's files describe themselves, so a lost folder list is rebuilt from
+them; but only a list knows a rename the files haven't caught up with yet,
+the name of a folder whose own and parent's lists were both lost, and empty
+folders. The app can back up every folder list, for one drive (More on its
+card) or
 all of them (Settings → Recovery), into one `.cloakbak` file protected by a
 password of your choice (Argon2id + XChaCha20-Poly1305, so a wrong password
-or a damaged file is detected). It holds no file contents: keep a normal
-backup of each drive's folder too.
+or a damaged file is detected). Backing up needs each drive's own password
+too. It holds no file contents: keep a normal backup of each drive's folder
+too.
 
-**Restore from a backup…** puts a drive's header and lists back only where
+**Restore from a backup…** puts a drive's lists back only where
 they're missing or can't be read. A list that still reads is newer than the
 backup and is left alone, so files added since aren't hidden. Restoring
 needs both the backup's password and the drive's own, and won't overwrite a
 different drive. The same is available from the command line:
 
 ```bash
-CLOAK_BACKUP_PASSPHRASE=... cloak backup out.cloakbak "Personal" D:/Personal "Work" E:/Work
+CLOAK_BACKUP_PASSPHRASE=... CLOAK_DRIVE_PASSPHRASES='["pw1","pw2"]' cloak backup out.cloakbak "Personal" D:/Personal "Work" E:/Work
 CLOAK_BACKUP_PASSPHRASE=... cloak backup-list out.cloakbak
 CLOAK_BACKUP_PASSPHRASE=... CLOAK_PASSPHRASE=... cloak restore out.cloakbak "Personal" D:/Personal
 ```
@@ -233,25 +242,28 @@ name, so the hidden files can be moved around outside cloak:
   since it's sealed for the drive it came from. The app counts what's waiting
   on the drive's card; **More → Bring in files from another drive** asks for
   both drives' passwords and re-seals each envelope (about 512 bytes per file,
-  whatever its size). Do this with both drives locked.
+  whatever its size). The other drive's folder isn't needed, even if it's
+  gone: each file carries that drive's key, locked with its password. Do this
+  with both drives locked.
 
-- **A folder's contents copied, `manifest.idx` and all, over another
-  folder's**: the list that replaced this folder's own can't be opened with
-  the drive's key, so it's set aside (kept, as `unreadable-list-….bak`) and
-  the folder's list is rebuilt from its files: nothing of this drive's goes
-  missing, and what came from the other drive waits to be brought in.
+- **A folder's list damaged or replaced**: it can't be opened with the
+  drive's key, so it's set aside (kept, as `unreadable-list-….bak`) and the
+  folder's list is rebuilt from its files: nothing of this drive's goes
+  missing. (Each drive names its lists differently, so copying one drive's
+  folder contents into another's no longer replaces its list at all.)
 - **Out of a drive** (a hidden file or folder moved away, or deleted,
   outside cloak): it drops out of the drive, and the card says how many items
   have gone missing; **More → Show missing items** lists them, with when they
   went. Nothing is deleted by cloak: put one back and it reappears.
 
-The same from the command line, plus the password change that format 2 makes
-instant (only `meta.json` changes):
+The same from the command line, plus changing a password (every list and
+envelope gets the newly locked key: about a minute per 100,000 files, and
+resumable):
 
 ```bash
 CLOAK_PASSPHRASE=... cloak strays D:/Work                    # -> {"foreign": n, "missing": m}
 CLOAK_PASSPHRASE=... cloak missing D:/Work                   # what went missing, and when
-CLOAK_PASSPHRASE=... CLOAK_OTHER_PASSPHRASE=... cloak adopt D:/Work D:/Holiday
+CLOAK_PASSPHRASE=... CLOAK_OTHER_PASSPHRASE=... cloak adopt D:/Work          # the other drive's folder is optional
 CLOAK_PASSPHRASE=old CLOAK_NEW_PASSPHRASE=new cloak passwd D:/Work
 ```
 

@@ -7,15 +7,20 @@
 //! doesn't name it (moved there by hand, or a list that was lost) is
 //! recognized and taken back in. Every envelope is the same size and has no
 //! plaintext marker: it opens under the drive's master key or it doesn't.
+//!
+//! It starts with the drive's lock (see [`crate::lock`]): the master key,
+//! sealed under the password's key, so this one file and the password are
+//! all it takes to read it.
 
 use crate::crypto::{self, Key, Nonce, KEY_LEN, NONCE_LEN, SEAL_OVERHEAD};
+use crate::lock;
 use crate::names::MAX_NAME_BYTES;
 use std::io;
 
 /// An envelope's size on disk.
 pub const LEN: u64 = 512;
-const PLAIN: usize = LEN as usize - SEAL_OVERHEAD;
-const LABEL: &[u8] = b"cloak-envelope-v2";
+const PLAIN: usize = LEN as usize - lock::LEN - SEAL_OVERHEAD;
+const LABEL: &[u8] = b"cloak-envelope-v3";
 const LAYOUT: u8 = 1;
 
 /// A file's random ID, kept for the life of the file.
@@ -30,9 +35,9 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    /// Sealed with the drive's master key, ready to write as the file's last
-    /// [`LEN`] bytes.
-    pub fn seal(&self, master: &Key) -> [u8; LEN as usize] {
+    /// Sealed with the drive's master key, after the drive's `lock`, ready to
+    /// write as the file's last [`LEN`] bytes.
+    pub fn seal(&self, master: &Key, lock: &[u8; lock::LEN]) -> [u8; LEN as usize] {
         let mut plain = [0u8; PLAIN];
         let name = self.name.as_bytes();
         // Names are validated to fit; cut at a character boundary just in case.
@@ -46,13 +51,17 @@ impl Envelope {
             at += part.len();
         }
         let sealed = crypto::seal(master, LABEL, &plain);
-        sealed.try_into().expect("a fixed-size plaintext seals to a fixed size")
+        let mut out = [0u8; LEN as usize];
+        out[..lock::LEN].copy_from_slice(lock);
+        out[lock::LEN..].copy_from_slice(&sealed);
+        out
     }
 
     /// Open the last [`LEN`] bytes of a file with `master`. `InvalidData` if
     /// they aren't an envelope sealed with it.
     pub fn open(master: &Key, bytes: &[u8]) -> io::Result<Envelope> {
-        let plain = crypto::open(master, LABEL, bytes)?;
+        let sealed = bytes.get(lock::LEN..).unwrap_or_default();
+        let plain = crypto::open(master, LABEL, sealed)?;
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "not an envelope this drive can read");
         if plain.len() != PLAIN || plain[0] != LAYOUT {
             return Err(bad());
@@ -77,17 +86,22 @@ impl Envelope {
     /// Read and open the envelope of the file at `path`, if it has one that
     /// `master` opens.
     pub fn read(path: &std::path::Path, master: &Key) -> io::Result<Envelope> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(path)?;
-        let len = f.metadata()?.len();
-        if len < LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "too short to have an envelope"));
-        }
-        let mut bytes = [0u8; LEN as usize];
-        f.seek(SeekFrom::Start(len - LEN))?;
-        f.read_exact(&mut bytes)?;
-        Envelope::open(master, &bytes)
+        Envelope::open(master, &read_tail(path)?)
     }
+}
+
+/// The last [`LEN`] bytes of the file at `path`.
+pub fn read_tail(path: &std::path::Path) -> io::Result<[u8; LEN as usize]> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len < LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too short to have an envelope"));
+    }
+    let mut bytes = [0u8; LEN as usize];
+    f.seek(SeekFrom::Start(len - LEN))?;
+    f.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// A new random file ID.
@@ -118,6 +132,8 @@ pub fn new_nonce() -> Nonce {
 mod tests {
     use super::*;
 
+    const LOCK: [u8; lock::LEN] = [5; lock::LEN];
+
     fn sample(name: &str) -> Envelope {
         Envelope { id: new_id(), key: new_key(), nonce: new_nonce(), name: name.into() }
     }
@@ -127,8 +143,9 @@ mod tests {
         let master = [7u8; 32];
         for name in ["a", "Caf\u{e9} \u{1f600}.txt", &"x".repeat(255)] {
             let e = sample(name);
-            let sealed = e.seal(&master);
+            let sealed = e.seal(&master, &LOCK);
             assert_eq!(sealed.len() as u64, LEN);
+            assert_eq!(sealed[..lock::LEN], LOCK, "the lock comes first");
             assert_eq!(Envelope::open(&master, &sealed).unwrap(), e);
         }
     }
@@ -136,9 +153,9 @@ mod tests {
     #[test]
     fn another_key_or_a_changed_byte_fails() {
         let e = sample("a.doc");
-        let mut sealed = e.seal(&[1u8; 32]);
+        let mut sealed = e.seal(&[1u8; 32], &LOCK);
         assert!(Envelope::open(&[2u8; 32], &sealed).is_err());
-        sealed[100] ^= 1;
+        sealed[200] ^= 1;
         assert!(Envelope::open(&[1u8; 32], &sealed).is_err());
     }
 
@@ -146,6 +163,6 @@ mod tests {
     fn same_contents_seal_differently() {
         // No two envelopes look alike, even of the same file.
         let e = sample("a");
-        assert_ne!(e.seal(&[1u8; 32]), e.seal(&[1u8; 32]));
+        assert_ne!(e.seal(&[1u8; 32], &LOCK)[lock::LEN..], e.seal(&[1u8; 32], &LOCK)[lock::LEN..]);
     }
 }

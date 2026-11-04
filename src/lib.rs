@@ -35,6 +35,7 @@ pub mod envelope;
 pub mod engine;
 pub mod inodes;
 pub mod key;
+pub mod lock;
 pub mod manifest;
 pub mod names;
 
