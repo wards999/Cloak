@@ -23,6 +23,21 @@
 //!
 //! `convert` and `unconvert` also print `{"progress": n, "total": t}` lines
 //! while they run; the last line is the result as usual.
+//!
+//! Files and folders moved in from elsewhere (see `docs/FORMAT.md`):
+//!
+//!   cloak strays <dir>                 check the whole drive -> {foreign, missing}
+//!   cloak missing <dir>                what has gone missing -> {missing:
+//!                                      [{path, is_dir, since}]}
+//!   cloak missing-clear <dir>          dismiss that record
+//!   cloak adopt-check <dir> <other-dir>  what adopt would bring in, changing
+//!                                      nothing -> {found: [{path, name,
+//!                                      is_dir, items}], left}
+//!   cloak adopt  <dir> <other-dir>     bring in what came from the other
+//!                                      drive (its password in
+//!                                      CLOAK_OTHER_PASSPHRASE) -> {adopted, left}
+//!   cloak passwd <dir>                 change the password (the new one in
+//!                                      CLOAK_NEW_PASSPHRASE)
 
 use cloak::Store;
 use std::env;
@@ -51,6 +66,58 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
         return Ok(serde_json::to_string(&cloak::convert::scan(std::path::Path::new(dir), REGION)?)?);
     }
     let pass = env::var("CLOAK_PASSPHRASE").map_err(|_| "CLOAK_PASSPHRASE not set")?;
+    match cmd {
+        "strays" => {
+            // Taking this drive's own strays back in happens on the way.
+            let s = Store::open_with_passphrase(dir, &pass)?;
+            let foreign = s.sweep()?;
+            let missing = s.missing_count();
+            drop(s); // saves the lists that changed
+            return Ok(serde_json::json!({ "foreign": foreign, "missing": missing }).to_string());
+        }
+        "missing" => {
+            let s = Store::open_with_passphrase(dir, &pass)?;
+            s.sweep()?;
+            return Ok(serde_json::json!({ "missing": s.missing() }).to_string());
+        }
+        "missing-clear" => {
+            Store::open_with_passphrase(dir, &pass)?.clear_missing()?;
+            return Ok(ok());
+        }
+        "adopt" => {
+            let other_dir = req(args, 2)?;
+            let other_pass =
+                env::var("CLOAK_OTHER_PASSPHRASE").map_err(|_| "CLOAK_OTHER_PASSPHRASE not set")?;
+            let meta = std::fs::read(std::path::Path::new(&other_dir).join("meta.json"))
+                .map_err(|e| format!("the other drive's folder has no drive header ({e})"))?;
+            let (other, _) = cloak::engine::key_from_meta(&meta, &other_pass)
+                .map_err(|e| format!("the other drive: {e}"))?;
+            let mut s = Store::open_with_passphrase(dir, &pass)?;
+            let (adopted, left) = s.adopt_from(&other)?;
+            return Ok(serde_json::json!({ "adopted": adopted, "left": left }).to_string());
+        }
+        "adopt-check" => {
+            let other_dir = req(args, 2)?;
+            let other_pass =
+                env::var("CLOAK_OTHER_PASSPHRASE").map_err(|_| "CLOAK_OTHER_PASSPHRASE not set")?;
+            let meta = std::fs::read(std::path::Path::new(&other_dir).join("meta.json"))
+                .map_err(|e| format!("the other drive's folder has no drive header ({e})"))?;
+            let (other, _) = cloak::engine::key_from_meta(&meta, &other_pass)
+                .map_err(|e| format!("the other drive: {e}"))?;
+            let s = Store::open_with_passphrase(dir, &pass)?;
+            let (found, left) = s.preview_from(&other)?;
+            return Ok(serde_json::json!({ "found": found, "left": left }).to_string());
+        }
+        "passwd" => {
+            let new = env::var("CLOAK_NEW_PASSPHRASE").map_err(|_| "CLOAK_NEW_PASSPHRASE not set")?;
+            if new.is_empty() {
+                return Err("the new password is empty".into());
+            }
+            cloak::engine::change_password(std::path::Path::new(dir), &pass, &new)?;
+            return Ok(ok());
+        }
+        _ => {}
+    }
     if cmd == "convert" || cmd == "unconvert" {
         let dir = std::path::Path::new(dir);
         let mut shown = std::time::Instant::now();

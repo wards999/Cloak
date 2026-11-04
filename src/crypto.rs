@@ -43,6 +43,41 @@ pub fn transform_region(key: &Key, nonce: &Nonce, file_offset: u64, buf: &mut [u
     cipher.apply_keystream(buf);
 }
 
+/// Bytes that [`seal`] adds: its random nonce and the tag.
+pub const SEAL_OVERHEAD: usize = 24 + 16;
+
+/// Encrypt and authenticate `plain` under `key` (XChaCha20-Poly1305), bound
+/// to `label` so one kind of sealed record can't stand in for another:
+/// `24-byte random nonce || ciphertext || 16-byte tag`.
+pub fn seal(key: &Key, label: &[u8], plain: &[u8]) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    use rand::RngCore;
+    let mut nonce = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let sealed = XChaCha20Poly1305::new(key.into())
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad: label })
+        .expect("XChaCha20-Poly1305 encryption doesn't fail");
+    let mut out = Vec::with_capacity(24 + sealed.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
+    out
+}
+
+/// Undo [`seal`]. `InvalidData` if `bytes` weren't sealed under `key` with
+/// `label`, or were changed since.
+pub fn open(key: &Key, label: &[u8], bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    let damaged = || std::io::Error::new(std::io::ErrorKind::InvalidData, "damaged, or not sealed with this key");
+    if bytes.len() < SEAL_OVERHEAD {
+        return Err(damaged());
+    }
+    XChaCha20Poly1305::new(key.into())
+        .decrypt(XNonce::from_slice(&bytes[..24]), Payload { msg: &bytes[24..], aad: label })
+        .map_err(|_| damaged())
+}
+
 /// The byte ranges (`[start, end)`) a file of `len` bytes should have encrypted,
 /// given a protected-region size of `n` at each end.
 ///

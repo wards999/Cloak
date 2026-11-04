@@ -451,7 +451,14 @@ mod imp {
         fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
             let s = self.shared.clone();
             self.workers.run(move || match s.node(ino) {
-                Ok((_, m)) if m.is_dir => reply.opened(0, 0),
+                Ok((path, m)) if m.is_dir => {
+                    // Opening a folder checks it for strays (the drive's own
+                    // are taken back in before the listing).
+                    if let Err(e) = s.reader().check_folder(&path) {
+                        warn(format!("checking {path} for moved-in files failed: {e}"));
+                    }
+                    reply.opened(0, 0)
+                }
                 Ok(_) => reply.error(libc::ENOTDIR),
                 Err(e) => reply.error(e),
             });
@@ -696,6 +703,7 @@ mod imp {
             .unwrap_or_else(|e| fail(format!("couldn't open the drive: {e}")));
         let store = Arc::new(RwLock::new(store));
         saver(&store);
+        watcher(&store);
         let new_fs = || CloakFs {
             shared: Shared {
                 store: store.clone(),
@@ -894,6 +902,34 @@ mod imp {
         fn run(&self, job: impl FnOnce() + Send + 'static) {
             let _ = self.0.send(Box::new(job));
         }
+    }
+
+    /// Check the whole drive for strays once it's mounted, then every minute
+    /// (folders that haven't changed are skipped), and tell the app how many
+    /// files and folders from other drives are waiting and how many items
+    /// have gone missing, as a `{"strays": n, "missing": m}` line, whenever
+    /// either changes.
+    fn watcher(store: &Arc<RwLock<Store>>) {
+        let store = Arc::downgrade(store);
+        std::thread::spawn(move || {
+            let mut told = None;
+            loop {
+                let Some(s) = store.upgrade() else { return };
+                let store = s.read().unwrap_or_else(PoisonError::into_inner);
+                let found = store.sweep().map(|n| (n, store.missing_count()));
+                drop(store);
+                drop(s);
+                match found {
+                    Ok((n, m)) if told != Some((n, m)) => {
+                        say(serde_json::json!({ "strays": n, "missing": m }));
+                        told = Some((n, m));
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn(format!("checking the drive for moved-in files failed: {e}")),
+                }
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
     }
 
     /// Save changed directory lists shortly after they change, even when

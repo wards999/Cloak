@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -27,7 +28,7 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
     ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
     RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter, ProgressBar,
-    TransparentDropDownPushButton, RoundMenu, Action,
+    TransparentDropDownPushButton, RoundMenu, Action, ListWidget,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -187,6 +188,13 @@ def _size(n):
         if n < 1000 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
         n /= 1000
+
+
+def _show_progress(bar, count, verb, done, total):
+    """Move `bar` and say "<verb> 1,234 of 5,000 files…" in `count`."""
+    bar.setValue(int(100 * done / total) if total else 100)
+    count.setText(f"{verb} {done:,} of {total:,} file{'s' if total != 1 else ''}…" if done < total
+                  else f"Finishing up ({total:,} file{'s' if total != 1 else ''} done)…")
 
 
 def _duration(seconds):
@@ -432,6 +440,15 @@ def install_power_hook(app, on_power):
 
 # ---- dialogs ---------------------------------------------------------------
 
+class PasswordField(PasswordLineEdit):
+    """A password box whose show-password button is left out of the Tab
+    order, so Tab goes from one box to the next (it still works by mouse)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.viewButton.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+
 class FocusedDialog(MessageBoxBase):
     """A dialog that puts the cursor in `self.first` when it appears, and that
     checks its fields before closing: the main button (and Enter) call
@@ -480,19 +497,35 @@ class FocusedDialog(MessageBoxBase):
         return False
 
     busy_text = None  # the main button's label while validate() works
+    _working = False
 
     def _on_yes(self):
+        # Enter in a field can press the main button twice (the field's own
+        # handler and the dialog's default button): run once, and never
+        # after the dialog has closed.
+        if self._working or not self.isVisible():
+            return
+        self._working = True
+        try:
+            self._run_yes()
+        finally:
+            self._working = False
+
+    def _run_yes(self):
         self.error.hide()
         label = self.yesButton.text()
-        if self.busy_text:
-            self.yesButton.setText(self.busy_text)
+        busy = self.busy_text or label
+        self.yesButton.setText(busy)
         self.yesButton.setEnabled(False)
         self.cancelButton.setEnabled(False)
         QApplication.processEvents()
         try:
             ok = self.validate()
         finally:
-            self.yesButton.setText(label)
+            # Put the label back, unless validate() gave the button a new one
+            # (a check that leads to a next step, such as Check -> Convert).
+            if self.yesButton.text() == busy:
+                self.yesButton.setText(label)
             self.yesButton.setEnabled(True)
             self.cancelButton.setEnabled(True)
         if ok:
@@ -509,8 +542,8 @@ class CreateDialog(FocusedDialog):
         self.name = LineEdit(self); self.name.setPlaceholderText("Name  (e.g. Personal)")
         self.loc = LineEdit(self); self.loc.setPlaceholderText("Location — an empty folder")
         self.pick = PushButton("Choose folder…", self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
-        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password")
+        self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
         row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.name)
@@ -572,7 +605,7 @@ class UnlockDialog(FocusedDialog):
         self.busy_text = "Unlocking…"
         self.titleLabel = SubtitleLabel(f"Unlock “{name}”", self)
         self.sub = CaptionLabel(path, self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password")
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.sub)
         self.viewLayout.addWidget(self.pw)
@@ -679,15 +712,16 @@ class ConvertDialog(FocusedDialog):
         self.name = LineEdit(self); self.name.setPlaceholderText("Name  (e.g. Personal)")
         self.loc = LineEdit(self); self.loc.setPlaceholderText("The folder to convert")
         self.pick = PushButton("Choose folder…", self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
-        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password")
+        self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
         self.report = BodyLabel("", self); self.report.setWordWrap(True); self.report.hide()
         self.bar = ProgressBar(self); self.bar.hide()
+        self.count = CaptionLabel("", self); self.count.hide()
         row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
         for w in (self.titleLabel, self.intro, self.name):
             self.viewLayout.addWidget(w)
         self.viewLayout.addLayout(row)
-        for w in (self.pw, self.pw2, self.report, self.bar):
+        for w in (self.pw, self.pw2, self.report, self.bar, self.count):
             self.viewLayout.addWidget(w)
         self.finish_layout()
         self.converted = None  # (name, folder) once done
@@ -772,14 +806,15 @@ class ConvertDialog(FocusedDialog):
 
     def _convert(self, name, loc):
         self.bar.setValue(0); self.bar.show()
+        self.count.setText("Starting…"); self.count.show()
 
         def progress(done, total):
-            self.bar.setValue(int(100 * done / total) if total else 100)
+            _show_progress(self.bar, self.count, "Converted", done, total)
 
         try:
             engine_with_progress(["convert", loc], progress, CLOAK_PASSPHRASE=self.pw.text())
         except RuntimeError as e:
-            self.bar.hide()
+            self.bar.hide(); self.count.hide()
             msg = str(e)
             if conversion_state(loc) == "converting":
                 msg += "\nNothing is lost: what's done so far is kept, and converting again carries on from there."
@@ -801,9 +836,10 @@ class UnconvertDialog(FocusedDialog):
                 "Its files get their real names back and are decrypted where they lie, so its folder "
                 "becomes an ordinary, unprotected folder. Anyone with access to it can then read everything.")
         self.intro = CaptionLabel(text, self); self.intro.setWordWrap(True)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("The drive's password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("The drive's password")
         self.bar = ProgressBar(self); self.bar.hide()
-        for w in (self.titleLabel, self.intro, self.pw, self.bar):
+        self.count = CaptionLabel("", self); self.count.hide()
+        for w in (self.titleLabel, self.intro, self.pw, self.bar, self.count):
             self.viewLayout.addWidget(w)
         self.finish_layout()
         self.yesButton.setText("Turn back into a folder")
@@ -812,26 +848,255 @@ class UnconvertDialog(FocusedDialog):
         self.widget.setMinimumWidth(450)
         self.pw.returnPressed.connect(self.yesButton.click)
         self.first = self.pw
-        self.done = False
+        self.succeeded = False
 
     def validate(self):
         if not self.pw.text():
             return self.problem("Enter the drive's password.", self.pw)
         self.bar.setValue(0); self.bar.show()
+        self.count.setText("Starting…"); self.count.show()
 
         def progress(done, total):
-            self.bar.setValue(int(100 * done / total) if total else 100)
+            _show_progress(self.bar, self.count, "Restored", done, total)
 
         try:
             engine_with_progress(["unconvert", self.path], progress, CLOAK_PASSPHRASE=self.pw.text())
         except RuntimeError as e:
-            self.bar.hide()
+            self.bar.hide(); self.count.hide()
             msg = str(e)
             msg = msg[:1].upper() + msg[1:]
             if conversion_state(self.path) == "unconverting":
                 msg += ". Nothing is lost: run this again to carry on from where it stopped"
             return self.problem(msg + ".", self.pw)
-        self.done = True
+        self.succeeded = True
+        return True
+
+
+class AdoptDialog(FocusedDialog):
+    """Bring files and folders moved in by hand from another drive into this
+    one: needs both drives' passwords. `others` are the other drives in the
+    list, offered as where they came from."""
+
+    def __init__(self, parent, drive, others, waiting):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.others = others
+        self.titleLabel = SubtitleLabel(f"Bring files into “{drive['name']}”", self)
+        if waiting:
+            what = f"{waiting} file{'s' if waiting != 1 else ''} or folder{'s' if waiting != 1 else ''}"
+            text = f"{what} from another drive {'are' if waiting != 1 else 'is'} waiting in this drive's folder. "
+        else:
+            text = "Files and folders moved into this drive's folder from another drive wait here until brought in. "
+        self.intro = CaptionLabel(
+            text + "Choose the drive they came from: cloak shows what it finds, then re-seals them for this "
+                   "drive without copying them.", self)
+        self.intro.setWordWrap(True)
+        self.pw = PasswordField(self); self.pw.setPlaceholderText(f"Password for “{drive['name']}”")
+        self.source = ComboBox(self)
+        self.source.addItems([d["name"] for d in others] + ["Another drive's folder…"])
+        self.loc = LineEdit(self); self.loc.setPlaceholderText("The other drive's folder")
+        self.pick = PushButton("Choose folder…", self)
+        self.other_pw = PasswordField(self); self.other_pw.setPlaceholderText("That drive's password")
+        self.summary = BodyLabel("", self); self.summary.setWordWrap(True); self.summary.hide()
+        # Short: the dialog sits over the window and can't be taller; it scrolls.
+        self.found = ListWidget(self); self.found.setFixedHeight(160); self.found.hide()
+        loc_row = QHBoxLayout(); loc_row.addWidget(self.loc); loc_row.addWidget(self.pick)
+        src_row = QHBoxLayout(); src_row.addWidget(BodyLabel("From", self)); src_row.addWidget(self.source, 1)
+        for w in (self.titleLabel, self.intro, self.pw):
+            self.viewLayout.addWidget(w)
+        self.viewLayout.addLayout(src_row)
+        self.viewLayout.addLayout(loc_row)
+        self.viewLayout.addWidget(self.other_pw)
+        self.viewLayout.addWidget(self.summary)
+        self.viewLayout.addWidget(self.found)
+        self.finish_layout()
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(470)
+        self.source.currentIndexChanged.connect(self._source_chosen)
+        self.pick.clicked.connect(self._choose)
+        self.other_pw.returnPressed.connect(self.yesButton.click)
+        # Any change to what's entered means looking again before bringing in.
+        for w in (self.pw, self.loc, self.other_pw):
+            w.textChanged.connect(self._unchecked)
+        self.first = self.pw
+        self.outcome = None
+        self.checked = None  # what the list shown is for
+        self._source_chosen(self.source.currentIndex())
+
+    def _source_chosen(self, i):
+        listed = i < len(self.others)
+        for w in (self.loc, self.pick):
+            w.setVisible(not listed)
+        self._unchecked()
+
+    def _unchecked(self, *_):
+        self.checked = None
+        self.summary.hide()
+        self.found.hide()
+        self.intro.show()
+        self.yesButton.setText("Show what's waiting")
+        self.busy_text = "Looking…"
+
+    def _choose(self):
+        d = QFileDialog.getExistingDirectory(self, "The other drive's folder", str(Path.home()))
+        if d:
+            self.loc.setText(os.path.normpath(d))
+
+    def validate(self):
+        if not self.pw.text():
+            return self.problem("Enter this drive's password.", self.pw)
+        i = self.source.currentIndex()
+        other = self.others[i]["path"] if i < len(self.others) else self.loc.text().strip()
+        if not other:
+            return self.problem("Choose the other drive's folder.", self.pick)
+        if not (Path(other) / "meta.json").exists():
+            return self.problem("That folder isn't a cloak drive (it has no drive header).", self.loc)
+        if not self.other_pw.text():
+            return self.problem("Enter the other drive's password.", self.other_pw)
+        args = [self.path, other]
+        env = {"CLOAK_PASSPHRASE": self.pw.text(), "CLOAK_OTHER_PASSPHRASE": self.other_pw.text()}
+        try:
+            if self.checked != args:
+                return self._show(engine(["adopt-check", *args], **env), args)
+            self.outcome = engine(["adopt", *args], **env)
+        except RuntimeError as e:
+            msg = str(e)
+            field = self.other_pw if msg.startswith("the other drive") else self.pw
+            return self.problem(msg[:1].upper() + msg[1:] + ".", field)
+        return True
+
+    def _show(self, r, args):
+        """List what would come in; stays open so the next press brings it in."""
+        found, left = r.get("found", []), r.get("left", 0)
+        source = self.source.currentText() if self.source.currentIndex() < len(self.others) else "that drive"
+        if not found:
+            more = f" ({left} item{'s' if left != 1 else ''} came from a different drive.)" if left else ""
+            return self.problem(f"Nothing waiting here came from {source}.{more}", self.source)
+        self.found.clear()
+        for f in found:
+            if f["is_dir"]:
+                n = f["items"]
+                self.found.addItem(f"📁  {f['path']}   ({n} item{'s' if n != 1 else ''})")
+            else:
+                self.found.addItem(f"     {f['path']}")
+        n = len(found)
+        text = f"{n} item{'s' if n != 1 else ''} from {source} will be brought in:"
+        if left:
+            text += f" ({left} other{'s' if left != 1 else ''} came from a different drive and will keep waiting.)"
+        self.summary.setText(text)
+        self.intro.hide()  # the list says it all, and needs the room
+        self.summary.show()
+        self.found.show()
+        self.checked = args
+        self.yesButton.setText(f"Bring {'them' if n != 1 else 'it'} in")
+        self.busy_text = "Bringing in…"
+        return False
+
+
+class MissingDialog(FocusedDialog):
+    """What has gone missing from a drive (moved out of its folder, or
+    deleted, outside cloak): look with the password, then dismiss the record."""
+
+    def __init__(self, parent, drive, count):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.titleLabel = SubtitleLabel(f"Missing from “{drive['name']}”", self)
+        what = f"{count} item{'s' if count != 1 else ''}" if count else "Items"
+        self.intro = CaptionLabel(
+            f"{what} listed in this drive went missing from its folder: moved out or deleted outside cloak. "
+            "Nothing was deleted by cloak; if one is put back into the drive's folder, it reappears by itself.",
+            self)
+        self.intro.setWordWrap(True)
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("The drive's password")
+        self.summary = BodyLabel("", self); self.summary.setWordWrap(True); self.summary.hide()
+        self.found = ListWidget(self); self.found.setFixedHeight(160); self.found.hide()
+        for w in (self.titleLabel, self.intro, self.pw, self.summary, self.found):
+            self.viewLayout.addWidget(w)
+        self.finish_layout()
+        self.cancelButton.setText("Close")
+        self.widget.setMinimumWidth(470)
+        self.pw.returnPressed.connect(self.yesButton.click)
+        self.pw.textChanged.connect(self._unchecked)
+        self.first = self.pw
+        self.shown = False
+        self.dismissed = False
+        self._unchecked()
+
+    def _unchecked(self, *_):
+        self.shown = False
+        self.summary.hide()
+        self.found.hide()
+        self.yesButton.setText("Show missing items")
+        self.busy_text = "Looking…"
+
+    def validate(self):
+        if not self.pw.text():
+            return self.problem("Enter the drive's password.", self.pw)
+        env = {"CLOAK_PASSPHRASE": self.pw.text()}
+        try:
+            if not self.shown:
+                return self._show(engine(["missing", self.path], **env).get("missing", []))
+            engine(["missing-clear", self.path], **env)
+        except RuntimeError as e:
+            msg = str(e)
+            return self.problem(msg[:1].upper() + msg[1:] + ".", self.pw)
+        self.dismissed = True
+        return True
+
+    def _show(self, missing):
+        if not missing:
+            return self.problem("Nothing is missing from this drive.", self.pw)
+        self.found.clear()
+        for m in missing:
+            when = datetime.fromtimestamp(m["since"]).strftime("%d %b %Y %H:%M")
+            icon = "📁  " if m["is_dir"] else "     "
+            self.found.addItem(f"{icon}{m['path']}   (missing since {when})")
+        n = len(missing)
+        self.summary.setText(f"{n} item{'s' if n != 1 else ''} missing. Dismissing forgets this list; "
+                             "it doesn't delete or change anything.")
+        self.intro.hide()
+        self.summary.show()
+        self.found.show()
+        self.shown = True
+        self.yesButton.setText("Dismiss")
+        self.busy_text = "Dismissing…"
+        return False
+
+
+class PasswordDialog(FocusedDialog):
+    """Change a drive's password: instant, as only its header changes."""
+
+    def __init__(self, parent, drive):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.titleLabel = SubtitleLabel(f"Change the password for “{drive['name']}”", self)
+        self.old = PasswordField(self); self.old.setPlaceholderText("Current password")
+        self.new = PasswordField(self); self.new.setPlaceholderText("New password")
+        self.new2 = PasswordField(self); self.new2.setPlaceholderText("Confirm new password")
+        for w in (self.titleLabel, self.old, self.new, self.new2):
+            self.viewLayout.addWidget(w)
+        self.finish_layout()
+        self.yesButton.setText("Change password")
+        self.busy_text = "Changing…"
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(420)
+        self.new2.returnPressed.connect(self.yesButton.click)
+        self.first = self.old
+        self.succeeded = False
+
+    def validate(self):
+        if not self.old.text():
+            return self.problem("Enter the current password.", self.old)
+        if not self.new.text():
+            return self.problem("Enter a new password.", self.new)
+        if self.new.text() != self.new2.text():
+            return self.problem("The new passwords don't match.", self.new2)
+        try:
+            engine(["passwd", self.path], CLOAK_PASSPHRASE=self.old.text(), CLOAK_NEW_PASSPHRASE=self.new.text())
+        except RuntimeError as e:
+            msg = str(e)
+            return self.problem(msg[:1].upper() + msg[1:] + ".", self.old)
+        self.succeeded = True
         return True
 
 
@@ -860,8 +1125,8 @@ class BackupDialog(FocusedDialog):
         self.out = LineEdit(self)
         self.out.setText(str(_documents() / f"{stem} recovery {date.today().isoformat()}.cloakbak"))
         self.pick = PushButton("Save as…", self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password for this backup")
-        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password for this backup")
+        self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
         row = QHBoxLayout(); row.addWidget(self.out); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(what)
@@ -876,7 +1141,7 @@ class BackupDialog(FocusedDialog):
         self.pw2.returnPressed.connect(self.yesButton.click)
         self.first = self.pw
         self.busy_text = "Backing up…"
-        self.result = None
+        self.outcome = None
 
     def _choose(self):
         f, _ = QFileDialog.getSaveFileName(self, "Save the backup as", self.out.text(), "cloak backup (*.cloakbak)")
@@ -899,10 +1164,10 @@ class BackupDialog(FocusedDialog):
         for d in self.drives:
             args += [d["name"], d["path"]]
         try:
-            self.result = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text())
+            self.outcome = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text())
         except RuntimeError as e:
             return self.problem(f"Couldn't make the backup: {e}", self.out)
-        self.result["file"] = out
+        self.outcome["file"] = out
         return True
 
 
@@ -922,11 +1187,11 @@ class RestoreDialog(FocusedDialog):
         what.setWordWrap(True)
         self.file = LineEdit(self); self.file.setPlaceholderText("Backup file (.cloakbak)")
         self.pick = PushButton("Choose…", self)
-        self.bpw = PasswordLineEdit(self); self.bpw.setPlaceholderText("The backup's password")
+        self.bpw = PasswordField(self); self.bpw.setPlaceholderText("The backup's password")
         self.combo = ComboBox(self)
         self.target = LineEdit(self); self.target.setPlaceholderText("The drive's folder")
         self.pick_target = PushButton("Choose folder…", self)
-        self.dpw = PasswordLineEdit(self); self.dpw.setPlaceholderText("The drive's password")
+        self.dpw = PasswordField(self); self.dpw.setPlaceholderText("The drive's password")
         row = QHBoxLayout(); row.addWidget(self.file); row.addWidget(self.pick)
         row2 = QHBoxLayout(); row2.addWidget(self.target); row2.addWidget(self.pick_target)
         self.viewLayout.addWidget(self.titleLabel)
@@ -950,7 +1215,7 @@ class RestoreDialog(FocusedDialog):
         self.dpw.returnPressed.connect(self.yesButton.click)
         self.first = self.pick
         self.busy_text = "Working…"
-        self.result = None
+        self.outcome = None
 
     def _choose(self):
         f, _ = QFileDialog.getOpenFileName(self, "Choose a backup", str(_documents()), "cloak backup (*.cloakbak)")
@@ -1020,16 +1285,17 @@ class RestoreDialog(FocusedDialog):
         except RuntimeError as e:
             field = self.dpw if "password" in str(e) else self.target
             return self.problem(str(e)[:1].upper() + str(e)[1:] + ".", field)
-        self.result = {"name": d["name"], "path": target, **r}
+        self.outcome = {"name": d["name"], "path": target, **r}
         return True
 
 
 # ---- drive card ------------------------------------------------------------
 
 class DriveCard(CardWidget):
-    def __init__(self, drive, mount, callbacks):
+    def __init__(self, drive, mount, callbacks, strays=0, missing=0):
         super().__init__()
-        self.setFixedSize(260, 158)
+        notices = bool(strays) + bool(missing)
+        self.setFixedSize(260, 158 + 20 * notices)
         lay = QVBoxLayout(self); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(5)
 
         lay.addWidget(StrongBodyLabel(drive["name"], self))
@@ -1050,6 +1316,18 @@ class DriveCard(CardWidget):
             status = CaptionLabel("○ Locked", self)
             status.setStyleSheet("color: gray;")
         lay.addWidget(status)
+        if strays and not state:
+            what = f"{strays} item{'s' if strays != 1 else ''} from another drive waiting"
+            waiting = CaptionLabel(f"◐ {what}" + (": lock to bring in" if unlocked else ""), self)
+            waiting.setStyleSheet("color: #ca5010;")
+            waiting.setWordWrap(True)
+            lay.addWidget(waiting)
+        if missing and not state:
+            what = f"{missing} item{'s' if missing != 1 else ''} gone missing"
+            gone = CaptionLabel(f"◐ {what}" + (": lock to see which" if unlocked else ""), self)
+            gone.setStyleSheet("color: #ca5010;")
+            gone.setWordWrap(True)
+            lay.addWidget(gone)
 
         row = QHBoxLayout()
         if state:
@@ -1074,9 +1352,21 @@ class DriveCard(CardWidget):
             # themselves.
             more = TransparentDropDownPushButton("More", self)
             menu = RoundMenu(parent=more)
+            if missing:
+                menu.addAction(Action(FIF.SEARCH, "Show missing items…",
+                                      triggered=lambda: callbacks["missing"](drive)))
+            if strays:
+                menu.addAction(Action(FIF.DOWNLOAD, "Bring in files from another drive…",
+                                      triggered=lambda: callbacks["adopt"](drive)))
+            if strays or missing:
+                menu.addSeparator()
             menu.addAction(Action(FIF.SAVE, "Back up recovery files…", triggered=lambda: callbacks["backup"](drive)))
+            menu.addAction(Action(FIF.EDIT, "Change password…", triggered=lambda: callbacks["passwd"](drive)))
             menu.addAction(Action(FIF.RETURN, "Turn back into a plain folder…",
                                   triggered=lambda: callbacks["unconvert"](drive)))
+            if not strays:
+                menu.addAction(Action(FIF.DOWNLOAD, "Bring in files from another drive…",
+                                      triggered=lambda: callbacks["adopt"](drive)))
             menu.addSeparator()
             menu.addAction(Action(FIF.CLOSE, "Remove from list (keeps the folder)",
                                   triggered=lambda: callbacks["remove"](drive)))
@@ -1094,6 +1384,14 @@ class DrivesInterface(QWidget):
         self.setObjectName("drivesInterface")
         self.drives = load_drives()
         self.mounts = {}  # path -> {"proc": Popen, "mp": mountpoint}
+        # path -> how many items from other drives are waiting there, as the
+        # mount last reported (kept after locking).
+        self.strays = {}
+        self.missing = {}  # path -> how many items have gone missing, likewise
+        self._strays_seen = ({}, {})
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._strays_changed)
+        self._poll.start(1500)
 
         lay = QVBoxLayout(self); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(16)
         head = QHBoxLayout()
@@ -1131,9 +1429,11 @@ class DrivesInterface(QWidget):
                 w.deleteLater()
         cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove,
                "backup": lambda d: self.back_up([d]), "resume": self.resume_conversion,
-               "unconvert": self.unconvert}
+               "unconvert": self.unconvert, "adopt": self.adopt, "passwd": self.change_password,
+               "missing": self.show_missing}
         for d in self.drives:
-            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs))
+            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs, self.strays.get(d["path"], 0),
+                                           self.missing.get(d["path"], 0)))
 
     def err(self, msg):
         InfoBar.error("Error", msg, duration=4500, position=InfoBarPosition.TOP, parent=self.win)
@@ -1186,7 +1486,7 @@ class DrivesInterface(QWidget):
             return self.err("Lock the drive first.")
         dlg = UnconvertDialog(self.win, drive)
         dlg.exec()
-        if dlg.done:
+        if dlg.succeeded:
             self.drives = [d for d in self.drives if d["path"] != drive["path"]]
             save_drives(self.drives)
             self.ok(f"“{drive['name']}” is a plain folder again: {drive['path']}")
@@ -1233,7 +1533,8 @@ class DrivesInterface(QWidget):
         try:
             proc = subprocess.Popen(
                 [adapter, drive["path"], mp],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, env=env, **NO_WINDOW,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=env, text=True,
+                encoding="utf-8", errors="replace", **NO_WINDOW,
             )
         except FileNotFoundError:
             return (
@@ -1254,7 +1555,59 @@ class DrivesInterface(QWidget):
             detail = "\n".join(lines)[-1500:] if lines else "the mount driver stopped without saying why"
             return f"Couldn't mount the drive:\n{detail}"
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
+        self._listen(drive["path"], proc)
         return None
+
+    def _listen(self, path, proc):
+        """Read the mount's reports (how many items from other drives are
+        waiting) as they come; the cards catch up on the next poll."""
+        def read():
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and "strays" in msg:
+                    self.strays[path] = msg["strays"]
+                    self.missing[path] = msg.get("missing", 0)
+        threading.Thread(target=read, daemon=True).start()
+
+    def _strays_changed(self):
+        if (self.strays, self.missing) != self._strays_seen:
+            self._strays_seen = (dict(self.strays), dict(self.missing))
+            self.refresh()
+
+    def adopt(self, drive):
+        if drive["path"] in self.mounts:
+            return self.err("Lock the drive first.")
+        others = [d for d in self.drives if d["path"] != drive["path"]]
+        dlg = AdoptDialog(self.win, drive, others, self.strays.get(drive["path"], 0))
+        if not dlg.exec() or not dlg.outcome:
+            return
+        r = dlg.outcome
+        self.strays[drive["path"]] = r["left"]
+        n = r["adopted"]
+        msg = (f"Brought {n} item{'s' if n != 1 else ''} into “{drive['name']}”." if n
+               else "Nothing from that drive was waiting here.")
+        if r["left"]:
+            msg += f" {r['left']} more came from a different drive."
+        self.ok(msg)
+        self.refresh()
+
+    def show_missing(self, drive):
+        if drive["path"] in self.mounts:
+            return self.err("Lock the drive first.")
+        dlg = MissingDialog(self.win, drive, self.missing.get(drive["path"], 0))
+        dlg.exec()
+        if dlg.dismissed:
+            self.missing[drive["path"]] = 0
+            self.ok("Dismissed the list of missing items.")
+            self.refresh()
+
+    def change_password(self, drive):
+        dlg = PasswordDialog(self.win, drive)
+        if dlg.exec() and dlg.succeeded:
+            self.ok(f"Changed the password for “{drive['name']}”.")
 
     def _wait_for_mount(self, proc, mp, timeout=15.0):
         """True once `mp` is mounted; False if the adapter exits first or the
@@ -1273,16 +1626,16 @@ class DrivesInterface(QWidget):
         if not drives:
             return self.err("There are no drives to back up yet.")
         dlg = BackupDialog(self.win, drives)
-        if not dlg.exec() or not dlg.result:
+        if not dlg.exec() or not dlg.outcome:
             return
         n = len(drives)
-        self.ok(f"Backed up {'the drive' if n == 1 else f'{n} drives'} to {dlg.result['file']}")
+        self.ok(f"Backed up {'the drive' if n == 1 else f'{n} drives'} to {dlg.outcome['file']}")
 
     def restore(self):
         dlg = RestoreDialog(self.win, self.drives, {os.path.normpath(p) for p in self.mounts})
-        if not dlg.exec() or not dlg.result:
+        if not dlg.exec() or not dlg.outcome:
             return
-        r = dlg.result
+        r = dlg.outcome
         if not any(os.path.normpath(d["path"]) == r["path"] for d in self.drives):
             self.drives.insert(0, {"name": r["name"], "path": r["path"]})
             save_drives(self.drives)

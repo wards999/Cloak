@@ -38,20 +38,25 @@ If your threat model includes that, you want **full-file authenticated
 encryption** (VeraCrypt, gocryptfs, Cryptomator) instead — this tool is for the
 "casual glance / mild obscurity, keep it fast" end of the spectrum.
 
-Two more honest caveats:
-- Each folder's **manifest** is the only record of its real names: lose it and
-  that folder is anonymous blobs. Manifests are saved crash-safely and sync
-  conflicts are merged (see below), but back the store up all the same.
-- Only the ends are authenticated-free XOR keystream here; there's no integrity
-  check over the passthrough body. Tampering with the middle is undetectable.
+What it does guarantee (drive format 2, see [`docs/FORMAT.md`](docs/FORMAT.md)):
+- **Each file has its own key**, and its ends get a fresh nonce whenever an
+  editing session changes them, so two copies of a file from either side of
+  an edit (from sync history or a backup) don't give each other away.
+- **Lists, file envelopes and the drive header are authenticated**: a damaged
+  or tampered one is reported, never read as garbage. The plain middle of a
+  file has no integrity check, by design.
+- **Nothing hangs on one file**: every file ends with a sealed envelope (its
+  key, nonce and real name) and every folder's list records the folder's own
+  name, so a lost list is rebuilt from what's on disk.
 
 ## Layout
 
 ```
-src/crypto.rs   seekable ChaCha20; encrypt first-N and last-N bytes
+src/crypto.rs   seekable ChaCha20 for the ends; XChaCha20-Poly1305 sealing
+src/envelope.rs the 512-byte envelope that ends every file
 src/boring.rs   boring decoy-name generator
 src/manifest.rs per-directory encrypted boring<->real mapping (the tree)
-src/key.rs      Argon2id passphrase -> master key (key never stored)
+src/key.rs      Argon2id passphrase -> key that unwraps the drive's master key
 src/engine.rs   Store: path/tree ops (mkdir / create / write_at / rename / move / remove)
 src/names.rs    cross-platform name rules (NFC, case folding, limits, Windows mapping)
 src/durable.rs  crash-safe metadata writes (side file + flush + rename)
@@ -216,6 +221,40 @@ CLOAK_PASSPHRASE=... cloak convert D:/Photos   # convert (or resume)
 CLOAK_PASSPHRASE=... cloak unconvert D:/Photos # back to a plain folder
 ```
 
+## Moving files between drives by hand
+
+Every file describes itself (its envelope) and every folder knows its own
+name, so the hidden files can be moved around outside cloak:
+
+- **Within one drive** (moving a hidden file or folder into another hidden
+  folder of the same drive): it shows up in its new place the next time that
+  folder is opened, under its real name.
+- **Into another drive's folder**: it's left untouched until it's brought in,
+  since it's sealed for the drive it came from. The app counts what's waiting
+  on the drive's card; **More → Bring in files from another drive** asks for
+  both drives' passwords and re-seals each envelope (about 512 bytes per file,
+  whatever its size). Do this with both drives locked.
+
+- **A folder's contents copied, `manifest.idx` and all, over another
+  folder's**: the list that replaced this folder's own can't be opened with
+  the drive's key, so it's set aside (kept, as `unreadable-list-….bak`) and
+  the folder's list is rebuilt from its files: nothing of this drive's goes
+  missing, and what came from the other drive waits to be brought in.
+- **Out of a drive** (a hidden file or folder moved away, or deleted,
+  outside cloak): it drops out of the drive, and the card says how many items
+  have gone missing; **More → Show missing items** lists them, with when they
+  went. Nothing is deleted by cloak: put one back and it reappears.
+
+The same from the command line, plus the password change that format 2 makes
+instant (only `meta.json` changes):
+
+```bash
+CLOAK_PASSPHRASE=... cloak strays D:/Work                    # -> {"foreign": n, "missing": m}
+CLOAK_PASSPHRASE=... cloak missing D:/Work                   # what went missing, and when
+CLOAK_PASSPHRASE=... CLOAK_OTHER_PASSPHRASE=... cloak adopt D:/Work D:/Holiday
+CLOAK_PASSPHRASE=old CLOAK_NEW_PASSPHRASE=new cloak passwd D:/Work
+```
+
 ## Performance notes
 
 - **Open files are read and written by handle.** A mount adapter opens a file
@@ -272,7 +311,8 @@ checks the desktop app.
 - [x] Storage engine (ingest / ranged read / write path) + tests
 - [x] Read-write fuser mount adapter (macOS/Linux)
 - [x] WinFsp mount adapter (Windows, MSVC)
-- [x] Passphrase-derived key (Argon2id); key never stored
+- [x] Passphrase-derived key (Argon2id) wrapping a random master key; per-file keys
+- [x] Format 2: envelopes, authenticated lists, fresh nonce per edit, strays
 - [x] Folder tree: boring-named dirs + per-directory encrypted manifests
 - [x] Desktop app (Fluent design; create, lock/unlock, auto-lock on sleep)
 - [x] Full-file vs ends-only benchmark
