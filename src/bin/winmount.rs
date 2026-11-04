@@ -704,6 +704,7 @@ mod imp {
 
         let store = Arc::new(RwLock::new(store));
         saver(&store);
+        watcher(&store);
         let context = CloakWinFs {
             store: store.clone(),
         };
@@ -735,6 +736,31 @@ mod imp {
     /// `CloakWinFs::store`).
     fn lock(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
         store.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Check the whole drive for strays once it's mounted, then every minute
+    /// (folders that haven't changed are skipped), and tell the app how many
+    /// files and folders from other drives are waiting, as a `{"strays": n}`
+    /// line, whenever that changes.
+    fn watcher(store: &Arc<RwLock<Store>>) {
+        let store = Arc::downgrade(store);
+        std::thread::spawn(move || {
+            let mut told = None;
+            loop {
+                let Some(s) = store.upgrade() else { return };
+                let found = s.read().unwrap_or_else(PoisonError::into_inner).sweep();
+                drop(s);
+                match found {
+                    Ok(n) if told != Some(n) => {
+                        say(serde_json::json!({ "strays": n }));
+                        told = Some(n);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn(format!("checking the drive for moved-in files failed: {e}")),
+                }
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
     }
 
     /// Save changed directory lists shortly after they change, even when
