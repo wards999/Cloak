@@ -1028,7 +1028,7 @@ class RestoreDialog(FocusedDialog):
 class DriveCard(CardWidget):
     def __init__(self, drive, mount, callbacks):
         super().__init__()
-        self.setFixedSize(260, 158)
+        self.setFixedSize(280, 158)
         lay = QVBoxLayout(self); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(5)
 
         lay.addWidget(StrongBodyLabel(drive["name"], self))
@@ -1068,7 +1068,10 @@ class DriveCard(CardWidget):
         else:
             unlockb = PrimaryPushButton("Unlock", self)
             unlockb.clicked.connect(lambda: callbacks["unlock"](drive))
-            removeb = TransparentPushButton("Remove", self)
+            # An icon like the card's other actions: as text it no longer fits.
+            removeb = TransparentToolButton(FIF.CLOSE, self)
+            removeb.setToolTip("Remove from the list (the drive's folder is kept)")
+            removeb.installEventFilter(ToolTipFilter(removeb))
             removeb.clicked.connect(lambda: callbacks["remove"](drive))
             row.addWidget(unlockb); row.addStretch(1); row.addWidget(removeb)
         backupb = TransparentToolButton(FIF.SAVE, self)
