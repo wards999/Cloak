@@ -481,8 +481,21 @@ class FocusedDialog(MessageBoxBase):
         return False
 
     busy_text = None  # the main button's label while validate() works
+    _working = False
 
     def _on_yes(self):
+        # Enter in a field can press the main button twice (the field's own
+        # handler and the dialog's default button): run once, and never
+        # after the dialog has closed.
+        if self._working or not self.isVisible():
+            return
+        self._working = True
+        try:
+            self._run_yes()
+        finally:
+            self._working = False
+
+    def _run_yes(self):
         self.error.hide()
         label = self.yesButton.text()
         if self.busy_text:
@@ -813,7 +826,7 @@ class UnconvertDialog(FocusedDialog):
         self.widget.setMinimumWidth(450)
         self.pw.returnPressed.connect(self.yesButton.click)
         self.first = self.pw
-        self.done = False
+        self.succeeded = False
 
     def validate(self):
         if not self.pw.text():
@@ -832,7 +845,7 @@ class UnconvertDialog(FocusedDialog):
             if conversion_state(self.path) == "unconverting":
                 msg += ". Nothing is lost: run this again to carry on from where it stopped"
             return self.problem(msg + ".", self.pw)
-        self.done = True
+        self.succeeded = True
         return True
 
 
@@ -876,7 +889,7 @@ class AdoptDialog(FocusedDialog):
         self.pick.clicked.connect(self._choose)
         self.other_pw.returnPressed.connect(self.yesButton.click)
         self.first = self.pw
-        self.result = None
+        self.outcome = None
         self._source_chosen(self.source.currentIndex())
 
     def _source_chosen(self, i):
@@ -901,7 +914,7 @@ class AdoptDialog(FocusedDialog):
         if not self.other_pw.text():
             return self.problem("Enter the other drive's password.", self.other_pw)
         try:
-            self.result = engine(["adopt", self.path, other],
+            self.outcome = engine(["adopt", self.path, other],
                                  CLOAK_PASSPHRASE=self.pw.text(), CLOAK_OTHER_PASSPHRASE=self.other_pw.text())
         except RuntimeError as e:
             msg = str(e)
@@ -929,7 +942,7 @@ class PasswordDialog(FocusedDialog):
         self.widget.setMinimumWidth(420)
         self.new2.returnPressed.connect(self.yesButton.click)
         self.first = self.old
-        self.done = False
+        self.succeeded = False
 
     def validate(self):
         if not self.old.text():
@@ -943,7 +956,7 @@ class PasswordDialog(FocusedDialog):
         except RuntimeError as e:
             msg = str(e)
             return self.problem(msg[:1].upper() + msg[1:] + ".", self.old)
-        self.done = True
+        self.succeeded = True
         return True
 
 
@@ -988,7 +1001,7 @@ class BackupDialog(FocusedDialog):
         self.pw2.returnPressed.connect(self.yesButton.click)
         self.first = self.pw
         self.busy_text = "Backing up…"
-        self.result = None
+        self.outcome = None
 
     def _choose(self):
         f, _ = QFileDialog.getSaveFileName(self, "Save the backup as", self.out.text(), "cloak backup (*.cloakbak)")
@@ -1011,10 +1024,10 @@ class BackupDialog(FocusedDialog):
         for d in self.drives:
             args += [d["name"], d["path"]]
         try:
-            self.result = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text())
+            self.outcome = engine(args, CLOAK_BACKUP_PASSPHRASE=self.pw.text())
         except RuntimeError as e:
             return self.problem(f"Couldn't make the backup: {e}", self.out)
-        self.result["file"] = out
+        self.outcome["file"] = out
         return True
 
 
@@ -1062,7 +1075,7 @@ class RestoreDialog(FocusedDialog):
         self.dpw.returnPressed.connect(self.yesButton.click)
         self.first = self.pick
         self.busy_text = "Working…"
-        self.result = None
+        self.outcome = None
 
     def _choose(self):
         f, _ = QFileDialog.getOpenFileName(self, "Choose a backup", str(_documents()), "cloak backup (*.cloakbak)")
@@ -1132,7 +1145,7 @@ class RestoreDialog(FocusedDialog):
         except RuntimeError as e:
             field = self.dpw if "password" in str(e) else self.target
             return self.problem(str(e)[:1].upper() + str(e)[1:] + ".", field)
-        self.result = {"name": d["name"], "path": target, **r}
+        self.outcome = {"name": d["name"], "path": target, **r}
         return True
 
 
@@ -1319,7 +1332,7 @@ class DrivesInterface(QWidget):
             return self.err("Lock the drive first.")
         dlg = UnconvertDialog(self.win, drive)
         dlg.exec()
-        if dlg.done:
+        if dlg.succeeded:
             self.drives = [d for d in self.drives if d["path"] != drive["path"]]
             save_drives(self.drives)
             self.ok(f"“{drive['name']}” is a plain folder again: {drive['path']}")
@@ -1414,9 +1427,9 @@ class DrivesInterface(QWidget):
             return self.err("Lock the drive first.")
         others = [d for d in self.drives if d["path"] != drive["path"]]
         dlg = AdoptDialog(self.win, drive, others, self.strays.get(drive["path"], 0))
-        if not dlg.exec() or not dlg.result:
+        if not dlg.exec() or not dlg.outcome:
             return
-        r = dlg.result
+        r = dlg.outcome
         self.strays[drive["path"]] = r["left"]
         n = r["adopted"]
         msg = (f"Brought {n} item{'s' if n != 1 else ''} into “{drive['name']}”." if n
@@ -1428,7 +1441,7 @@ class DrivesInterface(QWidget):
 
     def change_password(self, drive):
         dlg = PasswordDialog(self.win, drive)
-        if dlg.exec() and dlg.done:
+        if dlg.exec() and dlg.succeeded:
             self.ok(f"Changed the password for “{drive['name']}”.")
 
     def _wait_for_mount(self, proc, mp, timeout=15.0):
@@ -1448,16 +1461,16 @@ class DrivesInterface(QWidget):
         if not drives:
             return self.err("There are no drives to back up yet.")
         dlg = BackupDialog(self.win, drives)
-        if not dlg.exec() or not dlg.result:
+        if not dlg.exec() or not dlg.outcome:
             return
         n = len(drives)
-        self.ok(f"Backed up {'the drive' if n == 1 else f'{n} drives'} to {dlg.result['file']}")
+        self.ok(f"Backed up {'the drive' if n == 1 else f'{n} drives'} to {dlg.outcome['file']}")
 
     def restore(self):
         dlg = RestoreDialog(self.win, self.drives, {os.path.normpath(p) for p in self.mounts})
-        if not dlg.exec() or not dlg.result:
+        if not dlg.exec() or not dlg.outcome:
             return
-        r = dlg.result
+        r = dlg.outcome
         if not any(os.path.normpath(d["path"]) == r["path"] for d in self.drives):
             self.drives.insert(0, {"name": r["name"], "path": r["path"]})
             save_drives(self.drives)
