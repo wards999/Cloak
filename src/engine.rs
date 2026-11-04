@@ -517,7 +517,14 @@ impl Store {
         let folder = self.resolve_dir(&components(path))?;
         let found = scan(&folder);
         if let Some(found) = &found {
-            self.reconcile(&folder, found)?;
+            // Only when the folder changed since it was last checked.
+            let modified = std::fs::metadata(&folder).and_then(|m| m.modified()).ok();
+            if modified.is_none() || lock(&self.checked).get(&folder) != modified.as_ref() {
+                self.reconcile(&folder, found)?;
+                if let Some(t) = modified {
+                    lock(&self.checked).insert(folder.clone(), t);
+                }
+            }
         }
         let found = found.unwrap_or_default();
         let entries = self.list_entries(path)?;
@@ -835,8 +842,18 @@ impl Store {
             generate_unique(&mut rand::thread_rng(), &Taken { dir: &dir, at: &parent_disk })
         };
         let child = Child::new_file(name, boring.clone(), 0);
-        // An empty file is just its envelope.
-        std::fs::write(parent_disk.join(&boring), child.envelope().seal(&self.key))?;
+        // An empty file is just its envelope. Its handle is kept for the
+        // writes that usually follow: on Windows, reopening a file just
+        // written waits for the antivirus scan.
+        let blob = parent_disk.join(&boring);
+        let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&blob)?;
+        let env = child.envelope().seal(&self.key);
+        write_all_at(&f, &env, 0)?;
+        if self.handles.len() >= MAX_HANDLES {
+            self.handles.clear();
+        }
+        self.handles.insert(blob.clone(), f);
+        self.envelopes.insert(blob, env);
         self.dirs.edit(&parent_disk, &self.key, |d| d.push(child))?;
         self.tick()?;
         Ok(boring)
