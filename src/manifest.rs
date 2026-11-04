@@ -26,17 +26,14 @@
 //! writes listings in either form.
 
 use crate::crypto::{self, Key, Nonce, NONCE_LEN};
+use crate::lock::{self, Keys};
+pub use crate::lock::{is_conflict_copy, is_list_file};
 use crate::durable;
 use crate::envelope::{self, Envelope, FileId};
 use crate::names;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
-
-/// Reserved filename for the manifest within each on-disk directory. The boring
-/// generator never produces this (it always appends `_NNNN`), and callers also
-/// pass it as a reserved name so no child can collide with it.
-pub const MANIFEST_NAME: &str = "manifest.idx";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Kind {
@@ -127,23 +124,9 @@ fn is_zero(n: &u64) -> bool {
 /// Parts a directory's list is split into once it outgrows one file.
 pub const PARTS: usize = 64;
 
-/// The file holding part `i` of a split list.
-pub fn part_name(i: usize) -> String {
-    format!("manifest.p{i:02}.idx")
-}
-
-/// Does a file with this name hold (part of) a folder list? `manifest.idx`
-/// or one of its parts; not a side file or a sync tool's conflict copy.
-pub fn is_list_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower == MANIFEST_NAME || is_part_name(&lower)
-}
-
-fn is_part_name(lower: &str) -> bool {
-    lower.len() == 16
-        && lower.starts_with("manifest.p")
-        && lower.ends_with(".idx")
-        && lower[10..12].bytes().all(|b| b.is_ascii_digit())
+/// The file holding part `i` of a split list, in the drive with `keys`.
+pub fn part_name(keys: &Keys, i: usize) -> String {
+    lock::part_name(&keys.master, i)
 }
 
 /// Which of `parts` parts holds the child with this boring name. Keyed by the
@@ -158,36 +141,37 @@ pub fn part_of(boring: &str, parts: usize) -> usize {
 }
 
 impl Manifest {
-    /// Path of the manifest file inside the on-disk directory `dir`.
-    pub fn path_in(dir: &Path) -> PathBuf {
-        dir.join(MANIFEST_NAME)
+    /// Path of the list file inside the on-disk directory `dir`, in the drive
+    /// with `keys` (a dull name the drive works out from its key).
+    pub fn path_in(dir: &Path, keys: &Keys) -> PathBuf {
+        dir.join(keys.list_name())
     }
 
     /// Load and decrypt the manifest for `dir`. A directory with no manifest
     /// file yet (freshly created, or empty) reads as an empty manifest.
-    pub fn load(dir: &Path, key: &Key) -> io::Result<Manifest> {
-        let path = Self::path_in(dir);
+    pub fn load(dir: &Path, keys: &Keys) -> io::Result<Manifest> {
+        let path = Self::path_in(dir, keys);
         if !path.exists() {
             return Ok(Manifest::default());
         }
-        Self::load_file(&path, key)
+        Self::load_file(&path, keys)
     }
 
-    fn load_file(path: &Path, key: &Key) -> io::Result<Manifest> {
-        Self::from_sealed(std::fs::read(path)?, key)
+    fn load_file(path: &Path, keys: &Keys) -> io::Result<Manifest> {
+        Self::from_sealed(std::fs::read(path)?, keys)
     }
 
     /// Decrypt and parse a manifest file's bytes.
-    pub fn from_sealed(bytes: Vec<u8>, key: &Key) -> io::Result<Manifest> {
+    pub fn from_sealed(bytes: Vec<u8>, keys: &Keys) -> io::Result<Manifest> {
         if bytes.is_empty() {
             return Ok(Manifest::default());
         }
-        Ok(serde_json::from_slice(&unseal(bytes, key)?)?)
+        Ok(serde_json::from_slice(&unseal(bytes, keys)?)?)
     }
 
     /// Encrypt and write the manifest into `dir`, with a fresh random nonce.
-    pub fn save(&self, dir: &Path, key: &Key) -> io::Result<()> {
-        durable::write_atomic(&Self::path_in(dir), &seal(serde_json::to_vec(self)?, key))
+    pub fn save(&self, dir: &Path, keys: &Keys) -> io::Result<()> {
+        durable::write_atomic(&Self::path_in(dir, keys), &seal(serde_json::to_vec(self)?, keys))
     }
 
     // Name matching is case-insensitive and Unicode-normalization-insensitive:
@@ -203,38 +187,40 @@ impl Manifest {
         self.children.iter().position(|c| names::same(&c.real, real))
     }
 
-    /// The set of boring names in use here, plus the reserved manifest name, so
-    /// the boring-name generator never collides with a sibling or the manifest.
-    pub fn used_boring_names(&self) -> std::collections::HashSet<String> {
+    /// The set of boring names in use here, plus the list's own name, so
+    /// the boring-name generator never collides with a sibling or the list.
+    pub fn used_boring_names(&self, keys: &Keys) -> std::collections::HashSet<String> {
         let mut set: std::collections::HashSet<String> =
             self.children.iter().map(|c| c.boring.clone()).collect();
-        set.insert(MANIFEST_NAME.to_string());
+        set.insert(keys.list_name().to_string());
         set
     }
 }
 
 /// What a list is sealed as (see [`crypto::seal`]).
-const LIST: &[u8] = b"cloak-list-v2";
+const LIST: &[u8] = b"cloak-list-v3";
 
-/// Seal a list's JSON with the master key.
-pub fn seal(body: Vec<u8>, key: &Key) -> Vec<u8> {
-    crypto::seal(key, LIST, &body)
+/// Seal a list's JSON with the master key, followed by a tail like a file's
+/// envelope: the drive's lock, then random bytes. So every hidden file of a
+/// drive, list or not, carries the lock in the same place.
+pub fn seal(body: Vec<u8>, keys: &Keys) -> Vec<u8> {
+    use rand::RngCore;
+    let mut out = crypto::seal(&keys.master, LIST, &body);
+    out.extend_from_slice(&keys.lock());
+    let mut pad = vec![0u8; crate::envelope::LEN as usize - lock::LEN];
+    rand::thread_rng().fill_bytes(&mut pad);
+    out.extend_from_slice(&pad);
+    out
 }
 
-/// Undo [`seal`]; `InvalidData` if it isn't a list sealed with `key`, or was
-/// changed since.
-pub fn unseal(bytes: Vec<u8>, key: &Key) -> io::Result<Vec<u8>> {
-    crypto::open(key, LIST, &bytes)
-}
-
-/// Is `name` a sync tool's renamed copy of a manifest? Boring names never
-/// start with `manifest`, so anything else of the form `manifest….idx` is one.
-pub fn is_conflict_copy(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower != MANIFEST_NAME
-        && !is_part_name(&lower)
-        && lower.starts_with("manifest")
-        && lower.ends_with(".idx")
+/// Undo [`seal`]; `InvalidData` if it isn't a list sealed with `keys`, or
+/// was changed since.
+pub fn unseal(bytes: Vec<u8>, keys: &Keys) -> io::Result<Vec<u8>> {
+    let tail = crate::envelope::LEN as usize;
+    if bytes.len() < tail {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "damaged, or not sealed with this key"));
+    }
+    crypto::open(&keys.master, LIST, &bytes[..bytes.len() - tail])
 }
 
 /// Three-way merge of a directory list: `ours` and `theirs` both started from
@@ -294,10 +280,10 @@ fn unique_names(children: Vec<Child>) -> Vec<Child> {
 /// and one added on either machine appears. Two different files that ended up
 /// with the same real name get ` (conflict N)` added to the later one. A copy
 /// that can't be read (wrong key, damaged) is left in place.
-pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
+pub fn merge_conflicts(dir: &Path, keys: &Keys) -> io::Result<usize> {
     let mut copies: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_str().is_some_and(is_conflict_copy))
+        .filter(|e| e.file_name().to_str().is_some_and(|n| is_conflict_copy(&keys.master, n)))
         .map(|e| e.path())
         .collect();
     if copies.is_empty() {
@@ -305,8 +291,8 @@ pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
     }
     copies.sort();
 
-    let main_path = Manifest::path_in(dir);
-    let listing = crate::dircache::read_listing(dir, key);
+    let main_path = Manifest::path_in(dir, keys);
+    let listing = crate::dircache::read_listing(dir, keys);
     let parts = listing.as_ref().map_or(0, |l| l.parts);
     let name = listing.as_ref().ok().and_then(|l| l.name.clone());
     let mut merged = Manifest {
@@ -316,7 +302,7 @@ pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
     };
     let mut used = Vec::new();
     for copy in &copies {
-        let Ok(other) = Manifest::load_file(copy, key) else {
+        let Ok(other) = Manifest::load_file(copy, keys) else {
             continue;
         };
         for child in other.children {
@@ -332,7 +318,7 @@ pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
     merged.children.retain(|c| dir.join(&c.boring).exists());
 
     merged.children = unique_names(merged.children);
-    crate::dircache::write_listing(dir, key, name.as_deref(), &merged.children, parts, &mut vec![0; parts], None)?;
+    crate::dircache::write_listing(dir, keys, name.as_deref(), &merged.children, parts, &mut vec![0; parts], None)?;
     for copy in &used {
         if **copy != main_path {
             std::fs::remove_file(copy)?;
@@ -363,21 +349,21 @@ mod tests {
     #[test]
     fn empty_dir_reads_empty() {
         let d = tempdir().unwrap();
-        let m = Manifest::load(d.path(), &[1u8; 32]).unwrap();
+        let m = Manifest::load(d.path(), &Keys::bare([1u8; 32], 0)).unwrap();
         assert!(m.children.is_empty());
     }
 
     #[test]
     fn save_load_roundtrip_and_encrypted_on_disk() {
         let d = tempdir().unwrap();
-        let key = [2u8; 32];
+        let key = Keys::bare([2u8; 32], 0);
         let mut m = Manifest::default();
         m.children.push(dir_child("Taxes", "index_shard_0001.idx"));
         m.children.push(Child::new_file("Return.pdf".into(), "cache_0002.dat".into(), 4242));
         m.save(d.path(), &key).unwrap();
 
         // On disk, the real names must not appear in the clear.
-        let raw = std::fs::read(Manifest::path_in(d.path())).unwrap();
+        let raw = std::fs::read(Manifest::path_in(d.path(), &key)).unwrap();
         let hay = String::from_utf8_lossy(&raw);
         assert!(!hay.contains("Return.pdf"), "real names must be encrypted");
         assert!(!hay.contains("Taxes"));
@@ -393,24 +379,27 @@ mod tests {
         let d = tempdir().unwrap();
         let mut m = Manifest::default();
         m.children.push(dir_child("Secret", "thumbs_0003.db"));
-        m.save(d.path(), &[3u8; 32]).unwrap();
-        // A wrong key fails the seal's check.
-        assert!(Manifest::load(d.path(), &[4u8; 32]).is_err());
+        m.save(d.path(), &Keys::bare([3u8; 32], 0)).unwrap();
+        // A wrong key fails the seal's check (another key's drive wouldn't
+        // even look for it under this name).
+        let bytes = std::fs::read(Manifest::path_in(d.path(), &Keys::bare([3u8; 32], 0))).unwrap();
+        assert!(Manifest::from_sealed(bytes, &Keys::bare([4u8; 32], 0)).is_err());
         // So does a changed byte.
-        let path = Manifest::path_in(d.path());
+        let path = Manifest::path_in(d.path(), &Keys::bare([3u8; 32], 0));
         let mut raw = std::fs::read(&path).unwrap();
         raw[30] ^= 1;
         std::fs::write(&path, raw).unwrap();
-        assert!(Manifest::load(d.path(), &[3u8; 32]).is_err());
+        assert!(Manifest::load(d.path(), &Keys::bare([3u8; 32], 0)).is_err());
     }
 
     #[test]
     fn used_names_includes_reserved_manifest() {
         let mut m = Manifest::default();
         m.children.push(dir_child("A", "cache_0001.dat"));
-        let used = m.used_boring_names();
+        let keys = Keys::bare([1u8; 32], 0);
+        let used = m.used_boring_names(&keys);
         assert!(used.contains("cache_0001.dat"));
-        assert!(used.contains(MANIFEST_NAME));
+        assert!(used.contains(keys.list_name()));
     }
 
     fn file_child(real: &str, boring: &str) -> Child {
@@ -422,24 +411,26 @@ mod tests {
 
     #[test]
     fn conflict_copy_names() {
+        let k = [6u8; 32];
+        let list = lock::names(&k).list;
+        let (stem, ext) = list.rsplit_once('.').unwrap();
         for n in [
-            "manifest (Simon's conflicted copy 2026-11-02).idx",
-            "manifest-DESKTOP-4F2.idx",
-            "manifest.sync-conflict-20261102-101010-ABCDEF.idx",
-            "manifest 2.idx",
-            "manifest (1).idx",
+            format!("{stem} (Simon's conflicted copy 2026-11-02).{ext}"),
+            format!("{stem}-DESKTOP-4F2.{ext}"),
+            format!("{stem}.sync-conflict-20261102-101010-ABCDEF.{ext}"),
+            format!("{stem} 2.{ext}"),
         ] {
-            assert!(is_conflict_copy(n), "{n}");
+            assert!(is_conflict_copy(&k, &n), "{n}");
         }
-        for n in ["manifest.idx", "update_manifest_0001.idx", "manifest.idx.new", "cache_0001.idx"] {
-            assert!(!is_conflict_copy(n), "{n}");
+        for n in [list.to_string(), format!("{list}.new"), "cache_0001.idx".to_string(), lock::part_name(&k, 3)] {
+            assert!(!is_conflict_copy(&k, &n), "{n}");
         }
     }
 
     #[test]
     fn merges_both_sides_of_a_sync_conflict() {
         let d = tempdir().unwrap();
-        let key = [4u8; 32];
+        let key = Keys::bare([4u8; 32], 0);
         for b in ["cache_0001.dat", "cache_0002.dat", "cache_0003.dat", "cache_0004.dat"] {
             std::fs::write(d.path().join(b), b"x").unwrap();
         }
@@ -458,7 +449,9 @@ mod tests {
         b.children.push(file_child("Notes.txt", "cache_0005.dat"));
         std::fs::write(d.path().join("cache_0005.dat"), b"y").unwrap();
         b.save(d.path(), &key).unwrap();
-        std::fs::rename(Manifest::path_in(d.path()), d.path().join("manifest (conflicted copy).idx")).unwrap();
+        let (stem, ext) = key.list_name().rsplit_once('.').unwrap();
+        let copy = format!("{stem} (conflicted copy).{ext}");
+        std::fs::rename(Manifest::path_in(d.path(), &key), d.path().join(&copy)).unwrap();
         a.save(d.path(), &key).unwrap();
 
         assert_eq!(merge_conflicts(d.path(), &key).unwrap(), 1);
@@ -466,7 +459,7 @@ mod tests {
         let mut names: Vec<&str> = m.children.iter().map(|c| c.real.as_str()).collect();
         names.sort();
         assert_eq!(names, ["Notes (conflict 1).txt", "a.txt", "b.txt", "notes.txt", "shared"]);
-        assert!(!d.path().join("manifest (conflicted copy).idx").exists());
+        assert!(!d.path().join(&copy).exists());
         assert_eq!(merge_conflicts(d.path(), &key).unwrap(), 0);
     }
 }
