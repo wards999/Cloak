@@ -6,36 +6,37 @@
 //! resolved by walking manifests from the root, descending into each child's
 //! boring on-disk directory, until the final component.
 //!
-//! File *contents* use the same header/footer ChaCha20 scheme as before; only
-//! the directory layer is new. Directories themselves hold no blob and are never
-//! encrypted — their real names live solely in the parent's manifest, so a
-//! folder is "obfuscated" by having no real name on disk at all.
+//! A file's ends are encrypted with its own key (see `docs/FORMAT.md`), and
+//! every file ends with an envelope describing it, so a file found in a
+//! folder whose list doesn't name it can be recognized and taken back in
+//! ([`Store::check_folder`]). Directories hold no blob; their real names live
+//! in the parent's list and in their own.
 //!
 //! All operations are plain file I/O, so the engine runs and is fully tested
 //! without any FUSE/WinFsp driver.
 
 use crate::boring::{generate_unique, Contains};
-use crate::crypto::{protected_ranges, transform_region, Key, Nonce, NONCE_LEN};
-use crate::key::{self, SALT_LEN};
-use crate::dircache::{Dir, DirCache};
+use crate::crypto::{self, protected_ranges, transform_region, Key, Nonce};
+use crate::dircache::{read_listing, write_listing, Dir, DirCache};
 use crate::durable;
-use crate::manifest::{self, Child, Kind};
+use crate::envelope::{self, Envelope, LEN as ENVELOPE};
+use crate::key::{self, SALT_LEN};
+use crate::manifest::{self, Child};
 use crate::names;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Known token encrypted under the derived key at create time; decrypting it on
-/// open is how we tell a correct password from a wrong one. This is a
-/// usability/security trade: it lets an attacker with the store test password
-/// guesses offline, but Argon2id makes each guess expensive, and "wrong
-/// password" feedback is table stakes for a drive app.
-const VERIFY_TOKEN: &[u8] = b"cloak-verify-v1";
+/// The drive format this engine reads and writes (see `docs/FORMAT.md`).
+pub const FORMAT: u32 = 2;
+
+const META_LABEL: &[u8] = b"cloak-meta-v2";
+const JOURNAL_LABEL: &[u8] = b"cloak-journal-v2";
 
 /// Store-wide metadata persisted at the backing root (reserved name, distinct
 /// from a directory manifest).
@@ -44,53 +45,62 @@ struct StoreMeta {
     version: u32,
     salt: [u8; SALT_LEN],
     region: u64,
-    /// Nonce + ciphertext of VERIFY_TOKEN under the derived key.
-    verifier_nonce: [u8; NONCE_LEN],
-    verifier: Vec<u8>,
-    /// The Argon2id settings the key is derived with. Absent in drives made
-    /// before they were recorded, which used the original ones.
-    #[serde(default)]
+    /// The Argon2id settings the password's key is derived with.
     kdf: key::KdfParams,
+    /// The master key, sealed with the password's key: a wrong password
+    /// fails its check.
+    wrapped: Vec<u8>,
 }
 
-/// The key and region for `passphrase`, from the bytes of a store's
-/// `meta.json`. `InvalidData` if they aren't a store header,
-/// `PermissionDenied` if the passphrase is wrong.
-pub fn key_from_meta(meta: &[u8], passphrase: &str) -> io::Result<(Key, u64)> {
-    let meta: StoreMeta = serde_json::from_slice(meta)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("damaged drive header: {e}")))?;
-    let derived = key::derive_key(passphrase, &meta.salt, &meta.kdf)?;
-    let mut check = meta.verifier.clone();
-    transform_region(&derived, &meta.verifier_nonce, 0, &mut check);
-    if check != VERIFY_TOKEN {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong password"));
+fn parse_meta(meta: &[u8]) -> io::Result<StoreMeta> {
+    let damaged = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("damaged drive header: {e}"));
+    let value: serde_json::Value = serde_json::from_slice(meta).map_err(|e| damaged(e.to_string()))?;
+    if value.get("version").and_then(|v| v.as_u64()) != Some(FORMAT as u64) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "this drive was made by an earlier test version of cloak, which this version can't open",
+        ));
     }
-    Ok((derived, meta.region))
+    serde_json::from_value(value).map_err(|e| damaged(e.to_string()))
 }
 
-/// Write a new drive's `meta.json` into `backing_dir`: a fresh salt, the
-/// current password settings, `region`, and a verifier for `passphrase`.
-/// Returns the drive's key.
-pub(crate) fn write_new_meta(backing_dir: &Path, passphrase: &str, region: u64) -> io::Result<Key> {
+/// The master key and region for `passphrase`, from the bytes of a store's
+/// `meta.json`. `InvalidData` if they aren't a store header this version
+/// reads, `PermissionDenied` if the passphrase is wrong.
+pub fn key_from_meta(meta: &[u8], passphrase: &str) -> io::Result<(Key, u64)> {
+    let meta = parse_meta(meta)?;
+    let kek = key::derive_key(passphrase, &meta.salt, &meta.kdf)?;
+    let master = crypto::open(&kek, META_LABEL, &meta.wrapped)
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "wrong password"))?;
+    let master: Key = master
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "damaged drive header: key"))?;
+    Ok((master, meta.region))
+}
+
+/// `meta.json` for a drive with `master` key, protected by `passphrase`.
+fn meta_for(master: &Key, passphrase: &str, region: u64) -> io::Result<Vec<u8>> {
     let salt = key::random_salt();
     let kdf = key::KdfParams::CURRENT;
-    let derived = key::derive_key(passphrase, &salt, &kdf)?;
+    let kek = key::derive_key(passphrase, &salt, &kdf)?;
+    let meta = StoreMeta { version: FORMAT, salt, region, kdf, wrapped: crypto::seal(&kek, META_LABEL, master) };
+    Ok(serde_json::to_vec_pretty(&meta)?)
+}
 
-    let mut verifier_nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut verifier_nonce);
-    let mut verifier = VERIFY_TOKEN.to_vec();
-    transform_region(&derived, &verifier_nonce, 0, &mut verifier);
+/// Write a new drive's `meta.json` into `backing_dir`: a new random master
+/// key, wrapped for `passphrase`. Returns the master key.
+pub(crate) fn write_new_meta(backing_dir: &Path, passphrase: &str, region: u64) -> io::Result<Key> {
+    let master = envelope::new_key();
+    durable::write_atomic(&backing_dir.join("meta.json"), &meta_for(&master, passphrase, region)?)?;
+    Ok(master)
+}
 
-    let meta = StoreMeta {
-        version: 1,
-        salt,
-        region,
-        verifier_nonce,
-        verifier,
-        kdf,
-    };
-    durable::write_atomic(&backing_dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
-    Ok(derived)
+/// Change a drive's password: only `meta.json` changes (the master key is
+/// wrapped again), so it takes a moment whatever the drive holds.
+pub fn change_password(backing_dir: &Path, old: &str, new: &str) -> io::Result<()> {
+    let path = backing_dir.join("meta.json");
+    let (master, region) = key_from_meta(&std::fs::read(&path)?, old)?;
+    durable::write_atomic(&path, &meta_for(&master, new, region)?)
 }
 
 /// What a path points at. The times are those of its boring file or directory
@@ -135,7 +145,8 @@ impl Metadata {
             Some(d) => {
                 let modified = d.modified().unwrap_or(UNIX_EPOCH);
                 (
-                    if is_dir { 0 } else { d.len() },
+                    // A file's real length is its length on disk less its envelope.
+                    if is_dir { 0 } else { d.len().saturating_sub(ENVELOPE) },
                     d.accessed().unwrap_or(modified),
                     modified,
                     // Not every filesystem records a birth time (some Linux ones).
@@ -225,12 +236,26 @@ pub struct Store {
     /// Boring files and folders removed from their lists but not yet from
     /// the disk: they go once the lists are saved (see [`Store::sync`]).
     doomed: Vec<(PathBuf, String)>,
+    /// Envelopes of files being written, so a resize can put it back at the
+    /// new end without reading it again.
+    envelopes: HashMap<PathBuf, [u8; ENVELOPE as usize]>,
+    /// Files that already have a fresh nonce for the editing session under
+    /// way (until their last close).
+    renonced: HashSet<PathBuf>,
+    /// Files and folders found in each folder that belong to another drive
+    /// (see [`Store::check_folder`]).
+    foreign: Mutex<HashMap<PathBuf, BTreeSet<String>>>,
+    /// Each folder's modified time when last checked for strays.
+    checked: Mutex<HashMap<PathBuf, SystemTime>>,
 }
+
+/// A file's key and its current content nonce.
+type Crypt = (Key, Nonce);
 
 /// A file opened with [`Store::open_file`].
 struct Opened {
     blob: PathBuf,
-    nonce: Nonce,
+    crypt: Crypt,
 }
 
 /// How long a changed directory list may wait before it is saved.
@@ -279,6 +304,9 @@ enum Journal {
     /// Original bytes of a file whose encrypted end is being moved; restoring
     /// them and the length rolls the file back to before the write.
     Undo { blob: String, len: u64, ranges: Vec<(u64, Vec<u8>)> },
+    /// A file's ends being re-encrypted under `nonce`: done once its list
+    /// entry has that nonce, otherwise undone with the original bytes.
+    Renonce { dir: String, boring: String, nonce: Nonce, len: u64, ranges: Vec<(u64, Vec<u8>)> },
 }
 
 /// Split a logical path into non-empty components, each in NFC. Only `/`
@@ -320,6 +348,10 @@ impl Store {
             next_id: 1,
             dirs: DirCache::default(),
             doomed: Vec::new(),
+            envelopes: HashMap::new(),
+            renonced: HashSet::new(),
+            foreign: Mutex::default(),
+            checked: Mutex::default(),
         };
         store.recover()?;
         store.merge_all_conflicts()?;
@@ -478,20 +510,17 @@ impl Store {
     /// big folder lists about as fast as the disk lists it. A file this store
     /// is writing is read from its open handle instead, since NTFS only
     /// updates a folder's copy of an open file's size and dates lazily.
+    ///
+    /// The same scan is checked against the folder's list for strays (see
+    /// [`check_folder`](Self::check_folder)), at no extra cost to the disk.
     pub fn list_dir_meta(&self, path: &str) -> io::Result<Vec<(String, Metadata)>> {
-        let entries = self.list_entries(path)?;
-        let Some(first) = entries.first() else {
-            return Ok(Vec::new());
-        };
-        let folder = first.disk.parent().expect("a child of its folder").to_path_buf();
-        let mut found: HashMap<std::ffi::OsString, std::fs::Metadata> = HashMap::new();
-        if let Ok(rd) = std::fs::read_dir(&folder) {
-            for e in rd.flatten() {
-                if let Ok(m) = e.metadata() {
-                    found.insert(e.file_name(), m);
-                }
-            }
+        let folder = self.resolve_dir(&components(path))?;
+        let found = scan(&folder);
+        if let Some(found) = &found {
+            self.reconcile(&folder, found)?;
         }
+        let found = found.unwrap_or_default();
+        let entries = self.list_entries(path)?;
         Ok(entries
             .into_iter()
             .map(|e| {
@@ -501,6 +530,227 @@ impl Store {
                 (e.name, m)
             })
             .collect())
+    }
+
+    // ---- strays ---------------------------------------------------------
+    //
+    // Files and folders on disk that a folder's list doesn't name: moved
+    // there by hand, or left by a list that was lost. See `docs/FORMAT.md`.
+
+    /// Check the folder at `path` for strays, if it has changed since it was
+    /// last checked: one scan of its disk folder, compared with its list in
+    /// memory. A stray from this drive (its envelope, or a folder's list,
+    /// opens) is added to the list under its real name; one from another
+    /// drive is left alone and counted ([`foreign_count`](Self::foreign_count)).
+    /// Entries whose file or folder has gone are dropped. Changes to the
+    /// list are saved with the others.
+    pub fn check_folder(&self, path: &str) -> io::Result<()> {
+        self.check_disk_folder(&self.resolve_dir(&components(path))?)
+    }
+
+    fn check_disk_folder(&self, folder: &Path) -> io::Result<()> {
+        let modified = std::fs::metadata(folder)?.modified()?;
+        if lock(&self.checked).get(folder) == Some(&modified) {
+            return Ok(());
+        }
+        let found = scan(folder).ok_or_else(|| io::Error::other("couldn't read the folder"))?;
+        self.reconcile(folder, &found)?;
+        lock(&self.checked).insert(folder.to_path_buf(), modified);
+        Ok(())
+    }
+
+    /// Check the whole drive for strays (as unlocking does, in the
+    /// background). Returns how many from other drives are waiting.
+    pub fn sweep(&self) -> io::Result<usize> {
+        let mut folders = vec![self.backing_dir.clone()];
+        while let Some(folder) = folders.pop() {
+            let checked = self.check_disk_folder(&folder);
+            if folder == self.backing_dir {
+                checked?;
+            } else if checked.is_err() {
+                continue;
+            }
+            let Ok(dir) = self.dirs.load(&folder, &self.key) else {
+                continue; // a damaged list: reported when the folder is opened
+            };
+            folders.extend(dir.children().iter().filter(|c| c.is_dir()).map(|c| folder.join(&c.boring)));
+        }
+        Ok(self.foreign_count())
+    }
+
+    /// How many files and folders from other drives were found (by
+    /// [`check_folder`](Self::check_folder) or [`sweep`](Self::sweep)).
+    pub fn foreign_count(&self) -> usize {
+        lock(&self.foreign).values().map(BTreeSet::len).sum()
+    }
+
+    /// Compare a folder's scan with its list (see `check_folder`).
+    fn reconcile(&self, folder: &Path, found: &HashMap<OsString, std::fs::Metadata>) -> io::Result<()> {
+        let at_root = folder == self.backing_dir;
+        let dir = self.dirs.load(folder, &self.key)?;
+        let mut adopt = Vec::new();
+        let mut foreign = BTreeSet::new();
+        for (name, m) in found {
+            let Some(name) = name.to_str() else { continue };
+            if dir.has_boring(name)
+                || crate::convert::is_reserved(name, at_root)
+                || self.doomed.iter().any(|(d, b)| d == folder && b == name)
+            {
+                continue;
+            }
+            let path = folder.join(name);
+            if m.is_dir() {
+                if !manifest::Manifest::path_in(&path).exists() {
+                    continue; // not a drive's folder
+                }
+                match read_listing(&path, &self.key) {
+                    Ok(l) => adopt.push(Child::dir(l.name.unwrap_or_else(|| RECOVERED.into()), name.into())),
+                    Err(_) => {
+                        foreign.insert(name.to_string());
+                    }
+                }
+            } else if m.is_file() && m.len() >= ENVELOPE {
+                match Envelope::read(&path, &self.key) {
+                    Ok(e) => adopt.push(Child::from_envelope(e, name.into(), m.len() - ENVELOPE)),
+                    Err(_) => {
+                        foreign.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        let gone: Vec<String> = dir
+            .children()
+            .iter()
+            .filter(|c| !found.contains_key(std::ffi::OsStr::new(&c.boring)))
+            .map(|c| c.boring.clone())
+            .collect();
+        drop(dir);
+        if !adopt.is_empty() || !gone.is_empty() {
+            self.dirs.edit(folder, &self.key, |d| {
+                for b in &gone {
+                    if let Some(p) = d.position_of_boring(b) {
+                        d.remove(p);
+                    }
+                }
+                for c in adopt {
+                    if !d.has_boring(&c.boring) {
+                        d.push(c); // a clashing name gets " (conflict N)"
+                    }
+                }
+            })?;
+        }
+        let mut all = lock(&self.foreign);
+        if foreign.is_empty() {
+            all.remove(folder);
+        } else {
+            all.insert(folder.to_path_buf(), foreign);
+        }
+        Ok(())
+    }
+
+    /// Bring in the strays from the drive whose master key is `other`:
+    /// each file's envelope (and each folder's lists and the envelopes inside
+    /// it) is opened with `other` and sealed again with this drive's key, and
+    /// the item joins its folder's list. A file's data and its own key don't
+    /// change, so this costs about 512 bytes per file. Returns how many were
+    /// brought in and how many are left (from yet another drive).
+    pub fn adopt_from(&mut self, other: &Key) -> io::Result<(usize, usize)> {
+        self.sweep()?;
+        let strays: Vec<(PathBuf, String)> = lock(&self.foreign)
+            .iter()
+            .flat_map(|(d, names)| names.iter().map(move |n| (d.clone(), n.clone())))
+            .collect();
+        let (mut adopted, mut left) = (0, 0);
+        for (folder, name) in strays {
+            let path = folder.join(&name);
+            let child = if path.is_dir() {
+                if self.rekey_tree(&path, other)? {
+                    let l = read_listing(&path, &self.key)?;
+                    Some(Child::dir(l.name.unwrap_or_else(|| RECOVERED.into()), name.clone()))
+                } else {
+                    None
+                }
+            } else {
+                let size = std::fs::metadata(&path)?.len().saturating_sub(ENVELOPE);
+                self.rekey_file(&path, other)?.map(|e| Child::from_envelope(e, name.clone(), size))
+            };
+            match child {
+                Some(c) => {
+                    self.dirs.edit(&folder, &self.key, |d| {
+                        if !d.has_boring(&c.boring) {
+                            d.push(c);
+                        }
+                    })?;
+                    if let Some(set) = lock(&self.foreign).get_mut(&folder) {
+                        set.remove(&name);
+                    }
+                    adopted += 1;
+                }
+                None => left += 1,
+            }
+        }
+        lock(&self.foreign).retain(|_, s| !s.is_empty());
+        self.sync()?;
+        Ok((adopted, left))
+    }
+
+    /// Seal the envelope of the file at `path` with this drive's key if it's
+    /// sealed with `other`. Its old envelope is journaled first, so a crash
+    /// part-way leaves one or the other, never neither. `None` if neither key
+    /// opens it.
+    fn rekey_file(&self, path: &Path, other: &Key) -> io::Result<Option<Envelope>> {
+        if let Ok(e) = Envelope::read(path, &self.key) {
+            return Ok(Some(e));
+        }
+        let Ok(e) = Envelope::read(path, other) else {
+            return Ok(None);
+        };
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let len = f.metadata()?.len();
+        let at = len - ENVELOPE;
+        let mut old = [0u8; ENVELOPE as usize];
+        read_exact_at(&f, &mut old, at)?;
+        self.write_journal(&Journal::Undo { blob: self.rel(path), len, ranges: vec![(at, old.to_vec())] })?;
+        write_all_at(&f, &e.seal(&self.key), at)?;
+        f.sync_data()?;
+        self.clear_journal()?;
+        Ok(Some(e))
+    }
+
+    /// Re-seal a folder from the drive with key `other`, and everything in
+    /// it, with this drive's key: files first, then each folder's own list,
+    /// so an interrupted run is simply run again. False if the folder's
+    /// list opens with neither key.
+    fn rekey_tree(&self, dir: &Path, other: &Key) -> io::Result<bool> {
+        if !manifest::Manifest::path_in(dir).exists() {
+            return Ok(false);
+        }
+        let theirs = match read_listing(dir, &self.key) {
+            Ok(_) => None, // re-sealed already, by a run that stopped part-way
+            Err(_) => match read_listing(dir, other) {
+                Ok(l) => Some(l),
+                Err(_) => return Ok(false),
+            },
+        };
+        for e in std::fs::read_dir(dir)?.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            if crate::convert::is_reserved(&name, false) {
+                continue;
+            }
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                self.rekey_tree(&e.path(), other)?;
+            } else if ft.is_file() {
+                self.rekey_file(&e.path(), other)?;
+            }
+        }
+        if let Some(l) = theirs {
+            write_listing(dir, &self.key, l.name.as_deref(), &l.children, 0, &mut Vec::new(), None)?;
+            for i in 0..l.parts {
+                let _ = std::fs::remove_file(dir.join(manifest::part_name(i)));
+            }
+        }
+        Ok(true)
     }
 
     /// The path with each component in its stored case (lookups are
@@ -559,15 +809,12 @@ impl Store {
             }
             generate_unique(&mut rand::thread_rng(), &Taken { dir: &dir, at: &parent_disk })
         };
-        std::fs::create_dir(parent_disk.join(&boring))?;
-        let child = Child {
-            real: name,
-            boring,
-            kind: Kind::Dir,
-            nonce: [0u8; NONCE_LEN],
-            size: 0,
-        };
-        self.dirs.edit(&parent_disk, &self.key, |d| d.push(child))?;
+        let disk = parent_disk.join(&boring);
+        std::fs::create_dir(&disk)?;
+        // Its own list first, with its name, so the folder describes itself
+        // from the start.
+        write_listing(&disk, &self.key, Some(&name), &[], 0, &mut Vec::new(), None)?;
+        self.dirs.edit(&parent_disk, &self.key, |d| d.push(Child::dir(name, boring)))?;
         self.tick()
     }
 
@@ -587,16 +834,9 @@ impl Store {
             }
             generate_unique(&mut rand::thread_rng(), &Taken { dir: &dir, at: &parent_disk })
         };
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        std::fs::write(parent_disk.join(&boring), [])?;
-        let child = Child {
-            real: name,
-            boring: boring.clone(),
-            kind: Kind::File,
-            nonce,
-            size: 0,
-        };
+        let child = Child::new_file(name, boring.clone(), 0);
+        // An empty file is just its envelope.
+        std::fs::write(parent_disk.join(&boring), child.envelope().seal(&self.key))?;
         self.dirs.edit(&parent_disk, &self.key, |d| d.push(child))?;
         self.tick()?;
         Ok(boring)
@@ -622,14 +862,14 @@ impl Store {
     /// small one. The manifest isn't rewritten: a file's size is its boring
     /// file's length.
     pub fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> io::Result<()> {
-        let (blob, nonce) = self.file_blob(path)?;
-        self.write_blob(blob, &nonce, offset, data)
+        let (blob, crypt) = self.file_blob(path)?;
+        self.write_blob(blob, crypt, offset, data)
     }
 
     /// Set a file's length (shorter truncates, longer zero-extends).
     pub fn truncate(&mut self, path: &str, new_size: u64) -> io::Result<()> {
-        let (blob, nonce) = self.file_blob(path)?;
-        self.truncate_blob(blob, &nonce, new_size)
+        let (blob, crypt) = self.file_blob(path)?;
+        self.truncate_blob(blob, crypt, new_size)
     }
 
     /// Make everything written to `path` durable (an app's fsync /
@@ -661,10 +901,10 @@ impl Store {
     /// Open the file at `path`; returns an id for the `*_file` calls. Pair
     /// with [`release_file`](Self::release_file).
     pub fn open_file(&mut self, path: &str) -> io::Result<u64> {
-        let (blob, nonce) = self.file_blob(path)?;
+        let (blob, crypt) = self.file_blob(path)?;
         let id = self.next_id;
         self.next_id += 1;
-        self.open.insert(id, Opened { blob, nonce });
+        self.open.insert(id, Opened { blob, crypt });
         Ok(id)
     }
 
@@ -678,26 +918,26 @@ impl Store {
         }
     }
 
-    fn opened(&self, id: u64) -> io::Result<(PathBuf, Nonce)> {
+    fn opened(&self, id: u64) -> io::Result<(PathBuf, Crypt)> {
         self.open
             .get(&id)
-            .map(|o| (o.blob.clone(), o.nonce))
+            .map(|o| (o.blob.clone(), o.crypt))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file not open"))
     }
 
     pub fn read_file(&self, id: u64, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let o = self.open.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file not open"))?;
-        self.read_blob(&o.blob, &o.nonce, offset, len)
+        self.read_blob(&o.blob, &o.crypt, offset, len)
     }
 
     pub fn write_file(&mut self, id: u64, offset: u64, data: &[u8]) -> io::Result<()> {
-        let (blob, nonce) = self.opened(id)?;
-        self.write_blob(blob, &nonce, offset, data)
+        let (blob, crypt) = self.opened(id)?;
+        self.write_blob(blob, crypt, offset, data)
     }
 
     pub fn truncate_file(&mut self, id: u64, new_size: u64) -> io::Result<()> {
-        let (blob, nonce) = self.opened(id)?;
-        self.truncate_blob(blob, &nonce, new_size)
+        let (blob, crypt) = self.opened(id)?;
+        self.truncate_blob(blob, crypt, new_size)
     }
 
     pub fn flush_file(&mut self, id: u64) -> io::Result<()> {
@@ -724,28 +964,121 @@ impl Store {
 
     // ---- boring files ----------------------------------------------------
 
-    fn write_blob(&mut self, blob: PathBuf, nonce: &Nonce, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn write_blob(&mut self, blob: PathBuf, crypt: Crypt, offset: u64, data: &[u8]) -> io::Result<()> {
         let f = self.take_handle(&blob)?;
         let result = (|| {
-            let old = f.metadata()?.len();
-            let new = max(old, offset + data.len() as u64);
-            self.update_blob(&f, &blob, nonce, old, new, offset, data)
+            let old = data_len(&f)?;
+            let end = offset + data.len() as u64;
+            let new = max(old, end);
+            // Changing bytes in an encrypted end: a fresh nonce first.
+            let crypt = if offset < old && overlaps(&protected_ranges(old, self.region), offset, min(end, old)) {
+                self.renonce(&f, &blob, crypt, old)?
+            } else {
+                crypt
+            };
+            self.update_blob(&f, &blob, &crypt, old, new, offset, data)
         })();
         self.handles.insert(blob, f);
         result
     }
 
-    fn truncate_blob(&mut self, blob: PathBuf, nonce: &Nonce, new_size: u64) -> io::Result<()> {
+    fn truncate_blob(&mut self, blob: PathBuf, crypt: Crypt, new_size: u64) -> io::Result<()> {
         let f = self.take_handle(&blob)?;
         let result = (|| {
-            let old = f.metadata()?.len();
+            let old = data_len(&f)?;
             if new_size == old {
                 return Ok(());
             }
-            self.update_blob(&f, &blob, nonce, old, new_size, new_size, &[])
+            if new_size < old && new_size > 0 {
+                // Shortening brings bytes into the tail end: a fresh nonce first.
+                let crypt = self.renonce(&f, &blob, crypt, old)?;
+                return self.update_blob(&f, &blob, &crypt, old, new_size, new_size, &[]);
+            }
+            self.update_blob(&f, &blob, &crypt, old, new_size, new_size, &[])?;
+            if new_size == 0 {
+                // Nothing left under the old nonce: start the next contents
+                // under a new one.
+                self.renonce(&f, &blob, crypt, 0)?;
+            }
+            Ok(())
         })();
         self.handles.insert(blob, f);
         result
+    }
+
+    /// Give the file at `blob` (`len` bytes long, encrypted with `crypt`) a
+    /// new content nonce for this editing session, re-encrypting its ends,
+    /// unless it already has one. Returns the key and nonce to use from now on.
+    ///
+    /// Crash safety: the original ends and envelope are journaled first, the
+    /// file is synced before its list is saved with the new nonce, and the
+    /// journal goes last. After a crash the list says which nonce won: if
+    /// it's still the old one, the original bytes go back.
+    fn renonce(&mut self, f: &std::fs::File, blob: &Path, crypt: Crypt, len: u64) -> io::Result<Crypt> {
+        if self.renonced.contains(blob) {
+            return Ok(crypt);
+        }
+        let (dir, boring) = split_blob(blob)?;
+        let entry = self.dirs.load(&dir, &self.key)?.children().iter().find(|c| c.boring == boring).cloned();
+        let Some(mut entry) = entry else {
+            return Ok(crypt); // not listed (being moved): leave it be
+        };
+        let (key, old_nonce) = crypt;
+        let nonce = envelope::new_nonce();
+        let mut ranges = Vec::new();
+        for (s, e) in protected_ranges(len, self.region) {
+            let mut buf = vec![0u8; (e - s) as usize];
+            read_exact_at(f, &mut buf, s)?;
+            ranges.push((s, buf));
+        }
+        let old_env = self.envelope_of(f, blob, len)?;
+        ranges.push((len, old_env.to_vec()));
+        let journaled = len > 0;
+        if journaled {
+            self.write_journal(&Journal::Renonce {
+                dir: self.rel(&dir),
+                boring: boring.clone(),
+                nonce,
+                len: len + ENVELOPE,
+                ranges: ranges.clone(),
+            })?;
+        }
+        for (s, mut buf) in ranges.into_iter().take_while(|(s, _)| *s < len) {
+            transform_region(&key, &old_nonce, s, &mut buf);
+            transform_region(&key, &nonce, s, &mut buf);
+            write_all_at(f, &buf, s)?;
+        }
+        entry.nonce = nonce;
+        let env = entry.envelope().seal(&self.key);
+        write_all_at(f, &env, len)?;
+        self.envelopes.insert(blob.to_path_buf(), env);
+        f.sync_data()?;
+        self.dirs.edit(&dir, &self.key, |d| {
+            if let Some(p) = d.position_of_boring(&boring) {
+                d.child_mut(p).nonce = nonce;
+            }
+        })?;
+        self.dirs.flush_dir(&dir, &self.key)?;
+        if journaled {
+            self.clear_journal()?;
+        }
+        for o in self.open.values_mut().filter(|o| o.blob == blob) {
+            o.crypt = (key, nonce);
+        }
+        self.renonced.insert(blob.to_path_buf());
+        Ok((key, nonce))
+    }
+
+    /// The envelope of the file at `blob` whose data is `len` bytes, from the
+    /// cache or the disk.
+    fn envelope_of(&mut self, f: &std::fs::File, blob: &Path, len: u64) -> io::Result<[u8; ENVELOPE as usize]> {
+        if let Some(e) = self.envelopes.get(blob) {
+            return Ok(*e);
+        }
+        let mut e = [0u8; ENVELOPE as usize];
+        read_exact_at(f, &mut e, len)?;
+        self.envelopes.insert(blob.to_path_buf(), e);
+        Ok(e)
     }
 
     fn flush_blob(&mut self, blob: &Path) -> io::Result<()> {
@@ -761,6 +1094,8 @@ impl Store {
     fn close_blob(&mut self, blob: &Path) {
         self.durable_len.remove(blob);
         self.handles.remove(blob);
+        self.envelopes.remove(blob);
+        self.renonced.remove(blob);
         readers_mut(&mut self.readers).remove(blob);
     }
 
@@ -776,8 +1111,8 @@ impl Store {
         std::fs::OpenOptions::new().read(true).write(true).open(blob)
     }
 
-    /// The boring file and nonce behind a file path.
-    fn file_blob(&self, path: &str) -> io::Result<(PathBuf, Nonce)> {
+    /// The boring file, key and nonce behind a file path.
+    fn file_blob(&self, path: &str) -> io::Result<(PathBuf, Crypt)> {
         let (parent, name) = parent_and_name(path)?;
         let parent_disk = self.resolve_dir(&parent)?;
         let manifest = self.dirs.load(&parent_disk, &self.key)?;
@@ -785,10 +1120,11 @@ impl Store {
         if child.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
         }
-        Ok((parent_disk.join(&child.boring), child.nonce))
+        Ok((parent_disk.join(&child.boring), child.crypt()))
     }
 
-    /// Take blob `f` (at `blob`) from `old` to `new` bytes and write `data` at `offset`
+    /// Take blob `f` (at `blob`) from `old` to `new` bytes of data (its envelope
+    /// follows them) and write `data` at `offset`
     /// (`offset + data.len() <= new`), leaving it exactly as if the whole
     /// plaintext had been re-encrypted at the new size.
     ///
@@ -811,7 +1147,7 @@ impl Store {
         &mut self,
         f: &std::fs::File,
         blob: &Path,
-        nonce: &Nonce,
+        crypt: &Crypt,
         old: u64,
         new: u64,
         offset: u64,
@@ -819,6 +1155,8 @@ impl Store {
     ) -> io::Result<()> {
         let end = offset + data.len() as u64;
         let n = self.region;
+        let (key, nonce) = (&crypt.0, &crypt.1);
+        let env = if new != old { Some(self.envelope_of(f, blob, old)?) } else { None };
 
         let kept = min(old, new);
         let toggles = subtract(&toggled(old, new, n, kept), offset, end);
@@ -831,12 +1169,14 @@ impl Store {
                 read_exact_at(f, &mut buf, s)?;
                 ranges.push((s, buf));
             }
-            self.write_journal(&Journal::Undo { blob: self.rel(blob), len: old, ranges })?;
+            if let Some(env) = env {
+                ranges.push((old, env.to_vec()));
+            }
+            self.write_journal(&Journal::Undo { blob: self.rel(blob), len: old + ENVELOPE, ranges })?;
         }
         if new < durable {
             self.durable_len.insert(blob.to_path_buf(), new);
         }
-        let key = &self.key;
 
         // 1. Kept bytes whose encrypted/plain state flips (skipping what `data`
         //    is about to overwrite).
@@ -848,11 +1188,15 @@ impl Store {
         }
 
         // 2. Resize. Added bytes read as zeros, which is right outside the ends;
-        //    inside one they must hold the keystream.
+        //    inside one they must hold the keystream. Where the envelope was
+        //    is cleared first.
         if new != old {
-            f.set_len(new)?;
+            f.set_len(new + ENVELOPE)?;
         }
         if new > old {
+            for (s, e) in subtract(&[(old, min(old + ENVELOPE, new))], offset, end) {
+                write_all_at(f, &vec![0u8; (e - s) as usize], s)?;
+            }
             let added = clip(&protected_ranges(new, n), old, new);
             for (s, e) in subtract(&added, offset, end) {
                 let mut buf = vec![0u8; (e - s) as usize];
@@ -861,14 +1205,24 @@ impl Store {
             }
         }
 
-        // 3. The data itself.
+        // 3. The data itself, and the envelope at the new end (in the same
+        //    write when the data reaches it, as when appending).
+        let mut env = env;
         if !data.is_empty() {
             let mut buf = data.to_vec();
             for (s, e) in clip(&protected_ranges(new, n), offset, end) {
                 let (ls, le) = ((s - offset) as usize, (e - offset) as usize);
                 transform_region(key, nonce, s, &mut buf[ls..le]);
             }
+            if end == new {
+                if let Some(e) = env.take() {
+                    buf.extend_from_slice(&e);
+                }
+            }
             write_all_at(f, &buf, offset)?;
+        }
+        if let Some(e) = env {
+            write_all_at(f, &e, new)?;
         }
         if journaled {
             f.sync_data()?;
@@ -980,8 +1334,11 @@ impl Store {
                     d.remove(p);
                 }
                 let p = d.position_of_boring(&from_boring).expect("found above");
-                d.rename(p, new_name);
+                d.rename(p, new_name.clone());
             })?;
+            if moving_dir {
+                self.name_folder(&old_parent_disk.join(&from_boring), &new_name)?;
+            }
             if let Some(r) = replaced {
                 self.doomed.push((old_parent_disk, r));
             }
@@ -993,17 +1350,28 @@ impl Store {
         let new_manifest = self.dirs.load(&new_parent_disk, &self.key)?;
         child.boring = generate_unique(&mut rand::thread_rng(), &Taken { dir: &new_manifest, at: &new_parent_disk });
         drop(new_manifest);
-        child.real = new_name;
+        child.real = new_name.clone();
         if let Ok(blob) = self.disk_path(old) {
             self.durable_len.remove(&blob);
         }
+        let moved_to = new_parent_disk.join(&child.boring);
         self.run(Journal::Move {
             from_dir: self.rel(&old_parent_disk),
             from_boring,
             to_dir: self.rel(&new_parent_disk),
             child,
             replaced,
-        })
+        })?;
+        if moving_dir {
+            self.name_folder(&moved_to, &new_name)?;
+        }
+        Ok(())
+    }
+
+    /// Record a folder's real name in its own list (saved with the others).
+    fn name_folder(&mut self, disk: &Path, name: &str) -> io::Result<()> {
+        self.dirs.edit(disk, &self.key, |d| d.set_name(Some(name.to_string())))?;
+        self.tick()
     }
 
     // ---- reads -----------------------------------------------------------
@@ -1017,10 +1385,10 @@ impl Store {
         if child.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
         }
-        self.read_blob(&parent_disk.join(&child.boring), &child.nonce, offset, len)
+        self.read_blob(&parent_disk.join(&child.boring), &child.crypt(), offset, len)
     }
 
-    fn read_blob(&self, blob: &Path, nonce: &Nonce, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    fn read_blob(&self, blob: &Path, crypt: &Crypt, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         // The handle the file is being written through if there is one:
         // opening a just-written file again waits for the antivirus scan, and
         // with Windows caching, every new file's first page is read back.
@@ -1043,7 +1411,7 @@ impl Store {
                 &reader
             }
         };
-        let size = file.metadata()?.len();
+        let size = data_len(file)?;
         if offset >= size {
             return Ok(Vec::new());
         }
@@ -1057,7 +1425,7 @@ impl Store {
             if o_start < o_end {
                 let ls = (o_start - offset) as usize;
                 let le = (o_end - offset) as usize;
-                transform_region(&self.key, nonce, o_start, &mut buf[ls..le]);
+                transform_region(&crypt.0, &crypt.1, o_start, &mut buf[ls..le]);
             }
         }
         Ok(buf)
@@ -1091,7 +1459,7 @@ impl Store {
     }
 
     fn write_journal(&self, j: &Journal) -> io::Result<()> {
-        let sealed = manifest::seal(serde_json::to_vec(j)?, &self.key);
+        let sealed = crypto::seal(&self.key, JOURNAL_LABEL, &serde_json::to_vec(j)?);
         durable::write_synced(&self.backing_dir.join(JOURNAL), &sealed)?;
         durable::sync_dir(&self.backing_dir)
     }
@@ -1107,6 +1475,7 @@ impl Store {
     fn run(&mut self, j: Journal) -> io::Result<()> {
         self.sync()?;
         self.handles.clear();
+        self.envelopes.clear();
         readers_mut(&mut self.readers).clear();
         self.write_journal(&j)?;
         self.apply(&j)?;
@@ -1160,6 +1529,7 @@ impl Store {
         for (d, b) in &doomed {
             let gone = d.join(b);
             self.handles.retain(|p, _| !p.starts_with(&gone));
+            self.envelopes.retain(|p, _| !p.starts_with(&gone));
             readers_mut(&mut self.readers).retain(|p, _| !p.starts_with(&gone));
             self.durable_len.retain(|p, _| !p.starts_with(&gone));
         }
@@ -1175,7 +1545,8 @@ impl Store {
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(());
         };
-        if let Ok(j) = serde_json::from_slice::<Journal>(&manifest::unseal(bytes, &self.key)) {
+        let opened = crypto::open(&self.key, JOURNAL_LABEL, &bytes);
+        if let Some(j) = opened.ok().and_then(|b| serde_json::from_slice::<Journal>(&b).ok()) {
             self.apply(&j)?;
         }
         self.clear_journal()
@@ -1229,17 +1600,16 @@ impl Store {
                 durable::sync_dir(&to_dir)?;
                 durable::sync_dir(&from_dir)
             }
-            Journal::Undo { blob, len, ranges } => {
-                let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(self.abs(blob)) else {
-                    return Ok(()); // deleted since; nothing to restore
-                };
-                f.set_len(max(*len, ranges.iter().map(|(s, b)| s + b.len() as u64).max().unwrap_or(0)))?;
-                for (s, bytes) in ranges {
-                    f.seek(SeekFrom::Start(*s))?;
-                    f.write_all(bytes)?;
+            Journal::Undo { blob, len, ranges } => restore(&self.abs(blob), *len, ranges),
+            Journal::Renonce { dir, boring, nonce, len, ranges } => {
+                let dir = self.abs(dir);
+                let done = dir.is_dir()
+                    && self.dirs.load(&dir, &self.key)?.children().iter().any(|c| c.boring == *boring && c.nonce == *nonce);
+                if done {
+                    Ok(())
+                } else {
+                    restore(&dir.join(boring), *len, ranges)
                 }
-                f.set_len(*len)?;
-                f.sync_data()
             }
         }
     }
@@ -1315,6 +1685,63 @@ fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
         }
         Ok(())
     }
+}
+
+/// The name given to a folder found without one.
+const RECOVERED: &str = "Recovered folder";
+
+/// A mutex's contents, even if a thread panicked while holding it.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every entry of a disk folder with its metadata, from one scan (on
+/// Windows the scan returns the metadata, with no call per entry). `None` if
+/// the folder can't be read.
+fn scan(folder: &Path) -> Option<HashMap<OsString, std::fs::Metadata>> {
+    let rd = std::fs::read_dir(folder).ok()?;
+    let mut found = HashMap::new();
+    for e in rd.flatten() {
+        if let Ok(m) = e.metadata() {
+            found.insert(e.file_name(), m);
+        }
+    }
+    Some(found)
+}
+
+/// Put `ranges` back into the file at `path` and make it `len` bytes long
+/// (undoing a change that was journaled with them).
+fn restore(path: &Path, len: u64, ranges: &[(u64, Vec<u8>)]) -> io::Result<()> {
+    let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) else {
+        return Ok(()); // deleted since; nothing to restore
+    };
+    f.set_len(max(len, ranges.iter().map(|(s, b)| s + b.len() as u64).max().unwrap_or(0)))?;
+    for (s, bytes) in ranges {
+        f.seek(SeekFrom::Start(*s))?;
+        f.write_all(bytes)?;
+    }
+    f.set_len(len)?;
+    f.sync_data()
+}
+
+/// A file's data length: its length on disk less its envelope.
+fn data_len(f: &std::fs::File) -> io::Result<u64> {
+    let len = f.metadata()?.len();
+    len.checked_sub(ENVELOPE)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a file in the drive is damaged (too short)"))
+}
+
+/// A boring file's folder and name.
+fn split_blob(blob: &Path) -> io::Result<(PathBuf, String)> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, "not a file in the drive");
+    let dir = blob.parent().ok_or_else(bad)?.to_path_buf();
+    let name = blob.file_name().and_then(|n| n.to_str()).ok_or_else(bad)?.to_string();
+    Ok((dir, name))
+}
+
+/// Does `[lo, hi)` meet any of `ranges`?
+fn overlaps(ranges: &[(u64, u64)], lo: u64, hi: u64) -> bool {
+    ranges.iter().any(|&(s, e)| s < hi && lo < e)
 }
 
 /// Delete a boring file or directory if it's there.
@@ -1545,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn password_settings_are_recorded_and_old_drives_still_open() {
+    fn password_settings_are_recorded_and_old_formats_refused() {
         let d = tempdir().unwrap();
         {
             let mut s = Store::create_with_passphrase(d.path(), "right", 64).unwrap();
@@ -1560,12 +1987,17 @@ mod tests {
             key::KdfParams::CURRENT
         );
 
-        // A drive from before the settings were recorded has none: it opens
-        // with the original ones.
-        meta.as_object_mut().unwrap().remove("kdf");
-        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
         let s = Store::open_with_passphrase(d.path(), "right").unwrap();
         assert_eq!(s.read_all("note.txt").unwrap(), b"kept");
+        drop(s);
+
+        // A drive from an earlier format is refused, saying why.
+        let mut old = meta.clone();
+        old["version"] = serde_json::json!(1);
+        std::fs::write(&meta_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let err = Store::open_with_passphrase(d.path(), "right").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("earlier test version"), "{err}");
 
         // Settings out of range are refused rather than tried.
         meta["kdf"] = serde_json::json!({ "m_cost": u32::MAX, "t_cost": 2, "p_cost": 1 });
@@ -1716,15 +2148,19 @@ mod tests {
     }
 
     /// The blob on disk must be byte-for-byte what encrypting the ends of the
-    /// whole plaintext would give, after any mix of writes and resizes.
+    /// whole plaintext with the file's key would give, followed by an
+    /// envelope that describes it, after any mix of writes and resizes.
     fn assert_disk_matches(s: &Store, name: &str, plain: &[u8]) {
         assert_eq!(s.read_all(name).unwrap(), plain, "read back differs");
         let manifest = s.dirs.load(&s.backing_dir, &s.key).unwrap();
         let child = manifest.find(name).unwrap();
         let mut want = plain.to_vec();
-        crate::crypto::transform_ends(&s.key, &child.nonce, &mut want, s.region);
+        crate::crypto::transform_ends(&child.key, &child.nonce, &mut want, s.region);
         let disk = std::fs::read(s.backing_dir.join(&child.boring)).unwrap();
-        assert!(disk == want, "disk form differs at size {}", plain.len());
+        assert_eq!(disk.len(), want.len() + ENVELOPE as usize, "length at size {}", plain.len());
+        assert!(disk[..want.len()] == want, "disk form differs at size {}", plain.len());
+        let env = Envelope::open(&s.key, &disk[want.len()..]).expect("an envelope this drive opens");
+        assert_eq!((env.id, env.key, env.nonce), (child.id, child.key, child.nonce));
     }
 
     #[test]
@@ -1886,7 +2322,10 @@ mod tests {
         let s = reopen(s);
         let mut names: Vec<String> = s.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
         names.sort();
-        assert_eq!(names, ["doomed.txt", "old.txt"], "back to the last save, consistently");
+        // Back to the last save, consistently, except that the file created
+        // just before the crash is still on disk with its envelope, so it's
+        // found and taken back in.
+        assert_eq!(names, ["doomed.txt", "fresh.txt", "old.txt"]);
         assert!(d.path().join(&boring).exists(), "an unsaved delete deletes nothing");
         assert_eq!(s.read_all("old.txt").unwrap(), b"kept");
     }
@@ -1955,8 +2394,12 @@ mod tests {
         // The append toggles the old tail; pretend the crash came right after,
         // with the journal still holding the original bytes.
         s.write_at("db", 1000, &[7u8; 500]).unwrap();
-        s.write_journal(&Journal::Undo { blob: s.rel(&blob), len: 1000, ranges: vec![(0, before.clone())] })
-            .unwrap();
+        s.write_journal(&Journal::Undo {
+            blob: s.rel(&blob),
+            len: 1000 + ENVELOPE,
+            ranges: vec![(0, before.clone())],
+        })
+        .unwrap();
         let s = reopen(s);
         assert_eq!(s.read_all("db").unwrap(), original);
         assert_eq!(std::fs::read(&blob).unwrap(), before);
@@ -2092,5 +2535,256 @@ mod tests {
                 });
             }
         });
+    }
+
+    // ---- format 2: keys, nonces, envelopes, strays -----------------------
+
+    fn entry(s: &Store, folder: &Path, name: &str) -> Child {
+        s.dirs.load(folder, &s.key).unwrap().find(name).unwrap().clone()
+    }
+
+    #[test]
+    fn each_file_has_its_own_key_and_an_envelope() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        for name in ["a.txt", "b.txt"] {
+            s.create(name).unwrap();
+            s.write_at(name, 0, b"same contents").unwrap();
+        }
+        let (a, b) = (entry(&s, d.path(), "a.txt"), entry(&s, d.path(), "b.txt"));
+        assert_ne!(a.key, b.key);
+        assert_ne!(a.key, s.key, "file keys aren't the master key");
+        let (ra, rb) = (std::fs::read(d.path().join(&a.boring)).unwrap(), std::fs::read(d.path().join(&b.boring)).unwrap());
+        assert_ne!(ra[..13], rb[..13], "same contents, different ciphertext");
+        let env = Envelope::read(&d.path().join(&a.boring), &s.key).unwrap();
+        assert_eq!(env.name, "a.txt");
+        assert_eq!(s.metadata("a.txt").unwrap().unwrap().size, 13, "the envelope isn't counted");
+    }
+
+    #[test]
+    fn wrong_password_and_changing_it() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "first", 128).unwrap();
+            s.create("note.txt").unwrap();
+            s.write_at("note.txt", 0, b"kept").unwrap();
+        }
+        let wrong = Store::open_with_passphrase(d.path(), "nope").err().unwrap();
+        assert_eq!(wrong.kind(), io::ErrorKind::PermissionDenied);
+
+        change_password(d.path(), "first", "second").unwrap();
+        assert!(Store::open_with_passphrase(d.path(), "first").is_err());
+        let s = Store::open_with_passphrase(d.path(), "second").unwrap();
+        assert_eq!(s.read_all("note.txt").unwrap(), b"kept", "files untouched");
+        assert!(change_password(d.path(), "first", "x").is_err());
+    }
+
+    #[test]
+    fn an_edit_gets_a_fresh_nonce_and_appending_does_not() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("f").unwrap();
+        let mut plain: Vec<u8> = (0..1000u32).map(|i| (i * 3) as u8).collect();
+        s.write_at("f", 0, &plain).unwrap();
+        s.close("f");
+        let n0 = entry(&s, d.path(), "f").nonce;
+
+        // Appending, in a new session: same nonce.
+        s.write_at("f", 1000, b"more").unwrap();
+        plain.extend_from_slice(b"more");
+        assert_eq!(entry(&s, d.path(), "f").nonce, n0);
+        assert_disk_matches(&s, "f", &plain);
+        // Writing only the middle: same nonce.
+        s.write_at("f", 500, b"mid").unwrap();
+        plain[500..503].copy_from_slice(b"mid");
+        assert_eq!(entry(&s, d.path(), "f").nonce, n0);
+        s.close("f");
+
+        // Changing a byte in an encrypted end: a new nonce, once per session.
+        s.write_at("f", 3, b"X").unwrap();
+        plain[3] = b'X';
+        let n1 = entry(&s, d.path(), "f").nonce;
+        assert_ne!(n1, n0);
+        s.write_at("f", 4, b"Y").unwrap();
+        plain[4] = b'Y';
+        assert_eq!(entry(&s, d.path(), "f").nonce, n1, "one per session");
+        assert_disk_matches(&s, "f", &plain);
+        s.close("f");
+
+        // Shortening: a new nonce. Emptying: a new one for what comes next.
+        s.truncate("f", 900).unwrap();
+        plain.truncate(900);
+        let n2 = entry(&s, d.path(), "f").nonce;
+        assert_ne!(n2, n1);
+        assert_disk_matches(&s, "f", &plain);
+        s.close("f");
+        s.truncate("f", 0).unwrap();
+        assert_ne!(entry(&s, d.path(), "f").nonce, n2);
+        s.write_at("f", 0, b"new contents").unwrap();
+        assert_disk_matches(&s, "f", b"new contents");
+
+        let s = reopen(s);
+        assert_eq!(s.read_all("f").unwrap(), b"new contents");
+    }
+
+    #[test]
+    fn a_crash_mid_renonce_puts_the_file_back() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("f").unwrap();
+        let plain: Vec<u8> = (0..700u32).map(|i| i as u8).collect();
+        s.write_at("f", 0, &plain).unwrap();
+        s.sync().unwrap();
+        s.close("f");
+        let c = entry(&s, d.path(), "f");
+        let blob = d.path().join(&c.boring);
+        let before = std::fs::read(&blob).unwrap();
+
+        // The ends half re-encrypted, the list not yet saved: as a crash
+        // would leave it, with the journal holding the original bytes.
+        let mut torn = before.clone();
+        for b in &mut torn[..64] {
+            *b ^= 0x5a;
+        }
+        std::fs::write(&blob, &torn).unwrap();
+        s.write_journal(&Journal::Renonce {
+            dir: String::new(),
+            boring: c.boring.clone(),
+            nonce: envelope::new_nonce(),
+            len: before.len() as u64,
+            ranges: vec![(0, before.clone())],
+        })
+        .unwrap();
+        let s = reopen(s);
+        assert_eq!(std::fs::read(&blob).unwrap(), before);
+        assert_eq!(s.read_all("f").unwrap(), plain);
+    }
+
+    #[test]
+    fn a_file_moved_by_hand_within_the_drive_is_found() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("A").unwrap();
+        s.mkdir("B").unwrap();
+        s.create("A/report.pdf").unwrap();
+        s.write_at("A/report.pdf", 0, b"quarterly numbers").unwrap();
+        s.sync().unwrap();
+        let (a, b) = (entry(&s, d.path(), "A"), entry(&s, d.path(), "B"));
+        let file = entry(&s, &d.path().join(&a.boring), "report.pdf");
+
+        std::fs::rename(d.path().join(&a.boring).join(&file.boring), d.path().join(&b.boring).join(&file.boring))
+            .unwrap();
+        let in_b: Vec<String> = s.list_dir("B").unwrap().into_iter().map(|e| e.0).collect();
+        assert_eq!(in_b, ["report.pdf"]);
+        assert!(s.list_dir("A").unwrap().is_empty(), "gone from where it was");
+        assert_eq!(s.read_all("B/report.pdf").unwrap(), b"quarterly numbers");
+        assert_eq!(s.foreign_count(), 0);
+
+        // The lists' changes are saved like any other.
+        s.sync().unwrap();
+        let s = reopen(s);
+        assert_eq!(s.read_all("B/report.pdf").unwrap(), b"quarterly numbers");
+    }
+
+    #[test]
+    fn a_lost_list_is_rebuilt_from_what_is_on_disk() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("Photos").unwrap();
+        s.create("Photos/beach.jpg").unwrap();
+        s.write_at("Photos/beach.jpg", 0, b"sand").unwrap();
+        s.create("notes.txt").unwrap();
+        s.write_at("notes.txt", 0, b"hello").unwrap();
+        s.rename_path("Photos", "Holiday").unwrap();
+        s.sync().unwrap();
+        drop(s);
+        std::fs::remove_file(d.path().join(manifest::MANIFEST_NAME)).unwrap();
+
+        let s = Store::open(d.path(), [9u8; 32], 128).unwrap();
+        let mut top: Vec<String> = s.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
+        top.sort();
+        assert_eq!(top, ["Holiday", "notes.txt"], "the folder kept its own name");
+        assert_eq!(s.read_all("Holiday/beach.jpg").unwrap(), b"sand");
+        assert_eq!(s.read_all("notes.txt").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn names_in_envelopes_catch_up_lazily() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("draft.txt").unwrap();
+        s.write_at("draft.txt", 0, b"words").unwrap();
+        s.close("draft.txt");
+        s.rename_path("draft.txt", "final.txt").unwrap();
+        let blob = d.path().join(entry(&s, d.path(), "final.txt").boring);
+        assert_eq!(Envelope::read(&blob, &s.key).unwrap().name, "draft.txt", "a rename touches only the list");
+        s.write_at("final.txt", 0, b"W").unwrap(); // an edit rewrites the envelope
+        assert_eq!(Envelope::read(&blob, &s.key).unwrap().name, "final.txt");
+    }
+
+    /// A second drive in `dir`, with its own key.
+    fn other_store(dir: &Path) -> Store {
+        Store::open(dir, [8u8; 32], 128).unwrap()
+    }
+
+    #[test]
+    fn files_from_another_drive_wait_until_brought_in() {
+        let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut one = other_store(d1.path());
+        one.mkdir("Album").unwrap();
+        one.create("Album/song.mp3").unwrap();
+        one.write_at("Album/song.mp3", 0, &[3u8; 3000]).unwrap();
+        one.create("a.doc").unwrap();
+        one.write_at("a.doc", 0, b"letter").unwrap();
+        one.sync().unwrap();
+        let (album, doc) = (entry(&one, d1.path(), "Album"), entry(&one, d1.path(), "a.doc"));
+        drop(one);
+
+        // Both drives locked; the hidden file and folder moved by hand.
+        let mut two = store(d2.path());
+        two.create("mine.txt").unwrap();
+        two.sync().unwrap();
+        std::fs::rename(d1.path().join(&doc.boring), d2.path().join(&doc.boring)).unwrap();
+        std::fs::rename(d1.path().join(&album.boring), d2.path().join(&album.boring)).unwrap();
+
+        let names = |s: &Store| -> Vec<String> {
+            let mut v: Vec<String> = s.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&two), ["mine.txt"], "not shown, not deleted");
+        assert_eq!(two.foreign_count(), 2);
+        assert!(d2.path().join(&doc.boring).exists());
+
+        // The wrong drive's key brings nothing in.
+        assert_eq!(two.adopt_from(&[1u8; 32]).unwrap(), (0, 2));
+        assert_eq!(two.adopt_from(&[8u8; 32]).unwrap(), (2, 0));
+        assert_eq!(names(&two), ["Album", "a.doc", "mine.txt"]);
+        assert_eq!(two.read_all("a.doc").unwrap(), b"letter");
+        assert_eq!(two.read_all("Album/song.mp3").unwrap(), vec![3u8; 3000]);
+        assert_eq!(two.foreign_count(), 0);
+
+        // They're this drive's now, through and through.
+        let two = reopen(two);
+        assert_eq!(two.read_all("Album/song.mp3").unwrap(), vec![3u8; 3000]);
+        assert!(Envelope::read(&d2.path().join(&doc.boring), &[9u8; 32]).is_ok());
+        let one = other_store(d1.path());
+        assert!(one.list_dir("").unwrap().is_empty(), "and gone from the first drive's list");
+    }
+
+    #[test]
+    fn a_changed_list_is_refused() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("x").unwrap();
+        s.sync().unwrap();
+        drop(s);
+        let path = d.path().join(manifest::MANIFEST_NAME);
+        let mut raw = std::fs::read(&path).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 1;
+        std::fs::write(&path, raw).unwrap();
+        let s = Store::open(d.path(), [9u8; 32], 128).unwrap();
+        assert_eq!(s.list_dir("").err().map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
     }
 }

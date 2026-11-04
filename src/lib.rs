@@ -31,6 +31,7 @@ pub mod convert;
 pub mod crypto;
 pub mod dircache;
 pub mod durable;
+pub mod envelope;
 pub mod engine;
 pub mod inodes;
 pub mod key;

@@ -159,6 +159,8 @@ fn read_stamped(path: &Path) -> io::Result<Option<(Stamp, Vec<u8>)>> {
 /// A directory's list as read from disk.
 pub struct Listing {
     pub children: Vec<Child>,
+    /// The folder's own real name, if it records one.
+    pub name: Option<String>,
     /// 0 for a list kept in one file.
     pub parts: usize,
     tags: Vec<u64>,
@@ -170,10 +172,18 @@ pub struct Listing {
 /// empty.
 pub fn read_listing(dir: &Path, key: &Key) -> io::Result<Listing> {
     let Some((stamp, bytes)) = read_stamped(&Manifest::path_in(dir))? else {
-        return Ok(Listing { children: Vec::new(), parts: 0, tags: Vec::new(), stamps: vec![None], settled: true });
+        return Ok(Listing {
+            children: Vec::new(),
+            name: None,
+            parts: 0,
+            tags: Vec::new(),
+            stamps: vec![None],
+            settled: true,
+        });
     };
     let header = Manifest::from_sealed(bytes, key)?;
     let parts = header.parts.len();
+    let name = header.name;
     let mut children = header.children;
     let mut stamps = vec![Some(stamp)];
     let mut settled = true;
@@ -195,13 +205,15 @@ pub fn read_listing(dir: &Path, key: &Key) -> io::Result<Listing> {
     if settled {
         stamps.truncate(1);
     }
-    Ok(Listing { children, parts, tags: header.parts, stamps, settled })
+    Ok(Listing { children, name, parts, tags: header.parts, stamps, settled })
 }
 
 /// The serialized form of a list or part (the same JSON as [`Manifest`]).
 #[derive(Serialize)]
 struct Out<'a> {
     children: Vec<&'a Child>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     parts: Vec<u64>,
     #[serde(skip_serializing_if = "is_zero")]
@@ -222,13 +234,14 @@ fn write_sealed(path: &Path, key: &Key, out: &Out) -> io::Result<()> {
 pub fn write_listing(
     dir: &Path,
     key: &Key,
+    name: Option<&str>,
     children: &[Child],
     parts: usize,
     tags: &mut Vec<u64>,
     touched: Option<&HashSet<usize>>,
 ) -> io::Result<()> {
     if parts == 0 {
-        let out = Out { children: children.iter().collect(), parts: Vec::new(), tag: 0 };
+        let out = Out { children: children.iter().collect(), name, parts: Vec::new(), tag: 0 };
         return write_sealed(&Manifest::path_in(dir), key, &out);
     }
     let mut groups: Vec<Vec<&Child>> = vec![Vec::new(); parts];
@@ -241,16 +254,18 @@ pub fn write_listing(
             continue;
         }
         let tag = rand::thread_rng().next_u64() | 1;
-        write_sealed(&dir.join(part_name(i)), key, &Out { children: group, parts: Vec::new(), tag })?;
+        write_sealed(&dir.join(part_name(i)), key, &Out { children: group, name: None, parts: Vec::new(), tag })?;
         tags[i] = tag;
     }
-    write_sealed(&Manifest::path_in(dir), key, &Out { children: Vec::new(), parts: tags.clone(), tag: 0 })
+    write_sealed(&Manifest::path_in(dir), key, &Out { children: Vec::new(), name, parts: tags.clone(), tag: 0 })
 }
 
 /// A directory's list in memory, indexed by real and by boring name.
 #[derive(Clone, Default)]
 pub struct Dir {
     children: Vec<Child>,
+    /// The folder's own real name.
+    name: Option<String>,
     /// [`names::fold`] of each real name -> position.
     by_name: HashMap<String, usize>,
     by_boring: HashMap<String, usize>,
@@ -262,8 +277,8 @@ pub struct Dir {
 }
 
 impl Dir {
-    fn new(children: Vec<Child>, parts: usize, tags: Vec<u64>) -> Dir {
-        let mut d = Dir { parts, tags, ..Dir::default() };
+    fn new(children: Vec<Child>, name: Option<String>, parts: usize, tags: Vec<u64>) -> Dir {
+        let mut d = Dir { name, parts, tags, ..Dir::default() };
         for c in children {
             d.index(c);
         }
@@ -290,6 +305,26 @@ impl Dir {
 
     pub fn children(&self) -> &[Child] {
         &self.children
+    }
+
+    /// The folder's own real name, if recorded.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Record the folder's own real name (it lives in the main list file).
+    pub fn set_name(&mut self, name: Option<String>) {
+        if self.name != name {
+            self.name = name;
+            self.touched.insert(0);
+        }
+    }
+
+    /// The child at `pos`, to change in place (not its names).
+    pub fn child_mut(&mut self, pos: usize) -> &mut Child {
+        let boring = self.children[pos].boring.clone();
+        self.touch(&boring);
+        &mut self.children[pos]
     }
 
     /// Same answer as [`Manifest::position`], without scanning every name.
@@ -360,7 +395,7 @@ impl Entry {
             stamps: l.stamps,
             checked: Instant::now(),
             settled: l.settled,
-            dir: Arc::new(Dir::new(l.children, l.parts, l.tags)),
+            dir: Arc::new(Dir::new(l.children, l.name, l.parts, l.tags)),
             dirty: None,
         }
     }
@@ -451,7 +486,7 @@ impl DirCache {
             d.tags = vec![0; PARTS];
         }
         let only = (!d.tags.iter().all(|&t| t == 0)).then_some(&touched);
-        if let Err(err) = write_listing(dir, key, &d.children, d.parts, &mut d.tags, only) {
+        if let Err(err) = write_listing(dir, key, d.name.as_deref(), &d.children, d.parts, &mut d.tags, only) {
             d.touched = touched;
             return Err(err);
         }
@@ -488,12 +523,13 @@ impl DirCache {
         // Changed on disk while we hold unsaved edits: merge, and save every
         // part of the result.
         let merged = manifest::merge3(&base.children, &e.dir.children, &theirs.children);
-        let mut ours = Dir::new(merged, theirs.parts, theirs.tags.clone());
+        let name = e.dir.name.clone().or(theirs.name.clone());
+        let mut ours = Dir::new(merged, name, theirs.parts, theirs.tags.clone());
         ours.touched = (0..ours.parts).collect();
         e.stamps = theirs.stamps.clone();
         e.settled = theirs.settled;
         e.dir = Arc::new(ours);
-        e.dirty = Some((since, Arc::new(Dir::new(theirs.children, theirs.parts, theirs.tags))));
+        e.dirty = Some((since, Arc::new(Dir::new(theirs.children, theirs.name, theirs.parts, theirs.tags))));
         Ok(())
     }
 }
@@ -502,11 +538,12 @@ impl DirCache {
 mod tests {
     use super::*;
     use crate::crypto::NONCE_LEN;
-    use crate::manifest::Kind;
     use tempfile::tempdir;
 
     fn child(real: &str, boring: &str) -> Child {
-        Child { real: real.into(), boring: boring.into(), kind: Kind::File, nonce: [0; NONCE_LEN], size: 0 }
+        let mut c = Child::new_file(real.into(), boring.into(), 0);
+        (c.id, c.key, c.nonce) = ([0; 16], [0; 32], [0; NONCE_LEN]);
+        c
     }
 
     fn names_in(d: &Dir) -> Vec<String> {

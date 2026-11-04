@@ -2,10 +2,12 @@
 //!
 //! A drive's folder is a mirror of its tree with boring names, whose files
 //! hold their original bytes apart from the first and last `region` bytes
-//! (see `crypto`). So a plain folder becomes a drive without copying: write
-//! `meta.json`, then in every folder write its list and, for each file,
-//! encrypt its ends where it lies and rename it to its boring name. Each file
-//! costs at most `2 * region` bytes of reading and writing, whatever its size.
+//! (see `docs/FORMAT.md`) and a 512-byte envelope at the end. So a plain
+//! folder becomes a drive without copying: write `meta.json`, then in every
+//! folder write its list (with the folder's own name) and, for each file,
+//! encrypt its ends with a new key of its own where it lies, add its
+//! envelope, and rename it to its boring name. Each file costs at most
+//! `2 * region` bytes of reading and writing, whatever its size.
 //! [`unconvert`] is the same walk backwards (the cipher is its own inverse).
 //!
 //! Crash safety, so an interrupted run can simply be run again:
@@ -15,24 +17,24 @@
 //! * Each folder's complete list is written before anything in it changes.
 //!   An entry whose boring name exists on disk is done; one still under its
 //!   real name is not.
-//! * A file's original ends are journaled (sealed with the drive's key)
-//!   before they're touched, and its rename is the commit. If a run stops in
-//!   between, the next one finds the file under its old name, puts the
-//!   journaled ends back and does it again.
+//! * A file's original ends and length are journaled (sealed with the
+//!   drive's key) before it's touched, and its rename is the commit. If a run
+//!   stops in between, the next one finds the file under its old name, puts
+//!   it back as it was and does it again.
 //! * A folder is renamed only once everything inside it is done.
 //!
 //! [`scan`] is the dry run: everything that would stop a conversion, found
 //! before anything is changed.
 
 use crate::boring::{generate_unique, Contains};
-use crate::crypto::{protected_ranges, transform_region, Key, Nonce, NONCE_LEN};
+use crate::crypto::{self, protected_ranges, transform_region, Key, Nonce};
 use crate::dircache::read_listing;
 use crate::durable;
 use crate::engine::{key_from_meta, write_new_meta};
-use crate::manifest::{is_conflict_copy, is_list_file, seal, unseal, Child, Kind, Manifest};
+use crate::envelope::LEN as ENVELOPE;
+use crate::manifest::{is_conflict_copy, is_list_file, Child, Kind, Manifest};
 use crate::names;
 use crate::Store;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, FileTimes, OpenOptions};
@@ -46,6 +48,7 @@ pub const CONVERTING: &str = "converting.idx";
 pub const UNCONVERTING: &str = "unconverting.idx";
 /// The one file in flight, while it is.
 const JOURNAL: &str = "convert-journal.idx";
+const JOURNAL_LABEL: &[u8] = b"cloak-convert-journal-v2";
 const META: &str = "meta.json";
 
 /// Names a drive keeps for itself at its top level (besides folder lists).
@@ -64,7 +67,7 @@ fn is_litter(name: &str) -> bool {
 
 /// Does a drive use this name for its own files (a folder list, or at the
 /// top `meta.json` and the journals), or a crash's side file of one?
-fn is_reserved(name: &str, at_root: bool) -> bool {
+pub(crate) fn is_reserved(name: &str, at_root: bool) -> bool {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(durable::SIDE_SUFFIX).unwrap_or(&lower);
     is_list_file(stem) || is_conflict_copy(stem) || (at_root && ROOT_RESERVED.contains(&stem))
@@ -272,7 +275,7 @@ fn convert_until(dir: &Path, passphrase: &str, region: u64, progress: Progress, 
     };
     let mut run = Run::new(dir, key, region, progress, stop)?;
     run.recover()?;
-    run.convert_dir(dir, true)?;
+    run.convert_dir(dir, true, None)?;
     fs::remove_file(&marker)?;
     durable::sync_dir(dir)
 }
@@ -332,8 +335,9 @@ struct InFlight {
     /// Its name before the change, and after.
     from: String,
     to: String,
-    /// Its ends as they were.
+    /// Its ends (and envelope, if it had one) as they were, and its length.
     ranges: Vec<(u64, Vec<u8>)>,
+    len: u64,
     accessed: Option<SystemTime>,
     modified: Option<SystemTime>,
 }
@@ -346,6 +350,15 @@ impl Contains for Taken<'_> {
     fn contains(&self, name: &str) -> bool {
         name.starts_with("manifest") || self.0.contains(&name.to_ascii_lowercase())
     }
+}
+
+/// Which way a file is going.
+#[allow(clippy::large_enum_variant)] // one at a time, briefly
+enum Way {
+    /// Into a drive: its ends encrypted, this envelope added.
+    In([u8; ENVELOPE as usize]),
+    /// Out of a drive: its ends decrypted, its envelope removed.
+    Out,
 }
 
 struct Run<'a> {
@@ -390,14 +403,18 @@ impl<'a> Run<'a> {
         };
         // Unreadable means it was torn while being written, before its file
         // was touched.
-        if let Ok(j) = serde_json::from_slice::<InFlight>(&unseal(bytes, &self.key)) {
+        let opened = crypto::open(&self.key, JOURNAL_LABEL, &bytes);
+        if let Some(j) = opened.ok().and_then(|b| serde_json::from_slice::<InFlight>(&b).ok()) {
             let from = self.root.join(&j.dir).join(&j.from);
             if from.exists() {
                 let mut f = OpenOptions::new().write(true).open(&from)?;
+                let end = j.ranges.iter().map(|(s, b)| s + b.len() as u64).max().unwrap_or(0);
+                f.set_len(j.len.max(end))?;
                 for (s, buf) in &j.ranges {
                     f.seek(SeekFrom::Start(*s))?;
                     f.write_all(buf)?;
                 }
+                f.set_len(j.len)?;
                 f.sync_data()?;
                 set_times(&f, j.accessed, j.modified);
             }
@@ -405,47 +422,63 @@ impl<'a> Run<'a> {
         fs::remove_file(self.journal())
     }
 
-    /// Transform `from`'s ends in `dir` with `nonce` (encrypting or
-    /// decrypting: the same operation) and rename it `to`, keeping its times.
-    fn process_file(&mut self, dir: &Path, from: &str, to: &str, nonce: &Nonce) -> io::Result<()> {
+    /// Transform `from`'s ends in `dir` with the file's key and nonce
+    /// (encrypting or decrypting: the same operation), add or remove its
+    /// envelope, and rename it `to`, keeping its times.
+    fn process_file(&mut self, dir: &Path, from: &str, to: &str, crypt: (Key, Nonce), way: Way) -> io::Result<()> {
         let path = dir.join(from);
         let mut f = OpenOptions::new().read(true).write(true).open(&path).map_err(|e| {
             io::Error::new(e.kind(), format!("couldn't change {} (is it open in another program?): {e}", path.display()))
         })?;
         let meta = f.metadata()?;
         let (accessed, modified) = (meta.accessed().ok(), meta.modified().ok());
+        let len = meta.len();
+        let data = match way {
+            Way::In(_) => len,
+            Way::Out => len.checked_sub(ENVELOPE).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{} is damaged (too short)", path.display()))
+            })?,
+        };
         let mut ranges = Vec::new();
-        for (s, e) in protected_ranges(meta.len(), self.region) {
+        for (s, e) in protected_ranges(data, self.region) {
             let mut buf = vec![0u8; (e - s) as usize];
             f.seek(SeekFrom::Start(s))?;
             f.read_exact(&mut buf)?;
             ranges.push((s, buf));
         }
-        let journaled = !ranges.is_empty();
-        if journaled {
-            let j = InFlight { dir: self.rel(dir), from: from.into(), to: to.into(), ranges, accessed, modified };
-            durable::write_synced(&self.journal(), &seal(serde_json::to_vec(&j)?, &self.key))?;
-            for (s, mut buf) in j.ranges {
-                transform_region(&self.key, nonce, s, &mut buf);
-                f.seek(SeekFrom::Start(s))?;
-                f.write_all(&buf)?;
-            }
-            f.sync_data()?;
-            set_times(&f, accessed, modified);
+        if matches!(way, Way::Out) {
+            let mut env = vec![0u8; ENVELOPE as usize];
+            f.seek(SeekFrom::Start(data))?;
+            f.read_exact(&mut env)?;
+            ranges.push((data, env));
         }
+        let j = InFlight { dir: self.rel(dir), from: from.into(), to: to.into(), ranges, len, accessed, modified };
+        durable::write_synced(&self.journal(), &crypto::seal(&self.key, JOURNAL_LABEL, &serde_json::to_vec(&j)?))?;
+        for (s, mut buf) in j.ranges.into_iter().filter(|(s, _)| *s < data) {
+            transform_region(&crypt.0, &crypt.1, s, &mut buf);
+            f.seek(SeekFrom::Start(s))?;
+            f.write_all(&buf)?;
+        }
+        match way {
+            Way::In(env) => {
+                f.seek(SeekFrom::Start(data))?;
+                f.write_all(&env)?;
+            }
+            Way::Out => f.set_len(data)?,
+        }
+        f.sync_data()?;
+        set_times(&f, accessed, modified);
         drop(f);
         if matches!(self.stop, Some(Stop::Within(n)) if self.done + 1 == n) {
             return Err(interrupted());
         }
         fs::rename(&path, dir.join(to))?;
         durable::sync_dir(dir)?;
-        if journaled {
-            fs::remove_file(self.journal())?;
-        }
-        Ok(())
+        fs::remove_file(self.journal())
     }
 
-    fn convert_dir(&mut self, dir: &Path, at_root: bool) -> io::Result<()> {
+    /// Convert the folder `dir`, whose real name is `name` (none for the top).
+    fn convert_dir(&mut self, dir: &Path, at_root: bool, name: Option<&str>) -> io::Result<()> {
         let listed = crate::manifest::Manifest::path_in(dir).exists();
         let mut plan: Vec<Child> = if listed { read_listing(dir, &self.key)?.children } else { Vec::new() };
 
@@ -467,23 +500,23 @@ impl<'a> Run<'a> {
         let mut real_on_disk: HashMap<String, String> = HashMap::new();
         let mut changed = !listed;
 
-        for (name, ft) in &on_disk {
-            if planned_boring.contains(&name.to_ascii_lowercase()) {
+        for (disk, ft) in &on_disk {
+            if planned_boring.contains(&disk.to_ascii_lowercase()) {
                 continue;
             }
-            if is_litter(name) && ft.is_file() {
-                fs::remove_file(dir.join(name))?;
+            if is_litter(disk) && ft.is_file() {
+                fs::remove_file(dir.join(disk))?;
                 continue;
             }
-            let real = real_name(name);
+            let real = real_name(disk);
             let key = names::fold(&real);
-            real_on_disk.insert(key.clone(), name.clone());
+            real_on_disk.insert(key.clone(), disk.clone());
             if planned_real.contains(&key) {
                 continue;
             }
             // New since the plan (or no plan yet).
             names::validate(&real).map_err(|e| {
-                io::Error::new(e.kind(), format!("{} can't be used in a drive: {e}", dir.join(name).display()))
+                io::Error::new(e.kind(), format!("{} can't be used in a drive: {e}", dir.join(disk).display()))
             })?;
             let kind = if ft.is_dir() {
                 Kind::Dir
@@ -492,18 +525,15 @@ impl<'a> Run<'a> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("{} isn't an ordinary file or folder", dir.join(name).display()),
+                    format!("{} isn't an ordinary file or folder", dir.join(disk).display()),
                 ));
             };
             let boring = generate_unique(&mut rand::thread_rng(), &Taken(&taken));
             taken.insert(boring.to_ascii_lowercase());
-            let mut nonce = [0u8; NONCE_LEN];
-            let mut size = 0;
-            if kind == Kind::File {
-                rand::thread_rng().fill_bytes(&mut nonce);
-                size = fs::metadata(dir.join(name))?.len();
-            }
-            plan.push(Child { real, boring, kind, nonce, size });
+            plan.push(match kind {
+                Kind::Dir => Child::dir(real, boring),
+                Kind::File => Child::new_file(real, boring, fs::metadata(dir.join(disk))?.len()),
+            });
             changed = true;
         }
         // Entries gone from disk since the plan was written.
@@ -511,13 +541,15 @@ impl<'a> Run<'a> {
         plan.retain(|c| dir.join(&c.boring).exists() || real_on_disk.contains_key(&names::fold(&c.real)));
         changed |= plan.len() != before;
         if changed {
-            Manifest { children: plan.clone(), ..Default::default() }.save(dir, &self.key)?;
+            Manifest { children: plan.clone(), name: name.map(str::to_string), ..Default::default() }
+                .save(dir, &self.key)?;
         }
 
         for c in plan.iter().filter(|c| !c.is_dir()) {
             if !dir.join(&c.boring).exists() {
                 let from = &real_on_disk[&names::fold(&c.real)];
-                self.process_file(dir, from, &c.boring, &c.nonce)?;
+                let env = c.envelope().seal(&self.key);
+                self.process_file(dir, from, &c.boring, c.crypt(), Way::In(env))?;
             }
             self.tick(1)?;
         }
@@ -528,7 +560,7 @@ impl<'a> Run<'a> {
                 continue;
             }
             let from = dir.join(&real_on_disk[&names::fold(&c.real)]);
-            self.convert_dir(&from, false)?;
+            self.convert_dir(&from, false, Some(&c.real))?;
             fs::rename(&from, &done)?;
             durable::sync_dir(dir)?;
         }
@@ -539,7 +571,7 @@ impl<'a> Run<'a> {
         let children = read_listing(dir, &self.key)?.children;
         for c in children.iter().filter(|c| !c.is_dir()) {
             if dir.join(&c.boring).exists() {
-                self.process_file(dir, &c.boring, &disk_name(&c.real), &c.nonce)?;
+                self.process_file(dir, &c.boring, &disk_name(&c.real), c.crypt(), Way::Out)?;
             }
             self.tick(1)?;
         }

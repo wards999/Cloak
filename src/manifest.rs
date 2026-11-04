@@ -5,12 +5,14 @@
 //! for each child, its real name, its boring on-disk name, whether it's a file
 //! or subdirectory, and (for files) the per-file crypto params.
 //!
-//! The manifest is the only place real names live, so it is encrypted: a random
-//! 12-byte nonce prefix followed by the ChaCha20 keystream XORed over the JSON.
-//! Losing or corrupting one manifest costs you only that one directory's child
-//! names — not the whole store — which is the resilience win of per-directory
-//! manifests over a single global index. Saves go through
-//! [`crate::durable::write_atomic`], so a crash never leaves one torn.
+//! The manifest holds real names and file keys, so it is sealed
+//! (XChaCha20-Poly1305 under the master key, see [`crate::crypto::seal`]): a
+//! damaged or tampered list fails to open rather than reading as garbage. It
+//! also records the folder's own real name, so a folder moved elsewhere
+//! still knows what it's called. Losing one manifest costs nothing for good:
+//! every file carries an envelope (see [`crate::envelope`]) the list can be
+//! rebuilt from. Saves go through [`crate::durable::write_atomic`], so a
+//! crash never leaves one torn.
 //!
 //! When a store folder is synced between machines and both change the same
 //! folder, the sync tool keeps both manifests by renaming one
@@ -23,10 +25,10 @@
 //! then holds only a tag per part. See [`crate::dircache`], which reads and
 //! writes listings in either form.
 
-use crate::crypto::{transform_region, Key, NONCE_LEN};
+use crate::crypto::{self, Key, Nonce, NONCE_LEN};
 use crate::durable;
+use crate::envelope::{self, Envelope, FileId};
 use crate::names;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,7 +52,11 @@ pub struct Child {
     /// Boring on-disk name within this directory, e.g. `index_shard_0472.idx`.
     pub boring: String,
     pub kind: Kind,
-    /// Per-file ChaCha20 nonce (unused / zeroed for directories).
+    /// The file's random ID (zero for directories).
+    pub id: FileId,
+    /// The file's own key, for its encrypted ends (zero for directories).
+    pub key: Key,
+    /// The file's current content nonce (zero for directories).
     pub nonce: [u8; NONCE_LEN],
     /// Plaintext file size when the entry was last saved (0 for directories).
     /// Only a hint: the boring file's length on disk is authoritative, since
@@ -62,12 +68,48 @@ impl Child {
     pub fn is_dir(&self) -> bool {
         self.kind == Kind::Dir
     }
+
+    /// A folder's entry.
+    pub fn dir(real: String, boring: String) -> Child {
+        Child { real, boring, kind: Kind::Dir, id: [0; 16], key: [0; 32], nonce: [0; NONCE_LEN], size: 0 }
+    }
+
+    /// A new file's entry, with a fresh ID, key and nonce.
+    pub fn new_file(real: String, boring: String, size: u64) -> Child {
+        Child {
+            real,
+            boring,
+            kind: Kind::File,
+            id: envelope::new_id(),
+            key: envelope::new_key(),
+            nonce: envelope::new_nonce(),
+            size,
+        }
+    }
+
+    /// The entry for a file found under `boring` with this envelope.
+    pub fn from_envelope(e: Envelope, boring: String, size: u64) -> Child {
+        Child { real: e.name, boring, kind: Kind::File, id: e.id, key: e.key, nonce: e.nonce, size }
+    }
+
+    /// A file's envelope, describing it as this entry does.
+    pub fn envelope(&self) -> Envelope {
+        Envelope { id: self.id, key: self.key, nonce: self.nonce, name: self.real.clone() }
+    }
+
+    /// The file's key and nonce together.
+    pub fn crypt(&self) -> (Key, Nonce) {
+        (self.key, self.nonce)
+    }
 }
 
 /// The decrypted contents of one directory's manifest.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub children: Vec<Child>,
+    /// The folder's own real name (none for the drive's top folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// In a split directory's `manifest.idx`: the tag each part was last
     /// written with, so a part that hasn't caught up (a sync tool delivering
     /// files one at a time) is noticed. Empty for a list kept in one file.
@@ -137,10 +179,10 @@ impl Manifest {
 
     /// Decrypt and parse a manifest file's bytes.
     pub fn from_sealed(bytes: Vec<u8>, key: &Key) -> io::Result<Manifest> {
-        if bytes.len() < NONCE_LEN {
+        if bytes.is_empty() {
             return Ok(Manifest::default());
         }
-        Ok(serde_json::from_slice(&unseal(bytes, key))?)
+        Ok(serde_json::from_slice(&unseal(bytes, key)?)?)
     }
 
     /// Encrypt and write the manifest into `dir`, with a fresh random nonce.
@@ -171,27 +213,18 @@ impl Manifest {
     }
 }
 
-/// Encrypt `body` under a fresh nonce: `nonce || keystream XOR body`.
-pub fn seal(mut body: Vec<u8>, key: &Key) -> Vec<u8> {
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    transform_region(key, &nonce, 0, &mut body);
-    let mut out = Vec::with_capacity(NONCE_LEN + body.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&body);
-    out
+/// What a list is sealed as (see [`crypto::seal`]).
+const LIST: &[u8] = b"cloak-list-v2";
+
+/// Seal a list's JSON with the master key.
+pub fn seal(body: Vec<u8>, key: &Key) -> Vec<u8> {
+    crypto::seal(key, LIST, &body)
 }
 
-/// Undo [`seal`]. Input shorter than a nonce comes back empty.
-pub fn unseal(bytes: Vec<u8>, key: &Key) -> Vec<u8> {
-    if bytes.len() < NONCE_LEN {
-        return Vec::new();
-    }
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&bytes[..NONCE_LEN]);
-    let mut body = bytes[NONCE_LEN..].to_vec();
-    transform_region(key, &nonce, 0, &mut body);
-    body
+/// Undo [`seal`]; `InvalidData` if it isn't a list sealed with `key`, or was
+/// changed since.
+pub fn unseal(bytes: Vec<u8>, key: &Key) -> io::Result<Vec<u8>> {
+    crypto::open(key, LIST, &bytes)
 }
 
 /// Is `name` a sync tool's renamed copy of a manifest? Boring names never
@@ -275,6 +308,7 @@ pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
     let main_path = Manifest::path_in(dir);
     let listing = crate::dircache::read_listing(dir, key);
     let parts = listing.as_ref().map_or(0, |l| l.parts);
+    let name = listing.as_ref().ok().and_then(|l| l.name.clone());
     let mut merged = Manifest {
         // A damaged main list: rebuild from the copies alone.
         children: listing.map(|l| l.children).unwrap_or_default(),
@@ -298,7 +332,7 @@ pub fn merge_conflicts(dir: &Path, key: &Key) -> io::Result<usize> {
     merged.children.retain(|c| dir.join(&c.boring).exists());
 
     merged.children = unique_names(merged.children);
-    crate::dircache::write_listing(dir, key, &merged.children, parts, &mut vec![0; parts], None)?;
+    crate::dircache::write_listing(dir, key, name.as_deref(), &merged.children, parts, &mut vec![0; parts], None)?;
     for copy in &used {
         if **copy != main_path {
             std::fs::remove_file(copy)?;
@@ -323,13 +357,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn dir_child(real: &str, boring: &str) -> Child {
-        Child {
-            real: real.into(),
-            boring: boring.into(),
-            kind: Kind::Dir,
-            nonce: [0; NONCE_LEN],
-            size: 0,
-        }
+        Child::dir(real.into(), boring.into())
     }
 
     #[test]
@@ -345,13 +373,7 @@ mod tests {
         let key = [2u8; 32];
         let mut m = Manifest::default();
         m.children.push(dir_child("Taxes", "index_shard_0001.idx"));
-        m.children.push(Child {
-            real: "Return.pdf".into(),
-            boring: "cache_0002.dat".into(),
-            kind: Kind::File,
-            nonce: [9; NONCE_LEN],
-            size: 4242,
-        });
+        m.children.push(Child::new_file("Return.pdf".into(), "cache_0002.dat".into(), 4242));
         m.save(d.path(), &key).unwrap();
 
         // On disk, the real names must not appear in the clear.
@@ -372,8 +394,14 @@ mod tests {
         let mut m = Manifest::default();
         m.children.push(dir_child("Secret", "thumbs_0003.db"));
         m.save(d.path(), &[3u8; 32]).unwrap();
-        // A wrong key yields garbage bytes, so JSON parsing fails.
+        // A wrong key fails the seal's check.
         assert!(Manifest::load(d.path(), &[4u8; 32]).is_err());
+        // So does a changed byte.
+        let path = Manifest::path_in(d.path());
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[30] ^= 1;
+        std::fs::write(&path, raw).unwrap();
+        assert!(Manifest::load(d.path(), &[3u8; 32]).is_err());
     }
 
     #[test]
@@ -386,13 +414,10 @@ mod tests {
     }
 
     fn file_child(real: &str, boring: &str) -> Child {
-        Child {
-            real: real.into(),
-            boring: boring.into(),
-            kind: Kind::File,
-            nonce: [1; NONCE_LEN],
-            size: 0,
-        }
+        let mut c = Child::new_file(real.into(), boring.into(), 0);
+        // Fixed, so the same entry built twice compares equal.
+        (c.id, c.key, c.nonce) = ([1; 16], [1; 32], [1; NONCE_LEN]);
+        c
     }
 
     #[test]
