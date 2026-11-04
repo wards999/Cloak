@@ -242,6 +242,9 @@ pub struct Store {
     /// Files that already have a fresh nonce for the editing session under
     /// way (until their last close).
     renonced: HashSet<PathBuf>,
+    /// New files still empty, whose envelope (in `envelopes`) isn't on disk
+    /// yet: it's written with their first data, or by `write_unwritten`.
+    unwritten: HashSet<PathBuf>,
     /// Files and folders found in each folder that belong to another drive
     /// (see [`Store::check_folder`]).
     foreign: Mutex<HashMap<PathBuf, BTreeSet<String>>>,
@@ -392,6 +395,7 @@ impl Store {
             doomed: Vec::new(),
             envelopes: HashMap::new(),
             renonced: HashSet::new(),
+            unwritten: HashSet::new(),
             foreign: Mutex::default(),
             missing: Mutex::default(),
             arrived: Mutex::default(),
@@ -1121,13 +1125,14 @@ impl Store {
             generate_unique(&mut rand::thread_rng(), &Taken { dir: &dir, at: &parent_disk })
         };
         let child = Child::new_file(name, boring.clone(), 0);
-        // An empty file is just its envelope. Its handle is kept for the
-        // writes that usually follow: on Windows, reopening a file just
-        // written waits for the antivirus scan.
+        // Created empty: its envelope goes in with its first data (or when
+        // it's closed or saved still empty), so a new file is written once.
+        // Its handle is kept for the writes that usually follow: on Windows,
+        // reopening a file just written waits for the antivirus scan.
         let blob = parent_disk.join(&boring);
         let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&blob)?;
         let env = child.envelope().seal(&self.key);
-        write_all_at(&f, &env, 0)?;
+        self.unwritten.insert(blob.clone());
         if self.handles.len() >= MAX_HANDLES {
             self.handles.clear();
         }
@@ -1348,6 +1353,7 @@ impl Store {
         let env = entry.envelope().seal(&self.key);
         write_all_at(f, &env, len)?;
         self.envelopes.insert(blob.to_path_buf(), env);
+        self.unwritten.remove(blob);
         f.sync_data()?;
         self.dirs.edit(&dir, &self.key, |d| {
             if let Some(p) = d.position_of_boring(&boring) {
@@ -1363,6 +1369,33 @@ impl Store {
         }
         self.renonced.insert(blob.to_path_buf());
         Ok((key, nonce))
+    }
+
+    /// Put the envelope of a new file that's still empty on the disk.
+    fn write_unwritten_one(&mut self, blob: &Path) -> io::Result<()> {
+        self.unwritten.remove(blob);
+        let Some(env) = self.envelopes.get(blob).copied() else { return Ok(()) };
+        let f = match self.handles.get(blob) {
+            Some(f) => f.try_clone()?,
+            None => match std::fs::OpenOptions::new().read(true).write(true).open(blob) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // deleted since
+                Err(e) => return Err(e),
+            },
+        };
+        if f.metadata()?.len() == 0 {
+            write_all_at(&f, &env, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Put every pending envelope on the disk (see `unwritten`).
+    fn write_unwritten(&mut self) -> io::Result<()> {
+        let blobs: Vec<PathBuf> = self.unwritten.iter().cloned().collect();
+        for blob in blobs {
+            self.write_unwritten_one(&blob)?;
+        }
+        Ok(())
     }
 
     /// The envelope of the file at `blob` whose data is `len` bytes, from the
@@ -1388,6 +1421,9 @@ impl Store {
     }
 
     fn close_blob(&mut self, blob: &Path) {
+        if self.unwritten.contains(blob) {
+            let _ = self.write_unwritten_one(blob);
+        }
         self.durable_len.remove(blob);
         self.handles.remove(blob);
         self.envelopes.remove(blob);
@@ -1486,7 +1522,11 @@ impl Store {
         // 2. Resize. Added bytes read as zeros, which is right outside the ends;
         //    inside one they must hold the keystream. Where the envelope was
         //    is cleared first.
-        if new != old {
+        // Growing by a write that reaches the new end needs no resize: that
+        // write (data then envelope) extends the file itself, and any gap
+        // before it reads as zeros.
+        let extends = new > old && !data.is_empty() && end == new;
+        if new != old && !extends {
             f.set_len(new + ENVELOPE)?;
         }
         if new > old {
@@ -1519,6 +1559,9 @@ impl Store {
         }
         if let Some(e) = env {
             write_all_at(f, &e, new)?;
+        }
+        if new != old {
+            self.unwritten.remove(blob); // written at the new end, just now
         }
         if journaled {
             f.sync_data()?;
@@ -1803,6 +1846,7 @@ impl Store {
     /// finishes them. A file created just before a crash whose list wasn't
     /// saved yet stays on disk unnamed, as unflushed data does on any disk.
     pub fn sync(&mut self) -> io::Result<()> {
+        self.write_unwritten()?;
         let doomed = std::mem::take(&mut self.doomed);
         let purge = Journal::Purge {
             items: doomed.iter().map(|(d, b)| (self.rel(d), b.clone())).collect(),
@@ -2023,6 +2067,9 @@ fn restore(path: &Path, len: u64, ranges: &[(u64, Vec<u8>)]) -> io::Result<()> {
 /// A file's data length: its length on disk less its envelope.
 fn data_len(f: &std::fs::File) -> io::Result<u64> {
     let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(0); // a new file, empty, its envelope not written yet
+    }
     len.checked_sub(ENVELOPE)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a file in the drive is damaged (too short)"))
 }
@@ -2855,6 +2902,32 @@ mod tests {
         let env = Envelope::read(&d.path().join(&a.boring), &s.key).unwrap();
         assert_eq!(env.name, "a.txt");
         assert_eq!(s.metadata("a.txt").unwrap().unwrap().size, 13, "the envelope isn't counted");
+    }
+
+    #[test]
+    fn a_new_files_envelope_is_written_with_its_data_or_on_close() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("empty.txt").unwrap();
+        s.create("full.txt").unwrap();
+        let (e, f) = (entry(&s, d.path(), "empty.txt"), entry(&s, d.path(), "full.txt"));
+        assert_eq!(std::fs::metadata(d.path().join(&e.boring)).unwrap().len(), 0, "not written at create");
+        assert_eq!(s.metadata("empty.txt").unwrap().unwrap().size, 0);
+        assert!(s.read_all("empty.txt").unwrap().is_empty());
+
+        s.write_at("full.txt", 0, b"data").unwrap();
+        assert_disk_matches(&s, "full.txt", b"data");
+        s.close("empty.txt");
+        let env = Envelope::read(&d.path().join(&e.boring), &s.key).unwrap();
+        assert_eq!(env.name, "empty.txt");
+        assert_disk_matches(&s, "empty.txt", b"");
+
+        // One never closed gets its envelope when the drive saves.
+        s.create("later.txt").unwrap();
+        let l = entry(&s, d.path(), "later.txt");
+        s.sync().unwrap();
+        assert!(Envelope::read(&d.path().join(&l.boring), &s.key).is_ok());
+        let _ = f;
     }
 
     #[test]
