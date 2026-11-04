@@ -206,6 +206,8 @@ pub struct Store {
     /// Files that already have a fresh nonce for the editing session under
     /// way (until their last close).
     renonced: HashSet<PathBuf>,
+    /// Open files already made sparse for a jump in size (see `update_blob`).
+    sparse: HashSet<PathBuf>,
     /// New files still empty, whose envelope (in `envelopes`) isn't on disk
     /// yet: it's written with their first data, or by `write_unwritten`.
     unwritten: HashSet<PathBuf>,
@@ -365,6 +367,7 @@ impl Store {
             doomed: Vec::new(),
             envelopes: HashMap::new(),
             renonced: HashSet::new(),
+            sparse: HashSet::new(),
             unwritten: HashSet::new(),
             foreign: Mutex::default(),
             missing: Mutex::default(),
@@ -1523,6 +1526,7 @@ impl Store {
         }
         self.durable_len.remove(blob);
         self.handles.remove(blob);
+        self.sparse.remove(blob);
         self.envelopes.remove(blob);
         self.renonced.remove(blob);
         readers_mut(&mut self.readers).remove(blob);
@@ -1623,6 +1627,17 @@ impl Store {
         // write (data then envelope) extends the file itself, and any gap
         // before it reads as zeros.
         let extends = new > old && !data.is_empty() && end == new;
+        // A jump in size puts the tail end and envelope far past the old end.
+        // Windows would first fill the gap with zeros on the disk, and then
+        // the app writes its data over them (a copy sets the file's full size
+        // before writing it): every byte twice. A sparse file leaves the gap
+        // as a hole instead, which reads as the same zeros. It stays sparse:
+        // making it normal again on close would write zeros wherever the
+        // app's data hasn't reached the disk yet, the same double write.
+        let gap_to = if extends { offset } else { new };
+        if gap_to >= old + SPARSE_MIN && !self.sparse.contains(blob) && set_sparse(f, true).is_ok() {
+            self.sparse.insert(blob.to_path_buf());
+        }
         if new != old && !extends {
             f.set_len(new + ENVELOPE)?;
         }
@@ -1641,9 +1656,14 @@ impl Store {
         // 3. The data itself, and the envelope at the new end (in the same
         //    write when the data reaches it, as when appending).
         let mut env = env;
-        if !data.is_empty() {
+        let encrypted = clip(&protected_ranges(new, n), offset, end);
+        if !data.is_empty() && encrypted.is_empty() && (env.is_none() || end != new || data.len() > 64 * 1024) {
+            // All in the plain middle: straight from the app's buffer, not a
+            // copy of it (the envelope, if it moves, follows in its own write).
+            write_all_at(f, data, offset)?;
+        } else if !data.is_empty() {
             let mut buf = data.to_vec();
-            for (s, e) in clip(&protected_ranges(new, n), offset, end) {
+            for (s, e) in encrypted {
                 let (ls, le) = ((s - offset) as usize, (e - offset) as usize);
                 transform_region(key, nonce, s, &mut buf[ls..le]);
             }
@@ -2194,6 +2214,55 @@ fn restore(path: &Path, len: u64, ranges: &[(u64, Vec<u8>)]) -> io::Result<()> {
     f.sync_data()
 }
 
+/// A jump in a file's size at least this big is left as a hole.
+const SPARSE_MIN: u64 = 1 << 20;
+
+/// Mark a file sparse (or not). Only Windows needs it: elsewhere a file grows
+/// with a hole anyway.
+#[cfg(windows)]
+fn set_sparse(f: &std::fs::File, sparse: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            device: *mut std::ffi::c_void,
+            code: u32,
+            input: *const std::ffi::c_void,
+            input_len: u32,
+            output: *mut std::ffi::c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    let flag: u8 = sparse.into(); // FILE_SET_SPARSE_BUFFER
+    let mut returned = 0u32;
+    // SAFETY: a valid open handle, a 1-byte input buffer that outlives the
+    // call, no output, and a synchronous handle (no OVERLAPPED).
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            (&flag as *const u8).cast(),
+            1,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_sparse(_: &std::fs::File, _: bool) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 /// A file's data length: its length on disk less its envelope.
 fn data_len(f: &std::fs::File) -> io::Result<u64> {
     let len = f.metadata()?.len();
@@ -2467,7 +2536,7 @@ mod tests {
                 all.push(e.file_name().to_string_lossy().into_owned());
             }
         }
-        assert!(all.iter().all(|n| n.contains('_') && !n.contains("manifest") && n != "meta.json"), "{all:?}");
+        assert!(all.iter().all(|n| n.contains('_') && n != "manifest.idx" && n != "meta.json"), "{all:?}");
         let s = Store::open_with_passphrase(d.path(), "right").unwrap();
         assert_eq!(s.read_all("Docs/note.txt").unwrap(), b"kept");
         assert_eq!(Store::open_with_passphrase(d.path(), "wrong").err().map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
@@ -3084,6 +3153,33 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(b.adopt_from(&keys[0]).unwrap(), (1, 0));
         assert_eq!(b.read_all("letter.txt").unwrap(), b"dear diary");
+    }
+
+    #[test]
+    fn a_copy_that_sets_the_size_first_reads_back_and_leaves_a_hole() {
+        // How Windows copies a file: its full size first, then the data in order.
+        let d = tempdir().unwrap();
+        let mut s = Store::create_with_passphrase(d.path(), "pw", 128).unwrap();
+        let len = 5 * 1024 * 1024 + 777;
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4096) as u8).collect();
+        s.create("big.bin").unwrap();
+        let id = s.open_file("big.bin").unwrap();
+        s.truncate_file(id, len as u64).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let (blob, _) = s.opened(id).unwrap();
+            assert_ne!(std::fs::metadata(&blob).unwrap().file_attributes() & 0x200, 0, "sparse");
+        }
+        assert_eq!(s.read_file(id, len as u64 - 10, 10).unwrap(), vec![0; 10], "unwritten reads as zeros");
+        for (i, chunk) in data.chunks(1 << 20).enumerate() {
+            s.write_file(id, (i << 20) as u64, chunk).unwrap();
+        }
+        s.release_file(id);
+        assert_eq!(s.read_all("big.bin").unwrap(), data);
+        drop(s);
+        let s = Store::open_with_passphrase(d.path(), "pw").unwrap();
+        assert_eq!(s.read_all("big.bin").unwrap(), data, "after reopening");
     }
 
     #[test]
