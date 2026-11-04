@@ -217,82 +217,110 @@ pub fn is_conflict_copy(master: &Key, name: &str) -> bool {
         && lower.len() > list.len()
 }
 
-/// The keys of the drive in `dir`, with its password: from the lock of any
-/// file or folder in it (the top folder's first). `NotFound` if nothing in
-/// `dir` carries a lock, `PermissionDenied` for a wrong password, and
+/// The keys of the drive in `dir`, with its password. `NotFound` if nothing
+/// in `dir` carries a lock, `PermissionDenied` for a wrong password, and
 /// `PermissionDenied` naming a password change if the password opens only
-/// an older generation than the drive's newest.
+/// an older lock than the drive's top list carries.
+///
+/// The drive is the one whose top list is in `dir`: its list's name comes
+/// from its key, so a key belongs here only if that list is. Files copied in
+/// from another drive carry that drive's lock and can't pass for this one,
+/// however many there are. Each salt found among the top folder's files is
+/// tried in turn (one slow password check each, at most [`MAX_TRIES`]). Only
+/// if the top list is gone is a key accepted without it, and then only when
+/// every lock in the drive agrees.
 pub fn unlock_drive(dir: &Path, password: &str) -> io::Result<Keys> {
-    // Gather locks from the top folder, then deeper, until enough are seen
-    // to know the drive's salt: random bytes never repeat a salt, a drive's
-    // locks always do.
-    let mut locks: Vec<[u8; LEN]> = Vec::new();
-    let mut folders = vec![dir.to_path_buf()];
-    while let Some(folder) = folders.pop() {
-        let Ok(rd) = std::fs::read_dir(&folder) else { continue };
-        let mut subs = Vec::new();
-        for e in rd.flatten() {
-            match e.file_type() {
-                Ok(t) if t.is_dir() => subs.push(e.path()),
-                Ok(t) if t.is_file() => {
-                    if let Some(l) = lock_of_file(&e.path()).filter(plausible) {
-                        locks.push(l);
-                    }
-                }
-                _ => {}
-            }
-            if locks.len() >= 64 {
-                break;
-            }
+    let mut tried: Vec<Salt> = Vec::new();
+    let mut seen_salts: Vec<Salt> = Vec::new();
+    let mut fallback: Option<Keys> = None;
+
+    // A lock's key, if `password` opens it and this salt hasn't been tried.
+    let try_lock = |l: &[u8; LEN], tried: &mut Vec<Salt>| -> io::Result<Option<Keys>> {
+        let (salt, _) = peek(l).expect("LEN bytes");
+        if tried.contains(&salt) || tried.len() >= MAX_TRIES {
+            return Ok(None);
         }
-        if locks.len() >= 64 {
-            break;
+        tried.push(salt);
+        let kek = kek_for(password, &salt)?;
+        Ok(open_with(&kek, l).ok().map(|(master, gen, region)| Keys { master, region, gen, salt, kek }))
+    };
+
+    // The top folder first: a drive's top list is there.
+    let top: Vec<[u8; LEN]> = files_in(dir).filter_map(|p| lock_of_file(&p)).filter(plausible).collect();
+    for l in &top {
+        let (salt, _) = peek(l).expect("LEN bytes");
+        if !seen_salts.contains(&salt) {
+            seen_salts.push(salt);
         }
-        folders.extend(subs);
-    }
-    if locks.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
-    }
-    // Salts by how often they occur, most common first; generation newest
-    // first within a salt.
-    let mut salts: Vec<(Salt, usize, u64)> = Vec::new();
-    for l in &locks {
-        let (salt, gen) = peek(l).expect("LEN bytes");
-        match salts.iter_mut().find(|(s, _, _)| *s == salt) {
-            Some(e) => {
-                e.1 += 1;
-                e.2 = e.2.max(gen);
-            }
-            None => salts.push((salt, 1, gen)),
-        }
-    }
-    salts.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
-    let newest = salts.iter().map(|s| s.2).max().unwrap_or(0);
-    // A repeated salt is the drive's; with nothing repeated (a drive of one
-    // file), each salt is tried.
-    let tries: Vec<&(Salt, usize, u64)> =
-        if salts[0].1 > 1 { salts.iter().filter(|s| s.1 > 1).collect() } else { salts.iter().take(4).collect() };
-    for (salt, _, _) in tries {
-        let kek = kek_for(password, salt)?;
-        let mut best: Option<(Key, u64, u64)> = None;
-        for l in locks.iter().filter(|l| peek(l.as_slice()).is_some_and(|(s, _)| s == *salt)) {
-            if let Ok((master, gen, region)) = open_with(&kek, l) {
-                if best.as_ref().is_none_or(|b| gen > b.1) {
-                    best = Some((master, gen, region));
-                }
-            }
-        }
-        if let Some((master, gen, region)) = best {
-            if gen < newest {
+        let Some(keys) = try_lock(l, &mut tried)? else { continue };
+        let list = dir.join(names(&keys.master).list);
+        if let Some(top_lock) = lock_of_file(&list) {
+            // This drive. Its top list is relocked first in a password
+            // change, so a lock older than the list's means this password
+            // was replaced.
+            let top_gen = peek(&top_lock).map_or(0, |(_, g)| g);
+            if keys.gen < top_gen {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "this drive's password was changed: use the new password",
                 ));
             }
-            return Ok(Keys { master, region, gen, salt: *salt, kek });
+            return Ok(keys);
+        }
+        fallback.get_or_insert(keys);
+    }
+
+    // No top list opened: it may be lost, with files deeper down. A key is
+    // accepted only if every lock found is the same drive's.
+    let mut deeper = Vec::new();
+    let mut folders: Vec<std::path::PathBuf> = subfolders(dir).collect();
+    while let Some(f) = folders.pop() {
+        deeper.extend(files_in(&f).filter_map(|p| lock_of_file(&p)).filter(plausible));
+        folders.extend(subfolders(&f));
+        if deeper.len() >= 64 {
+            break;
         }
     }
-    Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong password"))
+    if top.is_empty() && deeper.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
+    }
+    for l in &deeper {
+        let (salt, _) = peek(l).expect("LEN bytes");
+        if !seen_salts.contains(&salt) {
+            seen_salts.push(salt);
+        }
+        if fallback.is_none() {
+            if let Some(keys) = try_lock(l, &mut tried)? {
+                fallback = Some(keys);
+            }
+        }
+    }
+    match fallback {
+        Some(keys) if seen_salts.iter().all(|s| *s == keys.salt) => Ok(keys),
+        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong password")),
+    }
+}
+
+/// How many different salts a password is tried against (each try is one
+/// slow password check).
+const MAX_TRIES: usize = 6;
+
+fn files_in(dir: &Path) -> impl Iterator<Item = std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+}
+
+fn subfolders(dir: &Path) -> impl Iterator<Item = std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
 }
 
 #[cfg(test)]

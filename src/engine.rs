@@ -3087,6 +3087,42 @@ mod tests {
     }
 
     #[test]
+    fn another_drives_files_copied_in_dont_take_over_the_drive() {
+        let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+        {
+            let mut v1 = Store::create_with_passphrase(d1.path(), "test1", 128).unwrap();
+            for i in 0..12 {
+                let p = format!("f{i}.txt");
+                v1.create(&p).unwrap();
+                v1.write_at(&p, 0, p.as_bytes()).unwrap();
+            }
+        }
+        drop(Store::create_with_passphrase(d2.path(), "test2", 128).unwrap());
+        // v2 is empty; v1's hidden files (not its list) copied into it, so
+        // v1's lock outnumbers v2's twelve to one.
+        let v1_list = unlock(d1.path(), "test1").unwrap().list_name().to_string();
+        for e in std::fs::read_dir(d1.path()).unwrap().flatten() {
+            if e.file_name().to_string_lossy() != v1_list {
+                std::fs::copy(e.path(), d2.path().join(e.file_name())).unwrap();
+            }
+        }
+
+        let mut v2 = Store::open_with_passphrase(d2.path(), "test2").expect("v2's own password opens v2");
+        assert!(v2.list_dir("").unwrap().is_empty());
+        assert_eq!(v2.foreign_count(), 12, "v1's files wait");
+        let err = Store::open_with_passphrase(d2.path(), "test1").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "v1's password isn't v2's: {err}");
+
+        let keys = v2.keys_for_strays("test1").unwrap();
+        assert_eq!(v2.adopt_from(&keys[0]).unwrap(), (12, 0));
+        assert_eq!(v2.read_all("f3.txt").unwrap(), b"f3.txt");
+        drop(v2);
+        // Now they're v2's: v2's password still opens it, v1's still doesn't.
+        assert!(Store::open_with_passphrase(d2.path(), "test2").is_ok());
+        assert!(Store::open_with_passphrase(d2.path(), "test1").is_err());
+    }
+
+    #[test]
     fn a_password_change_relocks_everything() {
         let d = tempdir().unwrap();
         {
