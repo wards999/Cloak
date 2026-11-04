@@ -28,7 +28,7 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
     ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
     RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter, ProgressBar,
-    TransparentDropDownPushButton, RoundMenu, Action,
+    TransparentDropDownPushButton, RoundMenu, Action, ListWidget,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -888,7 +888,8 @@ class AdoptDialog(FocusedDialog):
         else:
             text = "Files and folders moved into this drive's folder from another drive wait here until brought in. "
         self.intro = CaptionLabel(
-            text + "Choose the drive they came from: cloak re-seals them for this drive without copying them.", self)
+            text + "Choose the drive they came from: cloak shows what it finds, then re-seals them for this "
+                   "drive without copying them.", self)
         self.intro.setWordWrap(True)
         self.pw = PasswordField(self); self.pw.setPlaceholderText(f"Password for “{drive['name']}”")
         self.source = ComboBox(self)
@@ -896,6 +897,9 @@ class AdoptDialog(FocusedDialog):
         self.loc = LineEdit(self); self.loc.setPlaceholderText("The other drive's folder")
         self.pick = PushButton("Choose folder…", self)
         self.other_pw = PasswordField(self); self.other_pw.setPlaceholderText("That drive's password")
+        self.summary = BodyLabel("", self); self.summary.setWordWrap(True); self.summary.hide()
+        # Short: the dialog sits over the window and can't be taller; it scrolls.
+        self.found = ListWidget(self); self.found.setFixedHeight(160); self.found.hide()
         loc_row = QHBoxLayout(); loc_row.addWidget(self.loc); loc_row.addWidget(self.pick)
         src_row = QHBoxLayout(); src_row.addWidget(BodyLabel("From", self)); src_row.addWidget(self.source, 1)
         for w in (self.titleLabel, self.intro, self.pw):
@@ -903,22 +907,35 @@ class AdoptDialog(FocusedDialog):
         self.viewLayout.addLayout(src_row)
         self.viewLayout.addLayout(loc_row)
         self.viewLayout.addWidget(self.other_pw)
+        self.viewLayout.addWidget(self.summary)
+        self.viewLayout.addWidget(self.found)
         self.finish_layout()
-        self.yesButton.setText("Bring them in")
-        self.busy_text = "Bringing in…"
         self.cancelButton.setText("Cancel")
         self.widget.setMinimumWidth(470)
         self.source.currentIndexChanged.connect(self._source_chosen)
         self.pick.clicked.connect(self._choose)
         self.other_pw.returnPressed.connect(self.yesButton.click)
+        # Any change to what's entered means looking again before bringing in.
+        for w in (self.pw, self.loc, self.other_pw):
+            w.textChanged.connect(self._unchecked)
         self.first = self.pw
         self.outcome = None
+        self.checked = None  # what the list shown is for
         self._source_chosen(self.source.currentIndex())
 
     def _source_chosen(self, i):
         listed = i < len(self.others)
         for w in (self.loc, self.pick):
             w.setVisible(not listed)
+        self._unchecked()
+
+    def _unchecked(self, *_):
+        self.checked = None
+        self.summary.hide()
+        self.found.hide()
+        self.intro.show()
+        self.yesButton.setText("Show what's waiting")
+        self.busy_text = "Looking…"
 
     def _choose(self):
         d = QFileDialog.getExistingDirectory(self, "The other drive's folder", str(Path.home()))
@@ -936,14 +953,44 @@ class AdoptDialog(FocusedDialog):
             return self.problem("That folder isn't a cloak drive (it has no drive header).", self.loc)
         if not self.other_pw.text():
             return self.problem("Enter the other drive's password.", self.other_pw)
+        args = [self.path, other]
+        env = {"CLOAK_PASSPHRASE": self.pw.text(), "CLOAK_OTHER_PASSPHRASE": self.other_pw.text()}
         try:
-            self.outcome = engine(["adopt", self.path, other],
-                                 CLOAK_PASSPHRASE=self.pw.text(), CLOAK_OTHER_PASSPHRASE=self.other_pw.text())
+            if self.checked != args:
+                return self._show(engine(["adopt-check", *args], **env), args)
+            self.outcome = engine(["adopt", *args], **env)
         except RuntimeError as e:
             msg = str(e)
             field = self.other_pw if msg.startswith("the other drive") else self.pw
             return self.problem(msg[:1].upper() + msg[1:] + ".", field)
         return True
+
+    def _show(self, r, args):
+        """List what would come in; stays open so the next press brings it in."""
+        found, left = r.get("found", []), r.get("left", 0)
+        source = self.source.currentText() if self.source.currentIndex() < len(self.others) else "that drive"
+        if not found:
+            more = f" ({left} item{'s' if left != 1 else ''} came from a different drive.)" if left else ""
+            return self.problem(f"Nothing waiting here came from {source}.{more}", self.source)
+        self.found.clear()
+        for f in found:
+            if f["is_dir"]:
+                n = f["items"]
+                self.found.addItem(f"📁  {f['path']}   ({n} item{'s' if n != 1 else ''})")
+            else:
+                self.found.addItem(f"     {f['path']}")
+        n = len(found)
+        text = f"{n} item{'s' if n != 1 else ''} from {source} will be brought in:"
+        if left:
+            text += f" ({left} other{'s' if left != 1 else ''} came from a different drive and will keep waiting.)"
+        self.summary.setText(text)
+        self.intro.hide()  # the list says it all, and needs the room
+        self.summary.show()
+        self.found.show()
+        self.checked = args
+        self.yesButton.setText(f"Bring {'them' if n != 1 else 'it'} in")
+        self.busy_text = "Bringing in…"
+        return False
 
 
 class PasswordDialog(FocusedDialog):

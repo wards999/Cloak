@@ -27,6 +27,9 @@
 //! Files and folders moved in from elsewhere (see `docs/FORMAT.md`):
 //!
 //!   cloak strays <dir>                 check the whole drive -> {foreign}
+//!   cloak adopt-check <dir> <other-dir>  what adopt would bring in, changing
+//!                                      nothing -> {found: [{path, name,
+//!                                      is_dir, items}], left}
 //!   cloak adopt  <dir> <other-dir>     bring in what came from the other
 //!                                      drive (its password in
 //!                                      CLOAK_OTHER_PASSPHRASE) -> {adopted, left}
@@ -79,6 +82,18 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             let mut s = Store::open_with_passphrase(dir, &pass)?;
             let (adopted, left) = s.adopt_from(&other)?;
             return Ok(serde_json::json!({ "adopted": adopted, "left": left }).to_string());
+        }
+        "adopt-check" => {
+            let other_dir = req(args, 2)?;
+            let other_pass =
+                env::var("CLOAK_OTHER_PASSPHRASE").map_err(|_| "CLOAK_OTHER_PASSPHRASE not set")?;
+            let meta = std::fs::read(std::path::Path::new(&other_dir).join("meta.json"))
+                .map_err(|e| format!("the other drive's folder has no drive header ({e})"))?;
+            let (other, _) = cloak::engine::key_from_meta(&meta, &other_pass)
+                .map_err(|e| format!("the other drive: {e}"))?;
+            let s = Store::open_with_passphrase(dir, &pass)?;
+            let (found, left) = s.preview_from(&other)?;
+            return Ok(serde_json::json!({ "found": found, "left": left }).to_string());
         }
         "passwd" => {
             let new = env::var("CLOAK_NEW_PASSPHRASE").map_err(|_| "CLOAK_NEW_PASSPHRASE not set")?;

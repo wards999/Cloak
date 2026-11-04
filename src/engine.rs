@@ -252,6 +252,19 @@ pub struct Store {
 /// A file's key and its current content nonce.
 type Crypt = (Key, Nonce);
 
+/// Something from another drive waiting in this one (see
+/// [`Store::preview_from`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct Found {
+    /// Where it would appear in this drive, real names, `/`-separated.
+    pub path: String,
+    /// Its own real name.
+    pub name: String,
+    pub is_dir: bool,
+    /// For a folder: how many items it holds directly.
+    pub items: usize,
+}
+
 /// A file opened with [`Store::open_file`].
 struct Opened {
     blob: PathBuf,
@@ -653,6 +666,61 @@ impl Store {
             all.insert(folder.to_path_buf(), foreign);
         }
         Ok(())
+    }
+
+    /// What [`adopt_from`](Self::adopt_from) would bring in with `other`,
+    /// without changing anything: each item's path in this drive (the
+    /// folder it sits in, then its real name), whether it's a folder and,
+    /// for a folder, how many items it holds directly. Also how many items
+    /// are from yet another drive.
+    pub fn preview_from(&self, other: &Key) -> io::Result<(Vec<Found>, usize)> {
+        self.sweep()?;
+        let strays: Vec<(PathBuf, String)> = lock(&self.foreign)
+            .iter()
+            .flat_map(|(d, names)| names.iter().map(move |n| (d.clone(), n.clone())))
+            .collect();
+        let mut found = Vec::new();
+        let mut left = 0;
+        for (folder, name) in strays {
+            let path = folder.join(&name);
+            let item = if path.is_dir() {
+                read_listing(&path, other).ok().map(|l| Found {
+                    path: String::new(),
+                    name: l.name.unwrap_or_else(|| RECOVERED.into()),
+                    is_dir: true,
+                    items: l.children.len(),
+                })
+            } else {
+                Envelope::read(&path, other).ok().map(|e| Found { path: String::new(), name: e.name, is_dir: false, items: 0 })
+            };
+            match item {
+                Some(mut f) => {
+                    let at = self.real_path_of(&folder).unwrap_or_default();
+                    f.path = if at.is_empty() { f.name.clone() } else { format!("{at}/{}", f.name) };
+                    found.push(f);
+                }
+                None => left += 1,
+            }
+        }
+        found.sort_by(|a, b| names::fold(&a.path).cmp(&names::fold(&b.path)));
+        Ok((found, left))
+    }
+
+    /// The drive path (real names, `/`-separated; `""` for the top) of the
+    /// disk folder `disk`, found by looking each boring name up in its
+    /// parent's list.
+    fn real_path_of(&self, disk: &Path) -> Option<String> {
+        let rel = disk.strip_prefix(&self.backing_dir).ok()?;
+        let mut cur = self.backing_dir.clone();
+        let mut out = Vec::new();
+        for c in rel.components() {
+            let boring = c.as_os_str().to_str()?;
+            let dir = self.dirs.load(&cur, &self.key).ok()?;
+            let child = dir.children().iter().find(|ch| ch.boring == boring)?;
+            out.push(child.real.clone());
+            cur = cur.join(boring);
+        }
+        Some(out.join("/"))
     }
 
     /// Bring in the strays from the drive whose master key is `other`:
@@ -2772,6 +2840,14 @@ mod tests {
         assert_eq!(names(&two), ["mine.txt"], "not shown, not deleted");
         assert_eq!(two.foreign_count(), 2);
         assert!(d2.path().join(&doc.boring).exists());
+
+        // A look first: what would come in, and where, changing nothing.
+        let (found, left) = two.preview_from(&[8u8; 32]).unwrap();
+        let shown: Vec<(&str, bool, usize)> = found.iter().map(|f| (f.path.as_str(), f.is_dir, f.items)).collect();
+        assert_eq!(shown, [("a.doc", false, 0), ("Album", true, 1)]);
+        assert_eq!(left, 0);
+        assert_eq!(two.preview_from(&[1u8; 32]).unwrap().1, 2, "the wrong key recognizes nothing");
+        assert_eq!(names(&two), ["mine.txt"]);
 
         // The wrong drive's key brings nothing in.
         assert_eq!(two.adopt_from(&[1u8; 32]).unwrap(), (0, 2));
