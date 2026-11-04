@@ -30,14 +30,15 @@
 //!   cloak missing <dir>                what has gone missing -> {missing:
 //!                                      [{path, is_dir, since}]}
 //!   cloak missing-clear <dir>          dismiss that record
-//!   cloak adopt-check <dir> <other-dir>  what adopt would bring in, changing
+//!   cloak adopt-check <dir> [<other-dir>]  what adopt would bring in, changing
 //!                                      nothing -> {found: [{path, name,
 //!                                      is_dir, items}], left}
-//!   cloak adopt  <dir> <other-dir>     bring in what came from the other
-//!                                      drive (its password in
-//!                                      CLOAK_OTHER_PASSPHRASE) -> {adopted, left}
+//!   cloak adopt  <dir> [<other-dir>]   bring in what came from another drive
+//!                                      (its password in CLOAK_OTHER_PASSPHRASE;
+//!                                      its folder isn't needed: the strays
+//!                                      carry its lock) -> {adopted, left}
 //!   cloak passwd <dir>                 change the password (the new one in
-//!                                      CLOAK_NEW_PASSPHRASE)
+//!                                      CLOAK_NEW_PASSPHRASE); prints progress
 
 use cloak::Store;
 use std::env;
@@ -84,50 +85,49 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             Store::open_with_passphrase(dir, &pass)?.clear_missing()?;
             return Ok(ok());
         }
-        "adopt" => {
-            let other_dir = req(args, 2)?;
+        "adopt" | "adopt-check" => {
             let other_pass =
                 env::var("CLOAK_OTHER_PASSPHRASE").map_err(|_| "CLOAK_OTHER_PASSPHRASE not set")?;
-            let meta = std::fs::read(std::path::Path::new(&other_dir).join("meta.json"))
-                .map_err(|e| format!("the other drive's folder has no drive header ({e})"))?;
-            let (other, _) = cloak::engine::key_from_meta(&meta, &other_pass)
-                .map_err(|e| format!("the other drive: {e}"))?;
             let mut s = Store::open_with_passphrase(dir, &pass)?;
-            let (adopted, left) = s.adopt_from(&other)?;
+            // The other drive's key: from its folder if given, otherwise from
+            // the locks the strays here carry.
+            let others = match args.get(2) {
+                Some(other_dir) => vec![
+                    cloak::engine::unlock(std::path::Path::new(other_dir), &other_pass)
+                        .map_err(|e| format!("the other drive: {e}"))?
+                        .master,
+                ],
+                None => s.keys_for_strays(&other_pass)?,
+            };
+            if others.is_empty() {
+                return Err("the other drive: wrong password (nothing waiting here opens with it)".into());
+            }
+            if cmd == "adopt-check" {
+                let mut found = Vec::new();
+                for k in &others {
+                    found.extend(s.preview_from(k)?.0);
+                }
+                let left = s.foreign_count().saturating_sub(found.len());
+                return Ok(serde_json::json!({ "found": found, "left": left }).to_string());
+            }
+            let mut adopted = 0;
+            for k in &others {
+                adopted += s.adopt_from(k)?.0;
+            }
+            let left = s.foreign_count();
             return Ok(serde_json::json!({ "adopted": adopted, "left": left }).to_string());
-        }
-        "adopt-check" => {
-            let other_dir = req(args, 2)?;
-            let other_pass =
-                env::var("CLOAK_OTHER_PASSPHRASE").map_err(|_| "CLOAK_OTHER_PASSPHRASE not set")?;
-            let meta = std::fs::read(std::path::Path::new(&other_dir).join("meta.json"))
-                .map_err(|e| format!("the other drive's folder has no drive header ({e})"))?;
-            let (other, _) = cloak::engine::key_from_meta(&meta, &other_pass)
-                .map_err(|e| format!("the other drive: {e}"))?;
-            let s = Store::open_with_passphrase(dir, &pass)?;
-            let (found, left) = s.preview_from(&other)?;
-            return Ok(serde_json::json!({ "found": found, "left": left }).to_string());
         }
         "passwd" => {
             let new = env::var("CLOAK_NEW_PASSPHRASE").map_err(|_| "CLOAK_NEW_PASSPHRASE not set")?;
-            if new.is_empty() {
-                return Err("the new password is empty".into());
-            }
-            cloak::engine::change_password(std::path::Path::new(dir), &pass, &new)?;
+            let mut progress = progress_lines();
+            cloak::engine::change_password(std::path::Path::new(dir), &pass, &new, &mut progress)?;
             return Ok(ok());
         }
         _ => {}
     }
     if cmd == "convert" || cmd == "unconvert" {
         let dir = std::path::Path::new(dir);
-        let mut shown = std::time::Instant::now();
-        let mut progress = |done: u64, total: u64| {
-            // A line every so often is plenty for a progress bar.
-            if done == total || shown.elapsed() >= std::time::Duration::from_millis(200) {
-                shown = std::time::Instant::now();
-                println!("{}", serde_json::json!({ "progress": done, "total": total }));
-            }
-        };
+        let mut progress = progress_lines();
         if cmd == "convert" {
             cloak::convert::convert(dir, &pass, REGION, &mut progress)?;
         } else {
@@ -208,8 +208,9 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
 }
 
 /// Recovery backups (see `cloak::backup`). The backup's password comes from
-/// CLOAK_BACKUP_PASSPHRASE; restoring also needs the drive's own in
-/// CLOAK_PASSPHRASE.
+/// CLOAK_BACKUP_PASSPHRASE. Backing up needs each drive's own password too:
+/// CLOAK_DRIVE_PASSPHRASES, a JSON list in the order the drives are given,
+/// or CLOAK_PASSPHRASE for them all; restoring needs it in CLOAK_PASSPHRASE.
 ///
 ///   backup <out-file> <name> <drive-dir> [<name> <drive-dir> ...]
 ///   backup-list <file>              -> [{name, path, files}], plus created
@@ -225,9 +226,20 @@ fn backup_command(cmd: &str, args: &[String]) -> Result<Option<String>, Box<dyn 
             if pairs.is_empty() || pairs.len() % 2 != 0 {
                 return Err("usage: cloak backup <out-file> <name> <drive-dir> [...]".into());
             }
+            let passwords: Vec<String> = match env::var("CLOAK_DRIVE_PASSPHRASES") {
+                Ok(list) => serde_json::from_str(&list).map_err(|e| format!("CLOAK_DRIVE_PASSPHRASES: {e}"))?,
+                Err(_) => {
+                    let one = env::var("CLOAK_PASSPHRASE").map_err(|_| "set CLOAK_DRIVE_PASSPHRASES or CLOAK_PASSPHRASE")?;
+                    vec![one; pairs.len() / 2]
+                }
+            };
+            if passwords.len() != pairs.len() / 2 {
+                return Err("CLOAK_DRIVE_PASSPHRASES needs one password per drive".into());
+            }
             let drives = pairs
                 .chunks(2)
-                .map(|p| backup::collect(&p[0], Path::new(&p[1])))
+                .zip(&passwords)
+                .map(|(p, pw)| backup::collect(&p[0], Path::new(&p[1]), pw))
                 .collect::<Result<Vec<_>, _>>()?;
             let files: usize = drives.iter().map(|d| d.files.len()).sum();
             let count = drives.len();
@@ -258,6 +270,18 @@ fn backup_command(cmd: &str, args: &[String]) -> Result<Option<String>, Box<dyn 
         }
         _ => return Ok(None),
     }))
+}
+
+/// Print `{"progress": n, "total": t}` lines as work goes on (a line every
+/// so often is plenty for a progress bar).
+fn progress_lines() -> impl FnMut(u64, u64) {
+    let mut shown = std::time::Instant::now();
+    move |done: u64, total: u64| {
+        if done == total || shown.elapsed() >= std::time::Duration::from_millis(200) {
+            shown = std::time::Instant::now();
+            println!("{}", serde_json::json!({ "progress": done, "total": total }));
+        }
+    }
 }
 
 fn ok() -> String {

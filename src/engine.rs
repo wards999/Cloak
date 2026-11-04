@@ -998,7 +998,7 @@ impl Store {
                 None => left += 1,
             }
         }
-        found.sort_by(|a, b| names::fold(&a.path).cmp(&names::fold(&b.path)));
+        found.sort_by_key(|f| names::fold(&f.path));
         Ok((found, left))
     }
 
