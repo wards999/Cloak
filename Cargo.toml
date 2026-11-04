@@ -1,6 +1,6 @@
 [package]
 name = "cloak"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "A name-mapping overlay filesystem with header/footer encryption. Obfuscation layer, not a security guarantee."
 
