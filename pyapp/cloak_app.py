@@ -27,6 +27,7 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
     ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
     RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter, ProgressBar,
+    TransparentDropDownPushButton, RoundMenu, Action,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1068,20 +1069,19 @@ class DriveCard(CardWidget):
         else:
             unlockb = PrimaryPushButton("Unlock", self)
             unlockb.clicked.connect(lambda: callbacks["unlock"](drive))
-            removeb = TransparentPushButton("Remove", self)
-            removeb.clicked.connect(lambda: callbacks["remove"](drive))
-            row.addWidget(unlockb); row.addStretch(1); row.addWidget(removeb)
-        backupb = TransparentToolButton(FIF.SAVE, self)
-        backupb.setToolTip("Back up this drive's recovery files")
-        backupb.installEventFilter(ToolTipFilter(backupb))
-        backupb.clicked.connect(lambda: callbacks["backup"](drive))
-        row.insertWidget(1, backupb)
-        if not unlocked:
-            plainb = TransparentToolButton(FIF.RETURN, self)
-            plainb.setToolTip("Turn back into a plain folder")
-            plainb.installEventFilter(ToolTipFilter(plainb))
-            plainb.clicked.connect(lambda: callbacks["unconvert"](drive))
-            row.insertWidget(2, plainb)
+            # The occasional actions, each spelled out, in one menu: as
+            # buttons they don't fit, and as bare icons they don't explain
+            # themselves.
+            more = TransparentDropDownPushButton("More", self)
+            menu = RoundMenu(parent=more)
+            menu.addAction(Action(FIF.SAVE, "Back up recovery files…", triggered=lambda: callbacks["backup"](drive)))
+            menu.addAction(Action(FIF.RETURN, "Turn back into a plain folder…",
+                                  triggered=lambda: callbacks["unconvert"](drive)))
+            menu.addSeparator()
+            menu.addAction(Action(FIF.CLOSE, "Remove from list (keeps the folder)",
+                                  triggered=lambda: callbacks["remove"](drive)))
+            more.setMenu(menu)
+            row.addWidget(unlockb); row.addStretch(1); row.addWidget(more)
         lay.addLayout(row)
 
 
