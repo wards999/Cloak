@@ -235,6 +235,11 @@ name, so the hidden files can be moved around outside cloak:
   both drives' passwords and re-seals each envelope (about 512 bytes per file,
   whatever its size). Do this with both drives locked.
 
+- **A folder's contents copied, `manifest.idx` and all, over another
+  folder's**: the list that replaced this folder's own can't be opened with
+  the drive's key, so it's set aside (kept, as `unreadable-list-….bak`) and
+  the folder's list is rebuilt from its files: nothing of this drive's goes
+  missing, and what came from the other drive waits to be brought in.
 - **Out of a drive** (a hidden file or folder moved away, or deleted,
   outside cloak): it drops out of the drive, and the card says how many items
   have gone missing; **More → Show missing items** lists them, with when they

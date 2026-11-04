@@ -70,7 +70,10 @@ fn is_litter(name: &str) -> bool {
 pub(crate) fn is_reserved(name: &str, at_root: bool) -> bool {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(durable::SIDE_SUFFIX).unwrap_or(&lower);
-    is_list_file(stem) || is_conflict_copy(stem) || (at_root && ROOT_RESERVED.contains(&stem))
+    is_list_file(stem)
+        || is_conflict_copy(stem)
+        || stem.starts_with("unreadable-list-")
+        || (at_root && ROOT_RESERVED.contains(&stem))
 }
 
 /// The real name a name on disk stands for: on Windows, the characters it

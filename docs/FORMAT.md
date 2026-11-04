@@ -98,6 +98,16 @@ checked against its list in memory:
   clears; a move between two folders of the drive isn't recorded, whichever
   folder is seen first. Dismissing the record deletes `missing.idx`.
 
+**A list that won't open** (damaged, or another drive's list copied over
+this one, as happens when a folder's contents are copied together with its
+`manifest.idx`) is set aside as `unreadable-list-<time>-manifest.idx.bak`,
+never deleted, and the folder's list is rebuilt the same way: its files by
+their envelopes, its subfolders by their own lists (or, if a subfolder's
+list is unreadable too but it holds something this drive's key opens, it's
+repaired as well), its own name from its parent's list. A folder whose name
+was only in unreadable lists comes back as "Recovered folder". Anything
+from the other drive waits to be brought in.
+
 A folder is only rescanned when its modified time has changed. Bringing in
 another drive's strays (`cloak adopt`) needs both drives' passwords: each
 envelope (and each list, for a folder) is opened with the other drive's

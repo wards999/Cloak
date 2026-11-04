@@ -444,6 +444,12 @@ impl DirCache {
         Ok(f(Arc::make_mut(&mut e.dir)))
     }
 
+    /// Drop `dir`'s cached list, unsaved edits and all (its file was set
+    /// aside).
+    pub fn forget(&self, dir: &Path) {
+        self.map().remove(dir);
+    }
+
     /// When the oldest unsaved edit was made.
     pub fn oldest_unsaved(&self) -> Option<Instant> {
         self.map().values().filter_map(|e| e.dirty.as_ref().map(|d| d.0)).min()

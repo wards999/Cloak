@@ -252,6 +252,8 @@ pub struct Store {
     /// check (file ID, boring name): their old entry's disappearance, found
     /// later in another folder, is a move, not a loss.
     arrived: Mutex<Vec<(crate::envelope::FileId, String)>>,
+    /// Folders whose unreadable list was set aside and rebuilt.
+    repaired: Mutex<Vec<PathBuf>>,
     /// Each folder's modified time when last checked for strays.
     checked: Mutex<HashMap<PathBuf, SystemTime>>,
 }
@@ -393,6 +395,7 @@ impl Store {
             foreign: Mutex::default(),
             missing: Mutex::default(),
             arrived: Mutex::default(),
+            repaired: Mutex::default(),
             checked: Mutex::default(),
         };
         store.recover()?;
@@ -454,7 +457,7 @@ impl Store {
     fn resolve_dir(&self, comps: &[String]) -> io::Result<PathBuf> {
         let mut cur = self.backing_dir.clone();
         for name in comps {
-            let manifest = self.dirs.load(&cur, &self.key)?;
+            let manifest = self.dir(&cur)?;
             let child = manifest
                 .find(name)
                 .filter(|c| c.is_dir())
@@ -477,7 +480,7 @@ impl Store {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
-        let manifest = self.dirs.load(&parent_disk, &self.key)?;
+        let manifest = self.dir(&parent_disk)?;
         Ok(manifest.find(&name).map(|c| self.disk_metadata(c.is_dir(), c.size, &parent_disk.join(&c.boring))))
     }
 
@@ -500,7 +503,7 @@ impl Store {
             return Ok(self.backing_dir.clone());
         };
         let parent_disk = self.resolve_dir(parent)?;
-        let manifest = self.dirs.load(&parent_disk, &self.key)?;
+        let manifest = self.dir(&parent_disk)?;
         let child = manifest.find(name).ok_or_else(not_found)?;
         Ok(parent_disk.join(&child.boring))
     }
@@ -533,7 +536,7 @@ impl Store {
     /// List a directory without reading anything else from the disk.
     pub fn list_entries(&self, path: &str) -> io::Result<Vec<DirEntry>> {
         let disk = self.resolve_dir(&components(path))?;
-        let manifest = self.dirs.load(&disk, &self.key)?;
+        let manifest = self.dir(&disk)?;
         Ok(manifest
             .children()
             .iter()
@@ -587,6 +590,64 @@ impl Store {
     // Files and folders on disk that a folder's list doesn't name: moved
     // there by hand, or left by a list that was lost. See `docs/FORMAT.md`.
 
+    /// A folder's list. One that's there but won't open with the drive's key
+    /// (damaged, or copied over from another drive's folder) is set aside,
+    /// not deleted, as `unreadable-list-….bak`, and the list is rebuilt from
+    /// what's on disk: this drive's files and folders by their envelopes and
+    /// own names, the folder's own name from its parent's list.
+    fn dir(&self, folder: &Path) -> io::Result<Arc<Dir>> {
+        match self.dirs.load(folder, &self.key) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData && manifest::Manifest::path_in(folder).exists() => {
+                self.set_aside_list(folder)?;
+                if let Some(found) = scan(folder) {
+                    self.reconcile(folder, &found)?;
+                }
+                if folder != self.backing_dir {
+                    let name = self.real_path_of(folder).and_then(|p| p.rsplit('/').next().map(str::to_string));
+                    if let Some(name) = name.filter(|n| !n.is_empty()) {
+                        self.dirs.edit(folder, &self.key, |d| d.set_name(Some(name)))?;
+                    }
+                }
+                self.dirs.load(folder, &self.key)
+            }
+            r => r,
+        }
+    }
+
+    /// Does the disk folder `dir` hold anything this drive's key opens (a
+    /// file's envelope, or a subfolder's list)?
+    fn holds_ours(&self, dir: &Path) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else { return false };
+        rd.flatten().any(|e| match e.file_type() {
+            Ok(t) if t.is_file() => Envelope::read(&e.path(), &self.key).is_ok(),
+            Ok(t) if t.is_dir() => {
+                manifest::Manifest::path_in(&e.path()).exists() && read_listing(&e.path(), &self.key).is_ok()
+            }
+            _ => false,
+        })
+    }
+
+    /// Move a folder's unreadable list files out of the way, keeping them.
+    fn set_aside_list(&self, folder: &Path) -> io::Result<()> {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        for e in std::fs::read_dir(folder)?.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            if manifest::is_list_file(&name) {
+                std::fs::rename(e.path(), folder.join(format!("unreadable-list-{stamp}-{name}.bak")))?;
+            }
+        }
+        durable::sync_dir(folder)?;
+        self.dirs.forget(folder);
+        lock(&self.checked).remove(folder);
+        lock(&self.repaired).push(folder.to_path_buf());
+        Ok(())
+    }
+
+    /// Folders whose list couldn't be opened and was rebuilt (see `dir`).
+    pub fn repaired_count(&self) -> usize {
+        lock(&self.repaired).len()
+    }
+
     /// Check the folder at `path` for strays, if it has changed since it was
     /// last checked: one scan of its disk folder, compared with its list in
     /// memory. A stray from this drive (its envelope, or a folder's list,
@@ -620,7 +681,7 @@ impl Store {
             } else if checked.is_err() {
                 continue;
             }
-            let Ok(dir) = self.dirs.load(&folder, &self.key) else {
+            let Ok(dir) = self.dir(&folder) else {
                 continue; // a damaged list: reported when the folder is opened
             };
             folders.extend(dir.children().iter().filter(|c| c.is_dir()).map(|c| folder.join(&c.boring)));
@@ -640,7 +701,9 @@ impl Store {
     /// Compare a folder's scan with its list (see `check_folder`).
     fn reconcile(&self, folder: &Path, found: &HashMap<OsString, std::fs::Metadata>) -> io::Result<()> {
         let at_root = folder == self.backing_dir;
-        let dir = self.dirs.load(folder, &self.key)?;
+        // Through `dir`, so an unreadable list is set aside and rebuilt (by
+        // this same comparison, then against an empty list).
+        let dir = self.dir(folder)?;
         let mut adopt = Vec::new();
         let mut foreign = BTreeSet::new();
         for (name, m) in found {
@@ -658,6 +721,12 @@ impl Store {
                 }
                 match read_listing(&path, &self.key) {
                     Ok(l) => adopt.push(Child::dir(l.name.unwrap_or_else(|| RECOVERED.into()), name.into())),
+                    // Its list won't open, but what's in it does: this drive's
+                    // folder with a damaged list. Repair it and take it in.
+                    Err(_) if self.holds_ours(&path) => {
+                        let l = self.dir(&path)?;
+                        adopt.push(Child::dir(l.name().unwrap_or(RECOVERED).to_string(), name.into()));
+                    }
                     Err(_) => {
                         foreign.insert(name.to_string());
                     }
@@ -857,7 +926,7 @@ impl Store {
         let mut out = Vec::new();
         for c in rel.components() {
             let boring = c.as_os_str().to_str()?;
-            let dir = self.dirs.load(&cur, &self.key).ok()?;
+            let dir = self.dir(&cur).ok()?;
             let child = dir.children().iter().find(|ch| ch.boring == boring)?;
             out.push(child.real.clone());
             cur = cur.join(boring);
@@ -978,7 +1047,7 @@ impl Store {
         let mut cur = self.backing_dir.clone();
         let mut out = Vec::with_capacity(comps.len());
         for (i, name) in comps.iter().enumerate() {
-            let manifest = self.dirs.load(&cur, &self.key)?;
+            let manifest = self.dir(&cur)?;
             let Some(child) = manifest.find(name) else {
                 return Ok(None);
             };
@@ -1017,7 +1086,7 @@ impl Store {
         names::validate(&name)?;
         let parent_disk = self.resolve_dir(&parent)?;
         let boring = {
-            let dir = self.dirs.load(&parent_disk, &self.key)?;
+            let dir = self.dir(&parent_disk)?;
             if dir.find(&name).is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -1042,7 +1111,7 @@ impl Store {
         names::validate(&name)?;
         let parent_disk = self.resolve_dir(&parent)?;
         let boring = {
-            let dir = self.dirs.load(&parent_disk, &self.key)?;
+            let dir = self.dir(&parent_disk)?;
             if let Some(existing) = dir.find(&name) {
                 if existing.is_dir() {
                     return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
@@ -1246,7 +1315,7 @@ impl Store {
             return Ok(crypt);
         }
         let (dir, boring) = split_blob(blob)?;
-        let entry = self.dirs.load(&dir, &self.key)?.children().iter().find(|c| c.boring == boring).cloned();
+        let entry = self.dir(&dir)?.children().iter().find(|c| c.boring == boring).cloned();
         let Some(mut entry) = entry else {
             return Ok(crypt); // not listed (being moved): leave it be
         };
@@ -1342,7 +1411,7 @@ impl Store {
     fn file_blob(&self, path: &str) -> io::Result<(PathBuf, Crypt)> {
         let (parent, name) = parent_and_name(path)?;
         let parent_disk = self.resolve_dir(&parent)?;
-        let manifest = self.dirs.load(&parent_disk, &self.key)?;
+        let manifest = self.dir(&parent_disk)?;
         let child = manifest.find(&name).ok_or_else(not_found)?;
         if child.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
@@ -1463,7 +1532,7 @@ impl Store {
     pub fn remove(&mut self, path: &str) -> io::Result<()> {
         let (parent, name) = parent_and_name(path)?;
         let parent_disk = self.resolve_dir(&parent)?;
-        if self.dirs.load(&parent_disk, &self.key)?.find(&name).is_none() {
+        if self.dir(&parent_disk)?.find(&name).is_none() {
             return Ok(());
         }
         let child = self
@@ -1501,7 +1570,7 @@ impl Store {
         names::validate(&new_name)?;
 
         let old_parent_disk = self.resolve_dir(&old_parent)?;
-        let old_manifest = self.dirs.load(&old_parent_disk, &self.key)?;
+        let old_manifest = self.dir(&old_parent_disk)?;
         let pos = old_manifest.position(&old_name).ok_or_else(not_found)?;
         let moving_dir = old_manifest.children()[pos].is_dir();
         let new_parent_disk = self.resolve_dir(&new_parent)?;
@@ -1511,7 +1580,7 @@ impl Store {
         let target = if same_parent {
             old_manifest.position(&new_name).filter(|&p| p != pos)
         } else {
-            self.dirs.load(&new_parent_disk, &self.key)?.position(&new_name)
+            self.dir(&new_parent_disk)?.position(&new_name)
         };
         let mut replaced = None;
         if let Some(t) = target {
@@ -1541,7 +1610,7 @@ impl Store {
             let manifest = if same_parent {
                 old_manifest.clone()
             } else {
-                self.dirs.load(&new_parent_disk, &self.key)?
+                self.dir(&new_parent_disk)?
             };
             let boring = manifest.children()[t].boring.clone();
             self.durable_len.remove(&new_parent_disk.join(&boring));
@@ -1574,7 +1643,7 @@ impl Store {
 
         // Across folders the boring entry moves on disk and two lists change:
         // journaled, and saved before returning.
-        let new_manifest = self.dirs.load(&new_parent_disk, &self.key)?;
+        let new_manifest = self.dir(&new_parent_disk)?;
         child.boring = generate_unique(&mut rand::thread_rng(), &Taken { dir: &new_manifest, at: &new_parent_disk });
         drop(new_manifest);
         child.real = new_name.clone();
@@ -1607,7 +1676,7 @@ impl Store {
     pub fn read_at(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let (parent, name) = parent_and_name(path)?;
         let parent_disk = self.resolve_dir(&parent)?;
-        let manifest = self.dirs.load(&parent_disk, &self.key)?;
+        let manifest = self.dir(&parent_disk)?;
         let child = manifest.find(&name).ok_or_else(not_found)?;
         if child.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
@@ -1787,7 +1856,7 @@ impl Store {
                 for (dir, boring) in items {
                     let dir = self.abs(dir);
                     // Still listed means the save that dropped it never happened.
-                    if dir.is_dir() && !self.dirs.load(&dir, &self.key)?.has_boring(boring) {
+                    if dir.is_dir() && !self.dir(&dir)?.has_boring(boring) {
                         delete_entry(&dir.join(boring))?;
                         durable::sync_dir(&dir)?;
                     }
@@ -1831,7 +1900,7 @@ impl Store {
             Journal::Renonce { dir, boring, nonce, len, ranges } => {
                 let dir = self.abs(dir);
                 let done = dir.is_dir()
-                    && self.dirs.load(&dir, &self.key)?.children().iter().any(|c| c.boring == *boring && c.nonce == *nonce);
+                    && self.dir(&dir)?.children().iter().any(|c| c.boring == *boring && c.nonce == *nonce);
                 if done {
                     Ok(())
                 } else {
@@ -3063,18 +3132,85 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_list_is_refused() {
+    fn an_unreadable_list_is_set_aside_and_rebuilt() {
         let d = tempdir().unwrap();
         let mut s = store(d.path());
-        s.create("x").unwrap();
+        s.mkdir("Sub").unwrap();
+        s.create("Sub/inner.txt").unwrap();
+        s.write_at("Sub/inner.txt", 0, b"in").unwrap();
+        s.create("x.txt").unwrap();
+        s.write_at("x.txt", 0, b"ex").unwrap();
         s.sync().unwrap();
+        let sub = d.path().join(entry(&s, d.path(), "Sub").boring);
         drop(s);
+        // A changed byte in the top list, and the subfolder's list garbled.
         let path = d.path().join(manifest::MANIFEST_NAME);
         let mut raw = std::fs::read(&path).unwrap();
         let mid = raw.len() / 2;
         raw[mid] ^= 1;
         std::fs::write(&path, raw).unwrap();
+        std::fs::write(sub.join(manifest::MANIFEST_NAME), b"not a list").unwrap();
+
         let s = Store::open(d.path(), [9u8; 32], 128).unwrap();
-        assert_eq!(s.list_dir("").err().map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+        let mut top: Vec<String> = s.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
+        top.sort();
+        // Both lists that knew the folder's name were unreadable.
+        assert_eq!(top, [RECOVERED, "x.txt"]);
+        assert_eq!(s.read_all(&format!("{RECOVERED}/inner.txt")).unwrap(), b"in");
+        assert_eq!(s.repaired_count(), 2);
+        let kept = |dir: &Path| {
+            std::fs::read_dir(dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("unreadable-list-"))
+        };
+        assert!(kept(d.path()) && kept(&sub), "the unreadable lists are kept");
+        assert_eq!(s.foreign_count(), 0, "set-aside lists aren't strays");
+    }
+
+    #[test]
+    fn a_folder_whose_own_list_is_unreadable_keeps_its_name() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("Sub").unwrap();
+        s.create("Sub/inner.txt").unwrap();
+        s.write_at("Sub/inner.txt", 0, b"in").unwrap();
+        s.sync().unwrap();
+        let sub = d.path().join(entry(&s, d.path(), "Sub").boring);
+        drop(s);
+        std::fs::write(sub.join(manifest::MANIFEST_NAME), b"not a list").unwrap();
+
+        let mut s = Store::open(d.path(), [9u8; 32], 128).unwrap();
+        assert_eq!(s.list_dir("Sub").unwrap().into_iter().map(|e| e.0).collect::<Vec<_>>(), ["inner.txt"]);
+        assert_eq!(s.read_all("Sub/inner.txt").unwrap(), b"in");
+        s.sync().unwrap();
+        drop(s);
+        assert_eq!(read_listing(&sub, &[9u8; 32]).unwrap().name.as_deref(), Some("Sub"), "named from its parent");
+    }
+
+    #[test]
+    fn another_drives_list_copied_over_this_ones() {
+        let (da, db) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut a = other_store(da.path());
+        a.create("from-a.txt").unwrap();
+        a.write_at("from-a.txt", 0, b"A").unwrap();
+        a.sync().unwrap();
+        drop(a);
+        let mut b = store(db.path());
+        b.create("mine.txt").unwrap();
+        b.write_at("mine.txt", 0, b"B").unwrap();
+        b.sync().unwrap();
+        drop(b);
+        // Everything in A's folder copied into B's, its list replacing B's.
+        for e in std::fs::read_dir(da.path()).unwrap().flatten() {
+            if e.file_name() != "meta.json" {
+                std::fs::copy(e.path(), db.path().join(e.file_name())).unwrap();
+            }
+        }
+
+        let mut b = store(db.path());
+        let names: Vec<String> = b.list_dir("").unwrap().into_iter().map(|e| e.0).collect();
+        assert_eq!(names, ["mine.txt"], "this drive's own file is back");
+        assert_eq!(b.read_all("mine.txt").unwrap(), b"B");
+        assert_eq!(b.foreign_count(), 1, "the other drive's file waits");
+        assert_eq!(b.adopt_from(&[8u8; 32]).unwrap(), (1, 0));
+        assert_eq!(b.read_all("from-a.txt").unwrap(), b"A");
     }
 }
