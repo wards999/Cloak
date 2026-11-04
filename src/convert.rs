@@ -52,7 +52,7 @@ const JOURNAL_LABEL: &[u8] = b"cloak-convert-journal-v2";
 const META: &str = "meta.json";
 
 /// Names a drive keeps for itself at its top level (besides folder lists).
-const ROOT_RESERVED: &[&str] = &[META, "journal.idx", CONVERTING, UNCONVERTING, JOURNAL];
+const ROOT_RESERVED: &[&str] = &[META, "journal.idx", "missing.idx", CONVERTING, UNCONVERTING, JOURNAL];
 
 /// Is a conversion either way under way in `dir`?
 pub fn in_progress(dir: &Path) -> bool {
@@ -594,7 +594,7 @@ impl<'a> Run<'a> {
             }
         }
         if at_root {
-            for name in ["journal.idx", "journal.idx.new", "meta.json.new"] {
+            for name in ["journal.idx", "journal.idx.new", "meta.json.new", "missing.idx", "missing.idx.new"] {
                 let _ = fs::remove_file(dir.join(name));
             }
         }

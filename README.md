@@ -235,11 +235,17 @@ name, so the hidden files can be moved around outside cloak:
   both drives' passwords and re-seals each envelope (about 512 bytes per file,
   whatever its size). Do this with both drives locked.
 
+- **Out of a drive** (a hidden file or folder moved away, or deleted,
+  outside cloak): it drops out of the drive, and the card says how many items
+  have gone missing; **More → Show missing items** lists them, with when they
+  went. Nothing is deleted by cloak: put one back and it reappears.
+
 The same from the command line, plus the password change that format 2 makes
 instant (only `meta.json` changes):
 
 ```bash
-CLOAK_PASSPHRASE=... cloak strays D:/Work                    # -> {"foreign": n}
+CLOAK_PASSPHRASE=... cloak strays D:/Work                    # -> {"foreign": n, "missing": m}
+CLOAK_PASSPHRASE=... cloak missing D:/Work                   # what went missing, and when
 CLOAK_PASSPHRASE=... CLOAK_OTHER_PASSPHRASE=... cloak adopt D:/Work D:/Holiday
 CLOAK_PASSPHRASE=old CLOAK_NEW_PASSPHRASE=new cloak passwd D:/Work
 ```

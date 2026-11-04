@@ -993,6 +993,76 @@ class AdoptDialog(FocusedDialog):
         return False
 
 
+class MissingDialog(FocusedDialog):
+    """What has gone missing from a drive (moved out of its folder, or
+    deleted, outside cloak): look with the password, then dismiss the record."""
+
+    def __init__(self, parent, drive, count):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.titleLabel = SubtitleLabel(f"Missing from “{drive['name']}”", self)
+        what = f"{count} item{'s' if count != 1 else ''}" if count else "Items"
+        self.intro = CaptionLabel(
+            f"{what} listed in this drive went missing from its folder: moved out or deleted outside cloak. "
+            "Nothing was deleted by cloak; if one is put back into the drive's folder, it reappears by itself.",
+            self)
+        self.intro.setWordWrap(True)
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("The drive's password")
+        self.summary = BodyLabel("", self); self.summary.setWordWrap(True); self.summary.hide()
+        self.found = ListWidget(self); self.found.setFixedHeight(160); self.found.hide()
+        for w in (self.titleLabel, self.intro, self.pw, self.summary, self.found):
+            self.viewLayout.addWidget(w)
+        self.finish_layout()
+        self.cancelButton.setText("Close")
+        self.widget.setMinimumWidth(470)
+        self.pw.returnPressed.connect(self.yesButton.click)
+        self.pw.textChanged.connect(self._unchecked)
+        self.first = self.pw
+        self.shown = False
+        self.dismissed = False
+        self._unchecked()
+
+    def _unchecked(self, *_):
+        self.shown = False
+        self.summary.hide()
+        self.found.hide()
+        self.yesButton.setText("Show missing items")
+        self.busy_text = "Looking…"
+
+    def validate(self):
+        if not self.pw.text():
+            return self.problem("Enter the drive's password.", self.pw)
+        env = {"CLOAK_PASSPHRASE": self.pw.text()}
+        try:
+            if not self.shown:
+                return self._show(engine(["missing", self.path], **env).get("missing", []))
+            engine(["missing-clear", self.path], **env)
+        except RuntimeError as e:
+            msg = str(e)
+            return self.problem(msg[:1].upper() + msg[1:] + ".", self.pw)
+        self.dismissed = True
+        return True
+
+    def _show(self, missing):
+        if not missing:
+            return self.problem("Nothing is missing from this drive.", self.pw)
+        self.found.clear()
+        for m in missing:
+            when = datetime.fromtimestamp(m["since"]).strftime("%d %b %Y %H:%M")
+            icon = "📁  " if m["is_dir"] else "     "
+            self.found.addItem(f"{icon}{m['path']}   (missing since {when})")
+        n = len(missing)
+        self.summary.setText(f"{n} item{'s' if n != 1 else ''} missing. Dismissing forgets this list; "
+                             "it doesn't delete or change anything.")
+        self.intro.hide()
+        self.summary.show()
+        self.found.show()
+        self.shown = True
+        self.yesButton.setText("Dismiss")
+        self.busy_text = "Dismissing…"
+        return False
+
+
 class PasswordDialog(FocusedDialog):
     """Change a drive's password: instant, as only its header changes."""
 
@@ -1222,9 +1292,10 @@ class RestoreDialog(FocusedDialog):
 # ---- drive card ------------------------------------------------------------
 
 class DriveCard(CardWidget):
-    def __init__(self, drive, mount, callbacks, strays=0):
+    def __init__(self, drive, mount, callbacks, strays=0, missing=0):
         super().__init__()
-        self.setFixedSize(260, 178 if strays else 158)
+        notices = bool(strays) + bool(missing)
+        self.setFixedSize(260, 158 + 20 * notices)
         lay = QVBoxLayout(self); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(5)
 
         lay.addWidget(StrongBodyLabel(drive["name"], self))
@@ -1251,6 +1322,12 @@ class DriveCard(CardWidget):
             waiting.setStyleSheet("color: #ca5010;")
             waiting.setWordWrap(True)
             lay.addWidget(waiting)
+        if missing and not state:
+            what = f"{missing} item{'s' if missing != 1 else ''} gone missing"
+            gone = CaptionLabel(f"◐ {what}" + (": lock to see which" if unlocked else ""), self)
+            gone.setStyleSheet("color: #ca5010;")
+            gone.setWordWrap(True)
+            lay.addWidget(gone)
 
         row = QHBoxLayout()
         if state:
@@ -1275,9 +1352,13 @@ class DriveCard(CardWidget):
             # themselves.
             more = TransparentDropDownPushButton("More", self)
             menu = RoundMenu(parent=more)
+            if missing:
+                menu.addAction(Action(FIF.SEARCH, "Show missing items…",
+                                      triggered=lambda: callbacks["missing"](drive)))
             if strays:
                 menu.addAction(Action(FIF.DOWNLOAD, "Bring in files from another drive…",
                                       triggered=lambda: callbacks["adopt"](drive)))
+            if strays or missing:
                 menu.addSeparator()
             menu.addAction(Action(FIF.SAVE, "Back up recovery files…", triggered=lambda: callbacks["backup"](drive)))
             menu.addAction(Action(FIF.EDIT, "Change password…", triggered=lambda: callbacks["passwd"](drive)))
@@ -1306,7 +1387,8 @@ class DrivesInterface(QWidget):
         # path -> how many items from other drives are waiting there, as the
         # mount last reported (kept after locking).
         self.strays = {}
-        self._strays_seen = {}
+        self.missing = {}  # path -> how many items have gone missing, likewise
+        self._strays_seen = ({}, {})
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._strays_changed)
         self._poll.start(1500)
@@ -1347,9 +1429,11 @@ class DrivesInterface(QWidget):
                 w.deleteLater()
         cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove,
                "backup": lambda d: self.back_up([d]), "resume": self.resume_conversion,
-               "unconvert": self.unconvert, "adopt": self.adopt, "passwd": self.change_password}
+               "unconvert": self.unconvert, "adopt": self.adopt, "passwd": self.change_password,
+               "missing": self.show_missing}
         for d in self.drives:
-            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs, self.strays.get(d["path"], 0)))
+            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs, self.strays.get(d["path"], 0),
+                                           self.missing.get(d["path"], 0)))
 
     def err(self, msg):
         InfoBar.error("Error", msg, duration=4500, position=InfoBarPosition.TOP, parent=self.win)
@@ -1485,11 +1569,12 @@ class DrivesInterface(QWidget):
                     continue
                 if isinstance(msg, dict) and "strays" in msg:
                     self.strays[path] = msg["strays"]
+                    self.missing[path] = msg.get("missing", 0)
         threading.Thread(target=read, daemon=True).start()
 
     def _strays_changed(self):
-        if self.strays != self._strays_seen:
-            self._strays_seen = dict(self.strays)
+        if (self.strays, self.missing) != self._strays_seen:
+            self._strays_seen = (dict(self.strays), dict(self.missing))
             self.refresh()
 
     def adopt(self, drive):
@@ -1508,6 +1593,16 @@ class DrivesInterface(QWidget):
             msg += f" {r['left']} more came from a different drive."
         self.ok(msg)
         self.refresh()
+
+    def show_missing(self, drive):
+        if drive["path"] in self.mounts:
+            return self.err("Lock the drive first.")
+        dlg = MissingDialog(self.win, drive, self.missing.get(drive["path"], 0))
+        dlg.exec()
+        if dlg.dismissed:
+            self.missing[drive["path"]] = 0
+            self.ok("Dismissed the list of missing items.")
+            self.refresh()
 
     def change_password(self, drive):
         dlg = PasswordDialog(self.win, drive)

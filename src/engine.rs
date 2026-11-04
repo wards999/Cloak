@@ -245,12 +245,39 @@ pub struct Store {
     /// Files and folders found in each folder that belong to another drive
     /// (see [`Store::check_folder`]).
     foreign: Mutex<HashMap<PathBuf, BTreeSet<String>>>,
+    /// Items found gone from the disk, kept (sealed, in `missing.idx`) until
+    /// they come back or are dismissed.
+    missing: Mutex<Vec<Missing>>,
+    /// Items taken back in from elsewhere in the drive since the last full
+    /// check (file ID, boring name): their old entry's disappearance, found
+    /// later in another folder, is a move, not a loss.
+    arrived: Mutex<Vec<(crate::envelope::FileId, String)>>,
     /// Each folder's modified time when last checked for strays.
     checked: Mutex<HashMap<PathBuf, SystemTime>>,
 }
 
 /// A file's key and its current content nonce.
 type Crypt = (Key, Nonce);
+
+/// The drive's record of items that went missing (sealed, at the top).
+const MISSING: &str = "missing.idx";
+const MISSING_LABEL: &[u8] = b"cloak-missing-v2";
+
+/// Something listed in the drive whose file or folder was found gone from
+/// the disk (moved out or deleted outside cloak). See [`Store::missing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Missing {
+    /// Where it was in the drive, real names, `/`-separated.
+    pub path: String,
+    pub is_dir: bool,
+    /// When it was found gone, in seconds since 1970.
+    pub since: u64,
+    /// A file's ID (to clear the record if it comes back).
+    #[serde(skip)]
+    id: crate::envelope::FileId,
+    /// Its boring name (how a folder is recognized if it comes back).
+    boring: String,
+}
 
 /// Something from another drive waiting in this one (see
 /// [`Store::preview_from`]).
@@ -364,9 +391,12 @@ impl Store {
             envelopes: HashMap::new(),
             renonced: HashSet::new(),
             foreign: Mutex::default(),
+            missing: Mutex::default(),
+            arrived: Mutex::default(),
             checked: Mutex::default(),
         };
         store.recover()?;
+        *lock(&store.missing) = store.load_missing();
         store.merge_all_conflicts()?;
         Ok(store)
     }
@@ -595,6 +625,9 @@ impl Store {
             };
             folders.extend(dir.children().iter().filter(|c| c.is_dir()).map(|c| folder.join(&c.boring)));
         }
+        // Every folder has been checked: anything taken in whose old entry
+        // didn't turn up had no other entry (a lost list's files, say).
+        lock(&self.arrived).clear();
         Ok(self.foreign_count())
     }
 
@@ -638,17 +671,18 @@ impl Store {
                 }
             }
         }
-        let gone: Vec<String> = dir
+        let gone: Vec<Child> = dir
             .children()
             .iter()
             .filter(|c| !found.contains_key(std::ffi::OsStr::new(&c.boring)))
-            .map(|c| c.boring.clone())
+            .cloned()
             .collect();
         drop(dir);
+        self.note_missing(folder, &gone, &adopt)?;
         if !adopt.is_empty() || !gone.is_empty() {
             self.dirs.edit(folder, &self.key, |d| {
-                for b in &gone {
-                    if let Some(p) = d.position_of_boring(b) {
+                for c in &gone {
+                    if let Some(p) = d.position_of_boring(&c.boring) {
                         d.remove(p);
                     }
                 }
@@ -666,6 +700,114 @@ impl Store {
             all.insert(folder.to_path_buf(), foreign);
         }
         Ok(())
+    }
+
+    /// Record `gone` (dropped from `folder`'s list: found gone from the disk)
+    /// as missing, and clear the records of anything in `back` (taken back
+    /// in) that had gone missing.
+    fn note_missing(&self, folder: &Path, gone: &[Child], back: &[Child]) -> io::Result<()> {
+        if gone.is_empty() && back.is_empty() {
+            return Ok(());
+        }
+        let same = |c: &Child, id: &crate::envelope::FileId, boring: &str| {
+            if c.is_dir() {
+                c.boring == boring
+            } else {
+                c.id == *id && *id != [0; 16]
+            }
+        };
+        let mut missing = lock(&self.missing);
+        let mut arrived = lock(&self.arrived);
+        let before = missing.len();
+        for c in back {
+            // Back after going missing, or moved here from elsewhere in the drive.
+            if missing.iter().any(|m| same(c, &m.id, &m.boring)) {
+                missing.retain(|m| !same(c, &m.id, &m.boring));
+            } else {
+                arrived.push((c.id, c.boring.clone()));
+            }
+        }
+        let mut changed = missing.len() != before;
+        let gone: Vec<&Child> = gone
+            .iter()
+            .filter(|c| match arrived.iter().position(|(id, b)| same(c, id, b)) {
+                Some(i) => {
+                    arrived.swap_remove(i); // moved within the drive
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        drop(arrived);
+        if !gone.is_empty() {
+            let at = self.real_path_of(folder).unwrap_or_default();
+            let since = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            for c in gone {
+                let path = if at.is_empty() { c.real.clone() } else { format!("{at}/{}", c.real) };
+                if !missing.iter().any(|m| m.path == path && m.boring == c.boring) {
+                    missing.push(Missing { path, is_dir: c.is_dir(), since, id: c.id, boring: c.boring.clone() });
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save_missing(&missing)?;
+        }
+        Ok(())
+    }
+
+    /// Items found gone from the disk (moved out of the drive's folder, or
+    /// deleted, outside cloak), oldest first. They're kept until they come
+    /// back (then taken in again as strays) or are dismissed with
+    /// [`clear_missing`](Self::clear_missing).
+    pub fn missing(&self) -> Vec<Missing> {
+        lock(&self.missing).clone()
+    }
+
+    pub fn missing_count(&self) -> usize {
+        lock(&self.missing).len()
+    }
+
+    /// Forget the record of missing items.
+    pub fn clear_missing(&self) -> io::Result<()> {
+        let mut missing = lock(&self.missing);
+        missing.clear();
+        self.save_missing(&missing)
+    }
+
+    fn load_missing(&self) -> Vec<Missing> {
+        #[derive(Deserialize)]
+        struct Saved {
+            #[serde(flatten)]
+            m: Missing,
+            id: crate::envelope::FileId,
+        }
+        let Ok(bytes) = std::fs::read(self.backing_dir.join(MISSING)) else {
+            return Vec::new();
+        };
+        let Ok(plain) = crypto::open(&self.key, MISSING_LABEL, &bytes) else {
+            return Vec::new(); // damaged: only a record, start a new one
+        };
+        let saved: Vec<Saved> = serde_json::from_slice(&plain).unwrap_or_default();
+        saved.into_iter().map(|s| Missing { id: s.id, ..s.m }).collect()
+    }
+
+    fn save_missing(&self, missing: &[Missing]) -> io::Result<()> {
+        let path = self.backing_dir.join(MISSING);
+        if missing.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        }
+        #[derive(Serialize)]
+        struct Saved<'a> {
+            #[serde(flatten)]
+            m: &'a Missing,
+            id: crate::envelope::FileId,
+        }
+        let saved: Vec<Saved> = missing.iter().map(|m| Saved { m, id: m.id }).collect();
+        durable::write_atomic(&path, &crypto::seal(&self.key, MISSING_LABEL, &serde_json::to_vec(&saved)?))
     }
 
     /// What [`adopt_from`](Self::adopt_from) would bring in with `other`,
@@ -2769,6 +2911,61 @@ mod tests {
         s.sync().unwrap();
         let s = reopen(s);
         assert_eq!(s.read_all("B/report.pdf").unwrap(), b"quarterly numbers");
+    }
+
+    #[test]
+    fn items_moved_out_are_remembered_until_they_return_or_are_dismissed() {
+        let d = tempdir().unwrap();
+        let away = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("Docs").unwrap();
+        s.create("Docs/plan.txt").unwrap();
+        s.write_at("Docs/plan.txt", 0, b"the plan").unwrap();
+        s.mkdir("Docs/Old").unwrap();
+        s.sync().unwrap();
+        let docs = d.path().join(entry(&s, d.path(), "Docs").boring);
+        let plan = entry(&s, &docs, "plan.txt").boring;
+        let old = entry(&s, &docs, "Old").boring;
+
+        // Moved out of the drive by hand: dropped, and remembered.
+        std::fs::rename(docs.join(&plan), away.path().join(&plan)).unwrap();
+        std::fs::rename(docs.join(&old), away.path().join(&old)).unwrap();
+        assert!(s.list_dir("Docs").unwrap().is_empty());
+        let mut gone: Vec<(String, bool)> = s.missing().into_iter().map(|m| (m.path, m.is_dir)).collect();
+        gone.sort();
+        assert_eq!(gone, [("Docs/Old".to_string(), true), ("Docs/plan.txt".to_string(), false)]);
+
+        // Remembered across a lock and unlock.
+        s.sync().unwrap();
+        let s = reopen(s);
+        assert_eq!(s.missing_count(), 2);
+
+        // One comes back: it reappears and its record clears.
+        std::fs::rename(away.path().join(&plan), docs.join(&plan)).unwrap();
+        let names: Vec<String> = s.list_dir("Docs").unwrap().into_iter().map(|e| e.0).collect();
+        assert_eq!(names, ["plan.txt"]);
+        assert_eq!(s.missing().into_iter().map(|m| m.path).collect::<Vec<_>>(), ["Docs/Old"]);
+
+        s.clear_missing().unwrap();
+        assert_eq!(s.missing_count(), 0);
+        assert!(!d.path().join(MISSING).exists());
+    }
+
+    #[test]
+    fn moving_within_the_drive_is_not_missing_whichever_folder_is_seen_first() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("A").unwrap();
+        s.mkdir("B").unwrap();
+        s.create("A/f.txt").unwrap();
+        s.sync().unwrap();
+        let (a, b) = (d.path().join(entry(&s, d.path(), "A").boring), d.path().join(entry(&s, d.path(), "B").boring));
+        let f = entry(&s, &a, "f.txt").boring;
+        std::fs::rename(a.join(&f), b.join(&f)).unwrap();
+        // The new folder first, then the old one.
+        assert_eq!(s.list_dir("B").unwrap().len(), 1);
+        assert!(s.list_dir("A").unwrap().is_empty());
+        assert_eq!(s.missing_count(), 0);
     }
 
     #[test]

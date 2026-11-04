@@ -26,7 +26,10 @@
 //!
 //! Files and folders moved in from elsewhere (see `docs/FORMAT.md`):
 //!
-//!   cloak strays <dir>                 check the whole drive -> {foreign}
+//!   cloak strays <dir>                 check the whole drive -> {foreign, missing}
+//!   cloak missing <dir>                what has gone missing -> {missing:
+//!                                      [{path, is_dir, since}]}
+//!   cloak missing-clear <dir>          dismiss that record
 //!   cloak adopt-check <dir> <other-dir>  what adopt would bring in, changing
 //!                                      nothing -> {found: [{path, name,
 //!                                      is_dir, items}], left}
@@ -68,8 +71,18 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
             // Taking this drive's own strays back in happens on the way.
             let s = Store::open_with_passphrase(dir, &pass)?;
             let foreign = s.sweep()?;
+            let missing = s.missing_count();
             drop(s); // saves the lists that changed
-            return Ok(serde_json::json!({ "foreign": foreign }).to_string());
+            return Ok(serde_json::json!({ "foreign": foreign, "missing": missing }).to_string());
+        }
+        "missing" => {
+            let s = Store::open_with_passphrase(dir, &pass)?;
+            s.sweep()?;
+            return Ok(serde_json::json!({ "missing": s.missing() }).to_string());
+        }
+        "missing-clear" => {
+            Store::open_with_passphrase(dir, &pass)?.clear_missing()?;
+            return Ok(ok());
         }
         "adopt" => {
             let other_dir = req(args, 2)?;

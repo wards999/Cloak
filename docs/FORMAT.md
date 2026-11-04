@@ -8,6 +8,7 @@ folder under a random dull name. What a drive keeps for itself:
 | `meta.json` | top | format version, password settings, the wrapped master key |
 | `manifest.idx` (+ `manifest.pNN.idx`) | every folder | that folder's list (the "notebook") |
 | `journal.idx` | top | a change in progress, while it is |
+| `missing.idx` | top | items found gone from the disk, until dismissed |
 | envelope | last 512 bytes of every file | the file's own description |
 
 ## Keys
@@ -91,7 +92,11 @@ checked against its list in memory:
   if the name is taken). Anything else is from another drive: it's left
   untouched, never shown or deleted, and counted for the app.
 * **Listed, not on disk:** moved out or deleted outside cloak; the entry is
-  dropped.
+  dropped and recorded in `missing.idx` at the top (sealed, label
+  `cloak-missing-v2`: its path, whether it's a folder, when it went), for the
+  app to show. If it comes back it's taken in as a stray and its record
+  clears; a move between two folders of the drive isn't recorded, whichever
+  folder is seen first. Dismissing the record deletes `missing.idx`.
 
 A folder is only rescanned when its modified time has changed. Bringing in
 another drive's strays (`cloak adopt`) needs both drives' passwords: each
