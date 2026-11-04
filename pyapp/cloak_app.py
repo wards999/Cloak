@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -835,6 +836,117 @@ class UnconvertDialog(FocusedDialog):
         return True
 
 
+class AdoptDialog(FocusedDialog):
+    """Bring files and folders moved in by hand from another drive into this
+    one: needs both drives' passwords. `others` are the other drives in the
+    list, offered as where they came from."""
+
+    def __init__(self, parent, drive, others, waiting):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.others = others
+        self.titleLabel = SubtitleLabel(f"Bring files into “{drive['name']}”", self)
+        if waiting:
+            what = f"{waiting} file{'s' if waiting != 1 else ''} or folder{'s' if waiting != 1 else ''}"
+            text = f"{what} from another drive {'are' if waiting != 1 else 'is'} waiting in this drive's folder. "
+        else:
+            text = "Files and folders moved into this drive's folder from another drive wait here until brought in. "
+        self.intro = CaptionLabel(
+            text + "Choose the drive they came from: cloak re-seals them for this drive without copying them.", self)
+        self.intro.setWordWrap(True)
+        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText(f"Password for “{drive['name']}”")
+        self.source = ComboBox(self)
+        self.source.addItems([d["name"] for d in others] + ["Another drive's folder…"])
+        self.loc = LineEdit(self); self.loc.setPlaceholderText("The other drive's folder")
+        self.pick = PushButton("Choose folder…", self)
+        self.other_pw = PasswordLineEdit(self); self.other_pw.setPlaceholderText("That drive's password")
+        loc_row = QHBoxLayout(); loc_row.addWidget(self.loc); loc_row.addWidget(self.pick)
+        src_row = QHBoxLayout(); src_row.addWidget(BodyLabel("From", self)); src_row.addWidget(self.source, 1)
+        for w in (self.titleLabel, self.intro, self.pw):
+            self.viewLayout.addWidget(w)
+        self.viewLayout.addLayout(src_row)
+        self.viewLayout.addLayout(loc_row)
+        self.viewLayout.addWidget(self.other_pw)
+        self.finish_layout()
+        self.yesButton.setText("Bring them in")
+        self.busy_text = "Bringing in…"
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(470)
+        self.source.currentIndexChanged.connect(self._source_chosen)
+        self.pick.clicked.connect(self._choose)
+        self.other_pw.returnPressed.connect(self.yesButton.click)
+        self.first = self.pw
+        self.result = None
+        self._source_chosen(self.source.currentIndex())
+
+    def _source_chosen(self, i):
+        listed = i < len(self.others)
+        for w in (self.loc, self.pick):
+            w.setVisible(not listed)
+
+    def _choose(self):
+        d = QFileDialog.getExistingDirectory(self, "The other drive's folder", str(Path.home()))
+        if d:
+            self.loc.setText(os.path.normpath(d))
+
+    def validate(self):
+        if not self.pw.text():
+            return self.problem("Enter this drive's password.", self.pw)
+        i = self.source.currentIndex()
+        other = self.others[i]["path"] if i < len(self.others) else self.loc.text().strip()
+        if not other:
+            return self.problem("Choose the other drive's folder.", self.pick)
+        if not (Path(other) / "meta.json").exists():
+            return self.problem("That folder isn't a cloak drive (it has no drive header).", self.loc)
+        if not self.other_pw.text():
+            return self.problem("Enter the other drive's password.", self.other_pw)
+        try:
+            self.result = engine(["adopt", self.path, other],
+                                 CLOAK_PASSPHRASE=self.pw.text(), CLOAK_OTHER_PASSPHRASE=self.other_pw.text())
+        except RuntimeError as e:
+            msg = str(e)
+            field = self.other_pw if msg.startswith("the other drive") else self.pw
+            return self.problem(msg[:1].upper() + msg[1:] + ".", field)
+        return True
+
+
+class PasswordDialog(FocusedDialog):
+    """Change a drive's password: instant, as only its header changes."""
+
+    def __init__(self, parent, drive):
+        super().__init__(parent)
+        self.path = drive["path"]
+        self.titleLabel = SubtitleLabel(f"Change the password for “{drive['name']}”", self)
+        self.old = PasswordLineEdit(self); self.old.setPlaceholderText("Current password")
+        self.new = PasswordLineEdit(self); self.new.setPlaceholderText("New password")
+        self.new2 = PasswordLineEdit(self); self.new2.setPlaceholderText("Confirm new password")
+        for w in (self.titleLabel, self.old, self.new, self.new2):
+            self.viewLayout.addWidget(w)
+        self.finish_layout()
+        self.yesButton.setText("Change password")
+        self.busy_text = "Changing…"
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(420)
+        self.new2.returnPressed.connect(self.yesButton.click)
+        self.first = self.old
+        self.done = False
+
+    def validate(self):
+        if not self.old.text():
+            return self.problem("Enter the current password.", self.old)
+        if not self.new.text():
+            return self.problem("Enter a new password.", self.new)
+        if self.new.text() != self.new2.text():
+            return self.problem("The new passwords don't match.", self.new2)
+        try:
+            engine(["passwd", self.path], CLOAK_PASSPHRASE=self.old.text(), CLOAK_NEW_PASSPHRASE=self.new.text())
+        except RuntimeError as e:
+            msg = str(e)
+            return self.problem(msg[:1].upper() + msg[1:] + ".", self.old)
+        self.done = True
+        return True
+
+
 def _documents():
     d = Path.home() / "Documents"
     return d if d.is_dir() else Path.home()
@@ -1027,9 +1139,9 @@ class RestoreDialog(FocusedDialog):
 # ---- drive card ------------------------------------------------------------
 
 class DriveCard(CardWidget):
-    def __init__(self, drive, mount, callbacks):
+    def __init__(self, drive, mount, callbacks, strays=0):
         super().__init__()
-        self.setFixedSize(260, 158)
+        self.setFixedSize(260, 178 if strays else 158)
         lay = QVBoxLayout(self); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(5)
 
         lay.addWidget(StrongBodyLabel(drive["name"], self))
@@ -1050,6 +1162,12 @@ class DriveCard(CardWidget):
             status = CaptionLabel("○ Locked", self)
             status.setStyleSheet("color: gray;")
         lay.addWidget(status)
+        if strays and not state:
+            what = f"{strays} item{'s' if strays != 1 else ''} from another drive waiting"
+            waiting = CaptionLabel(f"◐ {what}" + (": lock to bring in" if unlocked else ""), self)
+            waiting.setStyleSheet("color: #ca5010;")
+            waiting.setWordWrap(True)
+            lay.addWidget(waiting)
 
         row = QHBoxLayout()
         if state:
@@ -1074,9 +1192,17 @@ class DriveCard(CardWidget):
             # themselves.
             more = TransparentDropDownPushButton("More", self)
             menu = RoundMenu(parent=more)
+            if strays:
+                menu.addAction(Action(FIF.DOWNLOAD, "Bring in files from another drive…",
+                                      triggered=lambda: callbacks["adopt"](drive)))
+                menu.addSeparator()
             menu.addAction(Action(FIF.SAVE, "Back up recovery files…", triggered=lambda: callbacks["backup"](drive)))
+            menu.addAction(Action(FIF.EDIT, "Change password…", triggered=lambda: callbacks["passwd"](drive)))
             menu.addAction(Action(FIF.RETURN, "Turn back into a plain folder…",
                                   triggered=lambda: callbacks["unconvert"](drive)))
+            if not strays:
+                menu.addAction(Action(FIF.DOWNLOAD, "Bring in files from another drive…",
+                                      triggered=lambda: callbacks["adopt"](drive)))
             menu.addSeparator()
             menu.addAction(Action(FIF.CLOSE, "Remove from list (keeps the folder)",
                                   triggered=lambda: callbacks["remove"](drive)))
@@ -1094,6 +1220,13 @@ class DrivesInterface(QWidget):
         self.setObjectName("drivesInterface")
         self.drives = load_drives()
         self.mounts = {}  # path -> {"proc": Popen, "mp": mountpoint}
+        # path -> how many items from other drives are waiting there, as the
+        # mount last reported (kept after locking).
+        self.strays = {}
+        self._strays_seen = {}
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._strays_changed)
+        self._poll.start(1500)
 
         lay = QVBoxLayout(self); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(16)
         head = QHBoxLayout()
@@ -1131,9 +1264,9 @@ class DrivesInterface(QWidget):
                 w.deleteLater()
         cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove,
                "backup": lambda d: self.back_up([d]), "resume": self.resume_conversion,
-               "unconvert": self.unconvert}
+               "unconvert": self.unconvert, "adopt": self.adopt, "passwd": self.change_password}
         for d in self.drives:
-            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs))
+            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs, self.strays.get(d["path"], 0)))
 
     def err(self, msg):
         InfoBar.error("Error", msg, duration=4500, position=InfoBarPosition.TOP, parent=self.win)
@@ -1233,7 +1366,8 @@ class DrivesInterface(QWidget):
         try:
             proc = subprocess.Popen(
                 [adapter, drive["path"], mp],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, env=env, **NO_WINDOW,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=env, text=True,
+                encoding="utf-8", errors="replace", **NO_WINDOW,
             )
         except FileNotFoundError:
             return (
@@ -1254,7 +1388,48 @@ class DrivesInterface(QWidget):
             detail = "\n".join(lines)[-1500:] if lines else "the mount driver stopped without saying why"
             return f"Couldn't mount the drive:\n{detail}"
         self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
+        self._listen(drive["path"], proc)
         return None
+
+    def _listen(self, path, proc):
+        """Read the mount's reports (how many items from other drives are
+        waiting) as they come; the cards catch up on the next poll."""
+        def read():
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and "strays" in msg:
+                    self.strays[path] = msg["strays"]
+        threading.Thread(target=read, daemon=True).start()
+
+    def _strays_changed(self):
+        if self.strays != self._strays_seen:
+            self._strays_seen = dict(self.strays)
+            self.refresh()
+
+    def adopt(self, drive):
+        if drive["path"] in self.mounts:
+            return self.err("Lock the drive first.")
+        others = [d for d in self.drives if d["path"] != drive["path"]]
+        dlg = AdoptDialog(self.win, drive, others, self.strays.get(drive["path"], 0))
+        if not dlg.exec() or not dlg.result:
+            return
+        r = dlg.result
+        self.strays[drive["path"]] = r["left"]
+        n = r["adopted"]
+        msg = (f"Brought {n} item{'s' if n != 1 else ''} into “{drive['name']}”." if n
+               else "Nothing from that drive was waiting here.")
+        if r["left"]:
+            msg += f" {r['left']} more came from a different drive."
+        self.ok(msg)
+        self.refresh()
+
+    def change_password(self, drive):
+        dlg = PasswordDialog(self.win, drive)
+        if dlg.exec() and dlg.done:
+            self.ok(f"Changed the password for “{drive['name']}”.")
 
     def _wait_for_mount(self, proc, mp, timeout=15.0):
         """True once `mp` is mounted; False if the adapter exits first or the
