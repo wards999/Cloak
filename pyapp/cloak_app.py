@@ -190,6 +190,13 @@ def _size(n):
         n /= 1000
 
 
+def _show_progress(bar, count, verb, done, total):
+    """Move `bar` and say "<verb> 1,234 of 5,000 files…" in `count`."""
+    bar.setValue(int(100 * done / total) if total else 100)
+    count.setText(f"{verb} {done:,} of {total:,} file{'s' if total != 1 else ''}…" if done < total
+                  else f"Finishing up ({total:,} file{'s' if total != 1 else ''} done)…")
+
+
 def _duration(seconds):
     if seconds < 60:
         return "under a minute"
@@ -433,6 +440,15 @@ def install_power_hook(app, on_power):
 
 # ---- dialogs ---------------------------------------------------------------
 
+class PasswordField(PasswordLineEdit):
+    """A password box whose show-password button is left out of the Tab
+    order, so Tab goes from one box to the next (it still works by mouse)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.viewButton.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+
 class FocusedDialog(MessageBoxBase):
     """A dialog that puts the cursor in `self.first` when it appears, and that
     checks its fields before closing: the main button (and Enter) call
@@ -498,15 +514,18 @@ class FocusedDialog(MessageBoxBase):
     def _run_yes(self):
         self.error.hide()
         label = self.yesButton.text()
-        if self.busy_text:
-            self.yesButton.setText(self.busy_text)
+        busy = self.busy_text or label
+        self.yesButton.setText(busy)
         self.yesButton.setEnabled(False)
         self.cancelButton.setEnabled(False)
         QApplication.processEvents()
         try:
             ok = self.validate()
         finally:
-            self.yesButton.setText(label)
+            # Put the label back, unless validate() gave the button a new one
+            # (a check that leads to a next step, such as Check -> Convert).
+            if self.yesButton.text() == busy:
+                self.yesButton.setText(label)
             self.yesButton.setEnabled(True)
             self.cancelButton.setEnabled(True)
         if ok:
@@ -523,8 +542,8 @@ class CreateDialog(FocusedDialog):
         self.name = LineEdit(self); self.name.setPlaceholderText("Name  (e.g. Personal)")
         self.loc = LineEdit(self); self.loc.setPlaceholderText("Location — an empty folder")
         self.pick = PushButton("Choose folder…", self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
-        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password")
+        self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
         row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.name)
@@ -586,7 +605,7 @@ class UnlockDialog(FocusedDialog):
         self.busy_text = "Unlocking…"
         self.titleLabel = SubtitleLabel(f"Unlock “{name}”", self)
         self.sub = CaptionLabel(path, self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password")
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.sub)
         self.viewLayout.addWidget(self.pw)
@@ -693,15 +712,16 @@ class ConvertDialog(FocusedDialog):
         self.name = LineEdit(self); self.name.setPlaceholderText("Name  (e.g. Personal)")
         self.loc = LineEdit(self); self.loc.setPlaceholderText("The folder to convert")
         self.pick = PushButton("Choose folder…", self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
-        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password")
+        self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
         self.report = BodyLabel("", self); self.report.setWordWrap(True); self.report.hide()
         self.bar = ProgressBar(self); self.bar.hide()
+        self.count = CaptionLabel("", self); self.count.hide()
         row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
         for w in (self.titleLabel, self.intro, self.name):
             self.viewLayout.addWidget(w)
         self.viewLayout.addLayout(row)
-        for w in (self.pw, self.pw2, self.report, self.bar):
+        for w in (self.pw, self.pw2, self.report, self.bar, self.count):
             self.viewLayout.addWidget(w)
         self.finish_layout()
         self.converted = None  # (name, folder) once done
@@ -786,14 +806,15 @@ class ConvertDialog(FocusedDialog):
 
     def _convert(self, name, loc):
         self.bar.setValue(0); self.bar.show()
+        self.count.setText("Starting…"); self.count.show()
 
         def progress(done, total):
-            self.bar.setValue(int(100 * done / total) if total else 100)
+            _show_progress(self.bar, self.count, "Converted", done, total)
 
         try:
             engine_with_progress(["convert", loc], progress, CLOAK_PASSPHRASE=self.pw.text())
         except RuntimeError as e:
-            self.bar.hide()
+            self.bar.hide(); self.count.hide()
             msg = str(e)
             if conversion_state(loc) == "converting":
                 msg += "\nNothing is lost: what's done so far is kept, and converting again carries on from there."
@@ -815,9 +836,10 @@ class UnconvertDialog(FocusedDialog):
                 "Its files get their real names back and are decrypted where they lie, so its folder "
                 "becomes an ordinary, unprotected folder. Anyone with access to it can then read everything.")
         self.intro = CaptionLabel(text, self); self.intro.setWordWrap(True)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("The drive's password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("The drive's password")
         self.bar = ProgressBar(self); self.bar.hide()
-        for w in (self.titleLabel, self.intro, self.pw, self.bar):
+        self.count = CaptionLabel("", self); self.count.hide()
+        for w in (self.titleLabel, self.intro, self.pw, self.bar, self.count):
             self.viewLayout.addWidget(w)
         self.finish_layout()
         self.yesButton.setText("Turn back into a folder")
@@ -832,14 +854,15 @@ class UnconvertDialog(FocusedDialog):
         if not self.pw.text():
             return self.problem("Enter the drive's password.", self.pw)
         self.bar.setValue(0); self.bar.show()
+        self.count.setText("Starting…"); self.count.show()
 
         def progress(done, total):
-            self.bar.setValue(int(100 * done / total) if total else 100)
+            _show_progress(self.bar, self.count, "Restored", done, total)
 
         try:
             engine_with_progress(["unconvert", self.path], progress, CLOAK_PASSPHRASE=self.pw.text())
         except RuntimeError as e:
-            self.bar.hide()
+            self.bar.hide(); self.count.hide()
             msg = str(e)
             msg = msg[:1].upper() + msg[1:]
             if conversion_state(self.path) == "unconverting":
@@ -867,12 +890,12 @@ class AdoptDialog(FocusedDialog):
         self.intro = CaptionLabel(
             text + "Choose the drive they came from: cloak re-seals them for this drive without copying them.", self)
         self.intro.setWordWrap(True)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText(f"Password for “{drive['name']}”")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText(f"Password for “{drive['name']}”")
         self.source = ComboBox(self)
         self.source.addItems([d["name"] for d in others] + ["Another drive's folder…"])
         self.loc = LineEdit(self); self.loc.setPlaceholderText("The other drive's folder")
         self.pick = PushButton("Choose folder…", self)
-        self.other_pw = PasswordLineEdit(self); self.other_pw.setPlaceholderText("That drive's password")
+        self.other_pw = PasswordField(self); self.other_pw.setPlaceholderText("That drive's password")
         loc_row = QHBoxLayout(); loc_row.addWidget(self.loc); loc_row.addWidget(self.pick)
         src_row = QHBoxLayout(); src_row.addWidget(BodyLabel("From", self)); src_row.addWidget(self.source, 1)
         for w in (self.titleLabel, self.intro, self.pw):
@@ -930,9 +953,9 @@ class PasswordDialog(FocusedDialog):
         super().__init__(parent)
         self.path = drive["path"]
         self.titleLabel = SubtitleLabel(f"Change the password for “{drive['name']}”", self)
-        self.old = PasswordLineEdit(self); self.old.setPlaceholderText("Current password")
-        self.new = PasswordLineEdit(self); self.new.setPlaceholderText("New password")
-        self.new2 = PasswordLineEdit(self); self.new2.setPlaceholderText("Confirm new password")
+        self.old = PasswordField(self); self.old.setPlaceholderText("Current password")
+        self.new = PasswordField(self); self.new.setPlaceholderText("New password")
+        self.new2 = PasswordField(self); self.new2.setPlaceholderText("Confirm new password")
         for w in (self.titleLabel, self.old, self.new, self.new2):
             self.viewLayout.addWidget(w)
         self.finish_layout()
@@ -985,8 +1008,8 @@ class BackupDialog(FocusedDialog):
         self.out = LineEdit(self)
         self.out.setText(str(_documents() / f"{stem} recovery {date.today().isoformat()}.cloakbak"))
         self.pick = PushButton("Save as…", self)
-        self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password for this backup")
-        self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
+        self.pw = PasswordField(self); self.pw.setPlaceholderText("Password for this backup")
+        self.pw2 = PasswordField(self); self.pw2.setPlaceholderText("Confirm password")
         row = QHBoxLayout(); row.addWidget(self.out); row.addWidget(self.pick)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(what)
@@ -1047,11 +1070,11 @@ class RestoreDialog(FocusedDialog):
         what.setWordWrap(True)
         self.file = LineEdit(self); self.file.setPlaceholderText("Backup file (.cloakbak)")
         self.pick = PushButton("Choose…", self)
-        self.bpw = PasswordLineEdit(self); self.bpw.setPlaceholderText("The backup's password")
+        self.bpw = PasswordField(self); self.bpw.setPlaceholderText("The backup's password")
         self.combo = ComboBox(self)
         self.target = LineEdit(self); self.target.setPlaceholderText("The drive's folder")
         self.pick_target = PushButton("Choose folder…", self)
-        self.dpw = PasswordLineEdit(self); self.dpw.setPlaceholderText("The drive's password")
+        self.dpw = PasswordField(self); self.dpw.setPlaceholderText("The drive's password")
         row = QHBoxLayout(); row.addWidget(self.file); row.addWidget(self.pick)
         row2 = QHBoxLayout(); row2.addWidget(self.target); row2.addWidget(self.pick_target)
         self.viewLayout.addWidget(self.titleLabel)
