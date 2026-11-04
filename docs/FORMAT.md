@@ -35,7 +35,9 @@ read as garbage.
 ## File contents
 
 A file on disk is `data || envelope`. Its real length is its length on disk
-minus 512.
+minus 512. The one exception is a new file that's still empty: it may be 0
+bytes with no envelope yet (it gets one with its first data, or when it's
+closed or the drive saves), so a new file is written once, not twice.
 
 The data is the file's bytes, with its first and last `region` bytes
 (64 KiB; the whole file when it's at most twice that) XORed with ChaCha20
