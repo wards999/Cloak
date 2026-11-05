@@ -633,6 +633,38 @@ class CreateDialog(FocusedDialog):
         return True
 
 
+class RenameDialog(FocusedDialog):
+    """A new name for a drive in the list. The name is only the app's (and
+    Explorer's, once unlocked): nothing in the drive's folder changes."""
+
+    def __init__(self, parent, drive):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(f"Rename “{drive['name']}”", self)
+        self.sub = CaptionLabel(drive["path"], self)
+        self.name = LineEdit(self); self.name.setText(drive["name"]); self.name.setPlaceholderText("Name")
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.sub)
+        self.viewLayout.addWidget(self.name)
+        self.finish_layout()
+        self.yesButton.setText("Rename")
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(390)
+        self.name.returnPressed.connect(self.yesButton.click)
+        self.first = self.name
+        self.new_name = None
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self.name.selectAll)
+
+    def validate(self):
+        name = self.name.text().strip()
+        if not name:
+            return self.problem("Give the drive a name.", self.name)
+        self.new_name = name
+        return True
+
+
 class UnlockDialog(FocusedDialog):
     """Password and drive letter, then the mount itself, all checked before
     closing: `mount(password, mountpoint)` returns an error message, or None
@@ -1433,6 +1465,7 @@ class DriveCard(CardWidget):
                                       triggered=lambda: callbacks["adopt"](drive)))
             if strays or missing:
                 menu.addSeparator()
+            menu.addAction(Action(FIF.FONT, "Rename…", triggered=lambda: callbacks["rename"](drive)))
             menu.addAction(Action(FIF.SAVE, "Back up recovery files…", triggered=lambda: callbacks["backup"](drive)))
             menu.addAction(Action(FIF.EDIT, "Change password…", triggered=lambda: callbacks["passwd"](drive)))
             menu.addAction(Action(FIF.RETURN, "Turn back into a plain folder…",
@@ -1503,7 +1536,7 @@ class DrivesInterface(QWidget):
         cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove,
                "backup": lambda d: self.back_up([d]), "resume": self.resume_conversion,
                "unconvert": self.unconvert, "adopt": self.adopt, "passwd": self.change_password,
-               "missing": self.show_missing}
+               "missing": self.show_missing, "rename": self.rename}
         for d in self.drives:
             self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs, self.strays.get(d["path"], 0),
                                            self.missing.get(d["path"], 0)))
@@ -1593,6 +1626,7 @@ class DrivesInterface(QWidget):
             Path(mp).mkdir(parents=True, exist_ok=True)
         adapter = _find("cloak-winmount" if IS_WIN else "cloak-mount")
         env = os.environ.copy(); env["CLOAK_PASSPHRASE"] = pw
+        env["CLOAK_LABEL"] = drive["name"]  # what Explorer calls it
         wb = winfsp_bin()
         if IS_WIN and not wb:
             return "WinFsp isn't installed. Install it (winget install WinFsp.WinFsp) and try again."
@@ -1750,6 +1784,19 @@ class DrivesInterface(QWidget):
         m = self.mounts.get(drive["path"])
         if m:
             open_in_file_manager(m["mp"])
+
+    def rename(self, drive):
+        if drive["path"] in self.mounts:
+            return self.err("Lock the drive first.")
+        dlg = RenameDialog(self.win, drive)
+        if not dlg.exec() or not dlg.new_name or dlg.new_name == drive["name"]:
+            return
+        for d in self.drives:
+            if d["path"] == drive["path"]:
+                d["name"] = dlg.new_name
+        save_drives(self.drives)
+        self.refresh()
+        self.ok(f"Renamed to “{dlg.new_name}”.")
 
     def remove(self, drive):
         self.drives = [d for d in self.drives if d["path"] != drive["path"]]

@@ -12,6 +12,8 @@
 //!
 //! Usage (the GUI launches this; it also runs by hand):
 //!     set CLOAK_PASSPHRASE=...  &  cloak-winmount <backing-store-dir> <X:>
+//! `CLOAK_LABEL`, if set, is the name Explorer shows for the drive (the
+//! drive's name in the app); otherwise it shows "cloak".
 //! The process holds the mount until stdin hits EOF (Enter / closed) or it is
 //! terminated. It needs winfsp-x64.dll reachable (WinFsp's bin dir on PATH).
 
@@ -68,6 +70,8 @@ mod imp {
         // side, changes one at a time. Shared with the thread that saves
         // directory lists (`saver`).
         store: Arc<RwLock<Store>>,
+        /// What Explorer calls the drive (see [`volume_label`]).
+        label: String,
     }
 
     impl CloakWinFs {
@@ -631,9 +635,27 @@ mod imp {
             let (total, free) = disk_space(&dir).unwrap_or((1 << 40, 1 << 39));
             out.total_size = total;
             out.free_size = free;
-            out.set_volume_label("cloak");
+            out.set_volume_label(&self.label);
             Ok(())
         }
+    }
+
+    /// The drive's name as Explorer shows it: `name` with control characters
+    /// dropped and trimmed, cut to the 32 UTF-16 units Windows allows
+    /// (never in the middle of a character), or "cloak" if that leaves
+    /// nothing.
+    fn volume_label(name: Option<&str>) -> String {
+        let mut label = String::new();
+        let mut units = 0;
+        for c in name.unwrap_or("").trim().chars().filter(|c| !c.is_control()) {
+            units += c.len_utf16();
+            if units > 32 {
+                break;
+            }
+            label.push(c);
+        }
+        let label = label.trim_end().to_string();
+        if label.is_empty() { "cloak".to_string() } else { label }
     }
 
     /// Total size and space free to this user, in bytes, of the disk holding
@@ -727,6 +749,7 @@ mod imp {
         watcher(&store);
         let context = CloakWinFs {
             store: store.clone(),
+            label: volume_label(std::env::var("CLOAK_LABEL").ok().as_deref()),
         };
         let mut fs_params = FileSystemParams::default_params(params);
         fs_params.use_dir_info_by_name = true;
