@@ -33,7 +33,7 @@ fn main() {
 #[cfg(all(feature = "winfsp", windows))]
 mod imp {
     use cloak::{names, Metadata, Store};
-    use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+    use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use widestring::U16CStr;
     use winfsp::filesystem::{
@@ -41,6 +41,7 @@ mod imp {
         OpenFileInfo, VolumeInfo, WideNameInfo,
     };
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
+    use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
     use winfsp::{winfsp_init_or_die, FspError, Result as FspResult};
     use winfsp_sys::{FspCleanupDelete, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FSP_FSCTL_VOLUME_PARAMS};
 
@@ -53,6 +54,17 @@ mod imp {
     // the mount, so the adapter sends none of its own; doing so duplicated every
     // event. The driver needs two things from us for them to be usable: true-case
     // names (`set_normalized_name`) and NUL-free entry names (`wide`).
+    //
+    // The one exception: a move to another folder. The driver reports it as a
+    // rename (old name, then new name), which Explorer applies to the folder
+    // the item arrived in but not the one it left, so that folder kept showing
+    // it. NTFS reports such a move as removed from one folder and added to the
+    // other, so the adapter adds the "removed" (see `moved_away`).
+    const FILE_ACTION_REMOVED: u32 = 2;
+    const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
+    const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x2;
+    /// How often, in ms, waiting "removed" notices are sent (see `moved_away`).
+    const NOTIFY_EVERY_MS: u32 = 50;
 
     /// An open handle, carrying the logical path it refers to. A directory
     /// handle also holds its listing while it is being enumerated.
@@ -72,6 +84,30 @@ mod imp {
         store: Arc<RwLock<Store>>,
         /// What Explorer calls the drive (see [`volume_label`]).
         label: String,
+        /// Items moved out of a folder, as (their old WinFsp name, is a
+        /// folder), waiting to be reported removed from it. They can't be
+        /// reported from inside the rename itself (WinFsp holds renames back
+        /// while notices are sent), so a timer sends them just after.
+        moved_away: Mutex<Vec<(Vec<u16>, bool)>>,
+    }
+
+    impl NotifyingFileSystemContext<()> for CloakWinFs {
+        fn should_notify(&self) -> Option<()> {
+            let waiting = self.moved_away.lock().unwrap_or_else(PoisonError::into_inner);
+            (!waiting.is_empty()).then_some(())
+        }
+
+        fn notify(&self, _: (), notifier: &Notifier) {
+            let gone = std::mem::take(&mut *self.moved_away.lock().unwrap_or_else(PoisonError::into_inner));
+            for (name, is_dir) in gone {
+                let mut info = NotifyInfo::<1024>::new();
+                info.filter = if is_dir { FILE_NOTIFY_CHANGE_DIR_NAME } else { FILE_NOTIFY_CHANGE_FILE_NAME };
+                info.action = FILE_ACTION_REMOVED;
+                if info.set_name_raw(name.as_slice()).is_ok() {
+                    notifier.notify(&info);
+                }
+            }
+        }
     }
 
     impl CloakWinFs {
@@ -570,21 +606,34 @@ mod imp {
 
         fn rename(
             &self,
-            _context: &Self::FileContext,
+            context: &Self::FileContext,
             file_name: &U16CStr,
             new_file_name: &U16CStr,
             replace_if_exists: bool,
         ) -> FspResult<()> {
             let old = path_of(file_name);
             let new = path_of(new_file_name);
-            let mut store = self.store();
-            // MoveFileEx(REPLACE_EXISTING) is how many editors save (write a
-            // temp file, rename it over the original).
-            if replace_if_exists {
-                store.rename_replace(&old, &new).map_err(fsp)
-            } else {
-                store.rename_path(&old, &new).map_err(fsp)
+            {
+                let mut store = self.store();
+                // MoveFileEx(REPLACE_EXISTING) is how many editors save (write a
+                // temp file, rename it over the original).
+                if replace_if_exists {
+                    store.rename_replace(&old, &new).map_err(fsp)?;
+                } else {
+                    store.rename_path(&old, &new).map_err(fsp)?;
+                }
             }
+            let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_lowercase());
+            if parent(&old) != parent(&new) {
+                // WinFsp's name for it is already in its true case (see
+                // `set_normalized_name`), as notices need.
+                let is_dir = matches!(context, Handle::Dir(..));
+                self.moved_away
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((file_name.as_slice().to_vec(), is_dir));
+            }
+            Ok(())
         }
 
         fn set_delete(
@@ -750,11 +799,12 @@ mod imp {
         let context = CloakWinFs {
             store: store.clone(),
             label: volume_label(std::env::var("CLOAK_LABEL").ok().as_deref()),
+            moved_away: Mutex::default(),
         };
         let mut fs_params = FileSystemParams::default_params(params);
         fs_params.use_dir_info_by_name = true;
         let mut host =
-            FileSystemHost::new_with_options(fs_params, context)
+            FileSystemHost::new_with_timer::<_, (), NOTIFY_EVERY_MS>(fs_params, context)
                 .unwrap_or_else(|e| fail(format!("couldn't start the file system (is WinFsp installed?): {e:?}")));
         if let Err(e) = host.mount(mount_point.as_str()) {
             fail(format!("couldn't mount at {mount_point} (is it free?): {e:?}"));
