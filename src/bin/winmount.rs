@@ -33,6 +33,7 @@ fn main() {
 #[cfg(all(feature = "winfsp", windows))]
 mod imp {
     use cloak::{names, Metadata, Store};
+    use std::sync::atomic::{AtomicPtr, Ordering};
     use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use widestring::U16CStr;
@@ -41,8 +42,12 @@ mod imp {
         OpenFileInfo, VolumeInfo, WideNameInfo,
     };
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
+    use winfsp::notify::{Notifier, NotifyingFileSystemContext};
     use winfsp::{winfsp_init_or_die, FspError, Result as FspResult};
-    use winfsp_sys::{FspCleanupDelete, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FSP_FSCTL_VOLUME_PARAMS};
+    use winfsp_sys::{
+        FspCleanupDelete, FspFileSystemNotify, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FSP_FILE_SYSTEM,
+        FSP_FSCTL_VOLUME_PARAMS,
+    };
 
     const ATTR_DIRECTORY: u32 = 0x10; // FILE_ATTRIBUTE_DIRECTORY
     const ATTR_NORMAL: u32 = 0x80; // FILE_ATTRIBUTE_NORMAL
@@ -53,6 +58,25 @@ mod imp {
     // the mount, so the adapter sends none of its own; doing so duplicated every
     // event. The driver needs two things from us for them to be usable: true-case
     // names (`set_normalized_name`) and NUL-free entry names (`wide`).
+    //
+    // The one exception: a move to another folder. The driver reports it as a
+    // rename (old name, then new name), which Explorer applies to the folder
+    // the item arrived in but not the one it left, so that folder kept showing
+    // it. NTFS reports such a move as removed from one folder and added to the
+    // other, so the adapter adds the "removed" (see `report_removed`).
+    //
+    // It sends it with FspFileSystemNotify alone, never inside a
+    // FspFileSystemNotifyBegin/End session. WinFsp 2.1's driver deadlocks
+    // for good when a rename queues while such a session is open (fixed only
+    // in WinFsp 2026, winfsp#669): every rename and open on the drive hangs,
+    // and so does the file manager that asked. Outside a session the driver
+    // just holds the notice until the rename under way is done.
+    const FILE_ACTION_REMOVED: u32 = 2;
+    const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
+    const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x2;
+    /// FSP_FSCTL_NOTIFY_INFO without its name: Size (u16, padded), Filter
+    /// and Action (u32 each).
+    const NOTIFY_HEADER: usize = 12;
 
     /// An open handle, carrying the logical path it refers to. A directory
     /// handle also holds its listing while it is being enumerated.
@@ -72,9 +96,55 @@ mod imp {
         store: Arc<RwLock<Store>>,
         /// What Explorer calls the drive (see [`volume_label`]).
         label: String,
+        /// WinFsp's handle on this file system, for sending notices (see
+        /// `report_removed`); null until the notify timer has handed it over.
+        fsp: Arc<AtomicPtr<FSP_FILE_SYSTEM>>,
     }
 
+    // winfsp-rs hands the file system's pointer only to a notify timer, and
+    // only inside a Begin/End session. So the timer is used once, before the
+    // drive is mounted (nothing can be renamed then), to learn the pointer;
+    // after that it never opens a session again.
+    impl NotifyingFileSystemContext<()> for CloakWinFs {
+        fn should_notify(&self) -> Option<()> {
+            self.fsp.load(Ordering::Acquire).is_null().then_some(())
+        }
+
+        fn notify(&self, _: (), notifier: &Notifier) {
+            const _: () = assert!(std::mem::size_of::<Notifier>() == std::mem::size_of::<*mut FSP_FILE_SYSTEM>());
+            // SAFETY: `Notifier` is a one-field tuple struct around the
+            // `*mut FSP_FILE_SYSTEM` (its size is checked above).
+            let fs = unsafe { *(notifier as *const Notifier).cast::<*mut FSP_FILE_SYSTEM>() };
+            self.fsp.store(fs, Ordering::Release);
+        }
+    }
+
+    /// How often, in ms, the notify timer looks; it matters only until the
+    /// pointer is known (see above).
+    const NOTIFY_EVERY_MS: u32 = 20;
+
     impl CloakWinFs {
+        /// Tell Windows that `name` (a WinFsp path, such as `\A\f.txt`) is
+        /// gone from its folder. Fine from inside a request: outside a
+        /// Begin/End session the driver only queues the notice.
+        fn report_removed(&self, name: &[u16], is_dir: bool) {
+            let fs = self.fsp.load(Ordering::Acquire);
+            let size = NOTIFY_HEADER + name.len() * 2;
+            if fs.is_null() || size > u16::MAX as usize {
+                return;
+            }
+            let filter = if is_dir { FILE_NOTIFY_CHANGE_DIR_NAME } else { FILE_NOTIFY_CHANGE_FILE_NAME };
+            let mut info = Vec::with_capacity(size);
+            info.extend_from_slice(&(size as u16).to_le_bytes());
+            info.extend_from_slice(&[0, 0]);
+            info.extend_from_slice(&filter.to_le_bytes());
+            info.extend_from_slice(&FILE_ACTION_REMOVED.to_le_bytes());
+            info.extend(name.iter().flat_map(|u| u.to_le_bytes()));
+            // SAFETY: `fs` is this file system's, alive while it's mounted
+            // (requests only arrive then); the buffer is one notify record.
+            unsafe { FspFileSystemNotify(fs, info.as_mut_ptr().cast(), info.len() as u64) };
+        }
+
         /// The store, even if an earlier callback panicked while holding it.
         /// WinFsp catches the panic and fails just that request; without this,
         /// the poisoned lock would fail every request after it and the drive
@@ -570,21 +640,30 @@ mod imp {
 
         fn rename(
             &self,
-            _context: &Self::FileContext,
+            context: &Self::FileContext,
             file_name: &U16CStr,
             new_file_name: &U16CStr,
             replace_if_exists: bool,
         ) -> FspResult<()> {
             let old = path_of(file_name);
             let new = path_of(new_file_name);
-            let mut store = self.store();
-            // MoveFileEx(REPLACE_EXISTING) is how many editors save (write a
-            // temp file, rename it over the original).
-            if replace_if_exists {
-                store.rename_replace(&old, &new).map_err(fsp)
-            } else {
-                store.rename_path(&old, &new).map_err(fsp)
+            {
+                let mut store = self.store();
+                // MoveFileEx(REPLACE_EXISTING) is how many editors save (write a
+                // temp file, rename it over the original).
+                if replace_if_exists {
+                    store.rename_replace(&old, &new).map_err(fsp)?;
+                } else {
+                    store.rename_path(&old, &new).map_err(fsp)?;
+                }
             }
+            let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_lowercase());
+            if parent(&old) != parent(&new) {
+                // WinFsp's name for it is already in its true case (see
+                // `set_normalized_name`), as notices need.
+                self.report_removed(file_name.as_slice(), matches!(context, Handle::Dir(..)));
+            }
+            Ok(())
         }
 
         fn set_delete(
@@ -750,12 +829,27 @@ mod imp {
         let context = CloakWinFs {
             store: store.clone(),
             label: volume_label(std::env::var("CLOAK_LABEL").ok().as_deref()),
+            fsp: Arc::default(),
         };
+        let fsp = context.fsp.clone();
         let mut fs_params = FileSystemParams::default_params(params);
         fs_params.use_dir_info_by_name = true;
         let mut host =
-            FileSystemHost::new_with_options(fs_params, context)
+            FileSystemHost::new_with_timer::<_, (), NOTIFY_EVERY_MS>(fs_params, context)
                 .unwrap_or_else(|e| fail(format!("couldn't start the file system (is WinFsp installed?): {e:?}")));
+        // The notify timer's one session, before anything can be renamed (see
+        // `NotifyingFileSystemContext for CloakWinFs`). Without it the drive
+        // works the same, but a folder an item is moved out of may not
+        // refresh by itself.
+        for _ in 0..100 {
+            if !fsp.load(Ordering::Acquire).is_null() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if fsp.load(Ordering::Acquire).is_null() {
+            warn("couldn't set up change notices: a folder an item is moved out of may need a refresh");
+        }
         if let Err(e) = host.mount(mount_point.as_str()) {
             fail(format!("couldn't mount at {mount_point} (is it free?): {e:?}"));
         }

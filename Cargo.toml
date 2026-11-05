@@ -65,7 +65,7 @@ libc = { version = "0.2", optional = true }
 # the GNU toolchain.
 # default features pull in `nightly` (strict-provenance => #![feature], which
 # only nightly rustc allows). Use the crate's `stable` bundle instead.
-winfsp = { version = "0.11.0", optional = true, default-features = false, features = ["stable", "windows-rs"] }
+winfsp = { version = "0.11.0", optional = true, default-features = false, features = ["stable", "windows-rs", "notify"] }
 winfsp-sys = { version = "0.2", optional = true }
 widestring = "1.1.0"
 
