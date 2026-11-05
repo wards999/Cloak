@@ -228,8 +228,27 @@ pub fn is_conflict_copy(master: &Key, name: &str) -> bool {
 /// however many there are. Each salt found among the top folder's files is
 /// tried in turn (one slow password check each, at most [`MAX_TRIES`]). Only
 /// if the top list is gone is a key accepted without it, and then only when
-/// every lock in the drive agrees.
+/// every lock in the drive agrees; when they don't, the error starts with
+/// [`UNSURE`] and says how many opened, and [`claim_drive`] takes the key
+/// anyway once the person has said this is the drive they meant.
 pub fn unlock_drive(dir: &Path, password: &str) -> io::Result<Keys> {
+    unlock_inner(dir, password, false)
+}
+
+/// Like [`unlock_drive`], but when no top list opens with `password` and the
+/// folder also holds other drives' items, the key `password` opens is taken
+/// as this folder's drive. Only for when the person has said so: in another
+/// drive's folder it makes a second drive there, with its own top list, and
+/// each drive then sees the other's items as waiting to be brought in.
+pub fn claim_drive(dir: &Path, password: &str) -> io::Result<Keys> {
+    unlock_inner(dir, password, true)
+}
+
+/// How an [`unlock_drive`] error starts when the password opens some of a
+/// folder's items but no top list, and the rest are other drives'.
+pub const UNSURE: &str = "this folder's top list is missing or isn't this password's drive";
+
+fn unlock_inner(dir: &Path, password: &str, claim: bool) -> io::Result<Keys> {
     let mut tried: Vec<Salt> = Vec::new();
     let mut seen_salts: Vec<Salt> = Vec::new();
     let mut fallback: Option<Keys> = None;
@@ -296,8 +315,16 @@ pub fn unlock_drive(dir: &Path, password: &str) -> io::Result<Keys> {
         }
     }
     match fallback {
-        Some(keys) if seen_salts.iter().all(|s| *s == keys.salt) => Ok(keys),
-        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong password")),
+        Some(keys) if claim || seen_salts.iter().all(|s| *s == keys.salt) => Ok(keys),
+        Some(keys) => {
+            let all = top.len() + deeper.len();
+            let ours = top.iter().chain(&deeper).filter(|l| peek(&l[..]).is_some_and(|(s, _)| s == keys.salt)).count();
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{UNSURE}: this password opens {ours} of the {all} hidden items checked, and the rest are from other drives"),
+            ))
+        }
+        None => Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong password")),
     }
 }
 

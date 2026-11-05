@@ -138,7 +138,12 @@ the folder's list is rebuilt the same way: its files by their envelopes,
 its subfolders by their own lists (repaired too when unreadable but holding
 this drive's files), its own name from its parent's list. A folder whose
 name was only in unreadable lists comes back as "Recovered folder". A
-missing top list is simply rebuilt: the drive still unlocks from any file.
+missing top list is simply rebuilt: the drive still unlocks from any file,
+as long as every lock in the folder is this drive's. If other drives' items
+are there too, a folder whose top list is lost can't be told apart from
+another drive's folder holding this drive's items, so unlocking stops and
+says how many items the password opens; only once the user confirms it's
+their drive ("claim") is it opened and its top list rebuilt.
 
 A folder is only rescanned when its modified time has changed.
 
