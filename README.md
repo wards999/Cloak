@@ -1,4 +1,4 @@
-# cloak
+# Cloak
 
 A name-mapping overlay filesystem with **header/footer encryption**. You mount a
 drive; through the mount you see your real filenames and read files normally. On
