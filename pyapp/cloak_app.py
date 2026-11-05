@@ -8,6 +8,7 @@ verify the password) and the `cloak-winmount` / `cloak-mount` adapter (to mount)
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -206,12 +207,19 @@ def _duration(seconds):
     return f"about {round(minutes / 60)} hours"
 
 
-def verify(path, password):
-    """Open the drive to check the password; raise RuntimeError on failure."""
+# How the engine's error starts when the password opens some of a folder's
+# items but no top list, and the rest are other drives' (see `lock::UNSURE`).
+UNSURE = "this folder's top list is missing or isn't this password's drive"
+
+
+def verify(path, password, command="open"):
+    """Open the drive to check the password; raise RuntimeError on failure.
+    `command` "claim" opens it as the password's drive after an UNSURE
+    error, rebuilding its top list."""
     env = os.environ.copy()
     env["CLOAK_PASSPHRASE"] = password
     try:
-        proc = subprocess.run([CLI, "open", path], capture_output=True, text=True, env=env, **NO_WINDOW)
+        proc = subprocess.run([CLI, command, path], capture_output=True, text=True, env=env, **NO_WINDOW)
     except OSError as e:
         raise RuntimeError(f"engine not found ({e})")
     out = (proc.stdout or "").strip()
@@ -496,6 +504,42 @@ class FocusedDialog(MessageBoxBase):
                 field.selectAll()
         return False
 
+    def check_password(self, path, pw):
+        """Check that `pw` opens the drive in `path`. Returns None, or the
+        error to show. When the folder's top list is missing and other
+        drives' items are there too, says so and turns the main button into
+        "Open as this drive"; pressed with the same password, that rebuilds
+        the list as this password's drive."""
+        claiming = getattr(self, "_claim", None)
+        try:
+            verify(path, pw, "claim" if claiming == (path, pw) else "open")
+            return None
+        except RuntimeError as e:
+            msg = str(e)
+        if not msg.startswith(UNSURE):
+            return msg
+        self._claim = (path, pw)
+        if not getattr(self, "_claim_label", None):
+            self._claim_label = self._idle_label
+            self.pw.textChanged.connect(self._drop_claim)
+            if hasattr(self, "loc"):
+                self.loc.textChanged.connect(self._drop_claim)
+        self.yesButton.setText("Open as this drive")
+        m = re.search(r"opens (\d+) of the (\d+)", msg)
+        counts = f" This password opens {m[1]} of the {m[2]} hidden items checked." if m else ""
+        return (
+            "This password opens some of this folder's items, but not its top list, and the "
+            f"folder also holds items from other drives, so Cloak can't be sure which drive it is.{counts} "
+            "If this is the drive you meant, choose Open as this drive: its list is rebuilt, "
+            "and the other drives' items wait to be brought in. If this folder is another "
+            "drive's, choose Cancel and use that drive's password."
+        )
+
+    def _drop_claim(self):
+        if getattr(self, "_claim", None):
+            self._claim = None
+            self.yesButton.setText(self._claim_label)
+
     busy_text = None  # the main button's label while validate() works
     _working = False
 
@@ -513,7 +557,7 @@ class FocusedDialog(MessageBoxBase):
 
     def _run_yes(self):
         self.error.hide()
-        label = self.yesButton.text()
+        label = self._idle_label = self.yesButton.text()
         busy = self.busy_text or label
         self.yesButton.setText(busy)
         self.yesButton.setEnabled(False)
@@ -630,10 +674,9 @@ class UnlockDialog(FocusedDialog):
             # It may have been taken since the dialog opened.
             if mp in used_drive_letters():
                 return self.problem(f"{mp} is no longer free. Pick another letter.", self.combo)
-        try:
-            verify(self.path, self.pw.text())
-        except RuntimeError as e:
-            return self.problem(str(e)[:1].upper() + str(e)[1:] + ".", self.pw)
+        failure = self.check_password(self.path, self.pw.text())
+        if failure:
+            return self.problem(failure[:1].upper() + failure[1:].rstrip(".") + ".", self.pw)
         mp = self.combo.currentText() if (IS_WIN and self.combo) else None
         failure = self.mount(self.pw.text(), mp)
         if failure:
@@ -689,14 +732,12 @@ class AddExistingDialog(FocusedDialog):
             return self.problem("That drive is already in your list.", self.loc)
         if not self.pw.text():
             return self.problem("Enter the drive's password.", self.pw)
-        try:
-            verify(loc, self.pw.text())
-        except RuntimeError as e:
-            msg = str(e)
-            if msg == "no drive here":
-                return self.problem(
-                    "That folder isn't a cloak drive. Choose the folder you created the drive in.", self.loc)
-            return self.problem(msg[:1].upper() + msg[1:] + ".", self.pw)
+        msg = self.check_password(loc, self.pw.text())
+        if msg == "no drive here":
+            return self.problem(
+                "That folder isn't a cloak drive. Choose the folder you created the drive in.", self.loc)
+        if msg:
+            return self.problem(msg[:1].upper() + msg[1:].rstrip(".") + ".", self.pw)
         self.added = (self.name.text().strip() or Path(loc).name, loc)
         return True
 

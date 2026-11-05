@@ -420,6 +420,28 @@ impl Store {
         Ok(store)
     }
 
+    /// Open the drive `passphrase` opens in `backing_dir` even though no top
+    /// list there opens with it and the folder holds other drives' items too
+    /// (the [`crate::lock::UNSURE`] error), once the person has said it's the
+    /// drive they meant. Its top list is rebuilt and saved, so from then on
+    /// it unlocks as usual; the other drives' items wait to be brought in.
+    pub fn claim_with_passphrase(backing_dir: impl AsRef<Path>, passphrase: &str) -> io::Result<Self> {
+        let backing_dir = backing_dir.as_ref().to_path_buf();
+        if crate::convert::in_progress(&backing_dir) {
+            return Err(io::Error::other(
+                "this folder is part-way through being converted; finish converting it first",
+            ));
+        }
+        let keys = crate::lock::claim_drive(&backing_dir, passphrase)?;
+        let mut store = Self::open_with_keys(backing_dir, keys)?;
+        if store.relock_marker().exists() {
+            store.relock(&mut |_, _| {})?;
+        }
+        store.sweep()?;
+        store.sync()?;
+        Ok(store)
+    }
+
     /// Where a password change under way is marked (a name the drive works
     /// out from its key, like its lists).
     fn relock_marker(&self) -> PathBuf {
@@ -3216,6 +3238,47 @@ mod tests {
         // Now they're v2's: v2's password still opens it, v1's still doesn't.
         assert!(Store::open_with_passphrase(d2.path(), "test2").is_ok());
         assert!(Store::open_with_passphrase(d2.path(), "test1").is_err());
+    }
+
+    #[test]
+    fn a_drive_without_its_top_list_that_holds_another_drives_files_says_so_and_can_be_claimed() {
+        let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+        {
+            let mut v1 = Store::create_with_passphrase(d1.path(), "test1", 128).unwrap();
+            v1.mkdir("Docs").unwrap();
+            for p in ["a.txt", "b.txt", "Docs/c.txt"] {
+                v1.create(p).unwrap();
+                v1.write_at(p, 0, p.as_bytes()).unwrap();
+            }
+            let mut v2 = Store::create_with_passphrase(d2.path(), "test2", 128).unwrap();
+            v2.create("theirs.txt").unwrap();
+            v2.write_at("theirs.txt", 0, b"2").unwrap();
+        }
+        // v2's hidden file copied into v1, then v1's top list lost.
+        let v2_list = unlock(d2.path(), "test2").unwrap().list_name().to_string();
+        for e in std::fs::read_dir(d2.path()).unwrap().flatten() {
+            if e.file_name().to_string_lossy() != v2_list {
+                std::fs::copy(e.path(), d1.path().join(e.file_name())).unwrap();
+            }
+        }
+        let v1_list = unlock(d1.path(), "test1").unwrap().list_name().to_string();
+        std::fs::remove_file(d1.path().join(&v1_list)).unwrap();
+
+        let err = Store::open_with_passphrase(d1.path(), "test1").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().starts_with(crate::lock::UNSURE), "says what's going on: {err}");
+        assert!(err.to_string().contains("opens 4 of the 5"), "{err}");
+        let wrong = Store::open_with_passphrase(d1.path(), "nope").err().unwrap();
+        assert_eq!(wrong.to_string(), "wrong password");
+
+        let s = Store::claim_with_passphrase(d1.path(), "test1").unwrap();
+        assert_eq!(s.read_all("Docs/c.txt").unwrap(), b"Docs/c.txt");
+        assert_eq!(s.foreign_count(), 1, "v2's file waits");
+        drop(s);
+        assert!(d1.path().join(&v1_list).exists(), "the top list is back");
+        let s = Store::open_with_passphrase(d1.path(), "test1").expect("unlocks as usual now");
+        assert_eq!(s.read_all("a.txt").unwrap(), b"a.txt");
+        assert!(Store::open_with_passphrase(d1.path(), "test2").is_err(), "and v2's password doesn't");
     }
 
     #[test]

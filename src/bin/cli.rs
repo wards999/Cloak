@@ -7,6 +7,10 @@
 //!
 //!   cloak create <dir>                 create a new drive
 //!   cloak open   <dir>                 verify the password opens the drive
+//!   cloak claim  <dir>                 open it as the password's drive though
+//!                                      its top list is missing and other
+//!                                      drives' items are there too (after
+//!                                      `open` said so); rebuilds the list
 //!   cloak ls     <dir> <path>          list a directory -> [{name,is_dir,size}]
 //!   cloak stat   <dir> <path>          -> {exists,is_dir,size}
 //!   cloak mkdir  <dir> <path>          make a folder
@@ -143,6 +147,10 @@ fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
         }
         "open" => {
             Store::open_with_passphrase(dir, &pass)?;
+            Ok(ok())
+        }
+        "claim" => {
+            Store::claim_with_passphrase(dir, &pass)?;
             Ok(ok())
         }
         "ls" => {
