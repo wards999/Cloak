@@ -29,7 +29,7 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
     ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
     RadioButton, SwitchButton, TransparentToolButton, ToolTipFilter, ProgressBar,
-    TransparentDropDownPushButton, RoundMenu, Action, ListWidget,
+    TransparentDropDownPushButton, RoundMenu, Action, ListWidget, ScrollArea,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -120,6 +120,47 @@ def _find(exe_base):
 
 
 CLI = _find("cloak")
+
+
+def app_version():
+    """This release's number: baked in by package.py, or read from Cargo.toml
+    when run from source."""
+    if FROZEN:
+        try:
+            from _version import VERSION
+            return VERSION
+        except ImportError:
+            return None
+    try:
+        cargo = (APP_DIR.parent / "Cargo.toml").read_text(encoding="utf-8")
+        return re.search(r'^version = "([^"]+)"', cargo, re.M)[1]
+    except (OSError, TypeError):
+        return None
+
+
+def part_versions():
+    """The release numbers of the engine and the mount driver in `bin`, or
+    None for one that's missing or too old to say."""
+    def ask(cmd, parse):
+        try:
+            env = os.environ.copy()
+            wb = winfsp_bin()
+            if wb:
+                env["PATH"] = wb + os.pathsep + env.get("PATH", "")
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env, **NO_WINDOW)
+            return parse(proc.stdout.strip()) if proc.returncode == 0 else None
+        except Exception:
+            return None
+
+    def engine_version(out):
+        return json.loads(out).get("version")
+
+    def driver_version(out):
+        m = re.fullmatch(r"cloak-\S+ (\S+)", out)
+        return m[1] if m else None
+
+    driver = _find("cloak-winmount" if IS_WIN else "cloak-mount")
+    return ask([CLI, "version"], engine_version), ask([driver, "--version"], driver_version)
 
 
 def engine(args, **env_vars):
@@ -1815,7 +1856,15 @@ class SettingsInterface(QWidget):
         super().__init__()
         self.win = win
         self.setObjectName("settingsInterface")
-        lay = QVBoxLayout(self); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(12)
+        # The page scrolls, so a small window doesn't squeeze its wrapped text.
+        scroll = ScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.enableTransparentBackground()
+        body = QWidget()
+        body.setStyleSheet("background: transparent;")
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+        lay = QVBoxLayout(body); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(12)
         lay.addWidget(TitleLabel("Settings", self))
 
         lay.addWidget(StrongBodyLabel("Appearance", self))
@@ -1864,9 +1913,11 @@ class SettingsInterface(QWidget):
         lay.addSpacing(10)
         lay.addWidget(StrongBodyLabel("Recovery", self))
         rec = CaptionLabel(
-            "If a drive's header or a folder list is lost or damaged, the drive (or that "
-            "folder) can't be opened. Back them up into a password-protected file and "
-            "restore from it if that happens. Each drive also has its own Back up button.",
+            "Every hidden file carries what it takes to recover it, so a drive whose "
+            "folder lists are lost or damaged still opens, and its lists are rebuilt. "
+            "A backup keeps what only the lists know: names from recent renames, empty "
+            "folders, and a folder's name if both lists that held it are lost. It's a "
+            "small, password-protected file. To back up one drive, use More on its card.",
             self)
         rec.setWordWrap(True)
         lay.addWidget(rec)
@@ -1878,7 +1929,34 @@ class SettingsInterface(QWidget):
         brow.addWidget(allb); brow.addWidget(restb); brow.addStretch(1)
         lay.addLayout(brow)
 
+        lay.addSpacing(10)
+        lay.addWidget(StrongBodyLabel("About", self))
+        version = app_version()
+        lay.addWidget(BodyLabel(f"Cloak {version}" if version else "Cloak (version unknown)", self))
+        self.parts = CaptionLabel("", self)
+        self.parts.setWordWrap(True)
+        self.parts.hide()
+        lay.addWidget(self.parts)
+        # Asking the engine and driver takes a moment: after the page is up.
+        QTimer.singleShot(0, lambda: self.check_parts(version))
+
         lay.addStretch(1)
+        scroll.setWidget(body)
+
+    def check_parts(self, version):
+        engine_v, driver_v = part_versions()
+        odd = [f"{name} is {v or 'an older version'}"
+               for name, v in (("the engine", engine_v), ("the mount driver", driver_v))
+               if version and v != version]
+        if not odd:
+            return
+        where = "the bin folder" if IS_WIN else "the app"
+        fix = ("Unzip the whole release over this folder, including bin." if IS_WIN
+               else "Drag the whole Cloak app from the disk image onto Applications again.")
+        self.parts.setText(f"Parts of Cloak are from another release: in {where}, "
+                           + " and ".join(odd) + f". {fix}")
+        self.parts.setStyleSheet("color: #ca5010;")
+        self.parts.show()
 
     def set_theme(self, name):
         setTheme(THEMES[name])

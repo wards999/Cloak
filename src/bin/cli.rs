@@ -5,6 +5,7 @@
 //! single line of JSON on stdout; on error it prints `{"error": "..."}` and
 //! exits non-zero.
 //!
+//!   cloak version                      -> {version}: this release's number
 //!   cloak create <dir>                 create a new drive
 //!   cloak open   <dir>                 verify the password opens the drive
 //!   cloak claim  <dir>                 open it as the password's drive though
@@ -63,6 +64,9 @@ fn main() {
 
 fn run(args: &[String]) -> Result<String, Box<dyn Error>> {
     let cmd = args.first().map(String::as_str).ok_or("usage: cloak <command> <dir> ...")?;
+    if cmd == "version" {
+        return Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }).to_string());
+    }
     if let Some(out) = backup_command(cmd, args)? {
         return Ok(out);
     }
