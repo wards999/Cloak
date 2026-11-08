@@ -10,6 +10,8 @@
 __pycache__/
 # The desktop app's drive list and settings when run from source
 /pyapp/cloak-data/
+# Written by pyapp/package.py
+/pyapp/_version.py
 *.pyc
 .venv/
 

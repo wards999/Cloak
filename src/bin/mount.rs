@@ -685,6 +685,12 @@ mod imp {
     }
 
     pub fn run() {
+        // The app shows this in Settings, to catch a `bin` folder left over
+        // from an older release.
+        if std::env::args().nth(1).as_deref() == Some("--version") {
+            println!("cloak-mount {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
         let mut args = std::env::args().skip(1);
         let (store_dir, mount_point) = match (args.next(), args.next()) {
             (Some(a), Some(b)) => (a, b),

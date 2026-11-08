@@ -11,6 +11,7 @@ Needs PyInstaller plus pyapp/requirements.txt installed.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,10 @@ def main():
         sys.exit(__doc__)
     engine, out = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
     work = out / "_build"
+    # The app shows its release number in Settings (see `app_version`).
+    cargo = (HERE.parent / "Cargo.toml").read_text(encoding="utf-8")
+    version = re.search(r'^version = "([^"]+)"', cargo, re.M)[1]
+    (HERE / "_version.py").write_text(f'VERSION = "{version}"\n', encoding="utf-8")
     PyInstaller.__main__.run([
         str(HERE / "cloak_app.py"),
         "--name", "Cloak",
