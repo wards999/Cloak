@@ -26,9 +26,21 @@ pub type Key = [u8; KEY_LEN];
 pub type Nonce = [u8; NONCE_LEN];
 
 /// ChaCha20 (IETF, 32-bit counter) addresses at most 256 GiB of keystream per
-/// nonce. The footer of a file larger than this cannot be reached; callers
-/// should fall back to a per-region nonce for such files. Headers are unaffected.
+/// nonce, so a file's encrypted tail can't lie past this: a drive's files are
+/// at most this long (see [`check_len`]).
 pub const MAX_ADDRESSABLE: u64 = (1u64 << 32) * 64;
+
+/// `FileTooLarge` if a file of `len` bytes would have its tail past
+/// [`MAX_ADDRESSABLE`]. Without this check the cipher would panic there.
+pub fn check_len(len: u64) -> std::io::Result<()> {
+    if len > MAX_ADDRESSABLE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "a file in a drive can be at most 256 GiB",
+        ));
+    }
+    Ok(())
+}
 
 /// Transform `buf` in place, where `buf[0]` sits at absolute `file_offset` in the
 /// file. XORs the ChaCha20 keystream positioned at that same offset. Symmetric:
@@ -158,6 +170,13 @@ mod tests {
         assert_ne!(buf, original);
         transform_ends(&k, &n, &mut buf, 8);
         assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn lengths_past_the_cipher_are_refused() {
+        assert!(check_len(MAX_ADDRESSABLE).is_ok());
+        let err = check_len(MAX_ADDRESSABLE + 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
     }
 
     #[test]

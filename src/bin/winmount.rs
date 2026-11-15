@@ -193,6 +193,7 @@ mod imp {
     const ERROR_ACCESS_DENIED: u32 = 5;
     const ERROR_INVALID_PARAMETER: u32 = 87;
     const ERROR_DISK_FULL: u32 = 112;
+    const ERROR_FILE_TOO_LARGE: u32 = 223;
     const ERROR_INVALID_NAME: u32 = 123;
     const ERROR_DIR_NOT_EMPTY: u32 = 145;
     const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -221,6 +222,7 @@ mod imp {
             NotADirectory => ERROR_DIRECTORY,
             DirectoryNotEmpty => ERROR_DIR_NOT_EMPTY,
             StorageFull => ERROR_DISK_FULL,
+            FileTooLarge => ERROR_FILE_TOO_LARGE,
             _ => ERROR_IO_DEVICE,
         })
     }

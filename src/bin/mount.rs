@@ -85,6 +85,7 @@ mod imp {
             NotADirectory => libc::ENOTDIR,
             DirectoryNotEmpty => libc::ENOTEMPTY,
             StorageFull => libc::ENOSPC,
+            FileTooLarge => libc::EFBIG,
             _ => libc::EIO,
         }
     }

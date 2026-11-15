@@ -1,5 +1,5 @@
-//! Crash-safe file writes for the store's own metadata (manifests, the store
-//! header, the journal).
+//! Crash-safe file writes for the store's own metadata (folder lists, the
+//! missing-items record, the journal).
 //!
 //! Writing a file in place and crashing part-way leaves it torn; for a
 //! directory manifest that means every real name in the folder is gone. So

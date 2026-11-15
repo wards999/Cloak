@@ -3,8 +3,9 @@
 //! A drive's folder is a mirror of its tree with boring names, whose files
 //! hold their original bytes apart from the first and last `region` bytes
 //! (see `docs/FORMAT.md`) and a 512-byte envelope at the end. So a plain
-//! folder becomes a drive without copying: write `meta.json`, then in every
-//! folder write its list (with the folder's own name) and, for each file,
+//! folder becomes a drive without copying: write the top list (it carries
+//! the drive's lock), then in every folder write its list (with the
+//! folder's own name) and, for each file,
 //! encrypt its ends with a new key of its own where it lies, add its
 //! envelope, and rename it to its boring name. Each file costs at most
 //! `2 * region` bytes of reading and writing, whatever its size.
@@ -72,7 +73,10 @@ fn is_litter(name: &str) -> bool {
 /// without them, only the fixed ones (the journals and markers).
 pub(crate) fn is_reserved(keys: Option<&Keys>, name: &str, at_root: bool) -> bool {
     let lower = name.to_ascii_lowercase();
-    let stem = lower.strip_suffix(durable::SIDE_SUFFIX).unwrap_or(&lower);
+    let stem = lower
+        .strip_suffix(durable::SIDE_SUFFIX)
+        .or_else(|| lower.strip_suffix(crate::engine::RELOCK_SUFFIX))
+        .unwrap_or(&lower);
     let keyed = keys.is_some_and(|k| {
         is_list_file(&k.master, stem)
             || is_conflict_copy(&k.master, stem)
@@ -200,6 +204,9 @@ fn scan_dir(dir: &Path, rel: &str, region: u64, report: &mut Report) -> io::Resu
         } else if ft.is_file() {
             let meta = entry.metadata()?;
             report.files += 1;
+            if crypto::check_len(meta.len()).is_err() {
+                report.problem(&path, "is larger than 256 GiB, the most a file in a drive can hold");
+            }
             report.bytes += meta.len();
             report.encrypt_bytes += protected_ranges(meta.len(), region).iter().map(|(s, e)| e - s).sum::<u64>();
             if meta.permissions().readonly() {
