@@ -22,15 +22,13 @@
 use crate::boring;
 use crate::crypto::{self, transform_region, Key, KEY_LEN};
 use crate::envelope;
-use crate::key::{self, KdfParams, Salt, SALT_LEN};
+use crate::key::{self, Salt, SALT_LEN};
 use std::io;
 use std::path::Path;
 
 /// A lock's size.
 pub const LEN: usize = SALT_LEN + 8 + crypto::SEAL_OVERHEAD + KEY_LEN + 8;
 const LABEL: &[u8] = b"cloak-lock-v3";
-/// The password settings of this format.
-const KDF: KdfParams = KdfParams::CURRENT;
 
 /// A drive's keys, once unlocked.
 #[derive(Clone)]
@@ -49,7 +47,7 @@ impl Keys {
     /// Keys for a new drive protected by `password`.
     pub fn new(password: &str, region: u64) -> io::Result<Keys> {
         let salt = key::random_salt();
-        let kek = key::derive_key(password, &salt, &KDF)?;
+        let kek = key::derive_key(password, &salt)?;
         Ok(Keys { master: envelope::new_key(), region, gen: 1, salt, kek })
     }
 
@@ -63,7 +61,7 @@ impl Keys {
     /// next generation.
     pub fn relocked(&self, password: &str) -> io::Result<Keys> {
         let salt = key::random_salt();
-        let kek = key::derive_key(password, &salt, &KDF)?;
+        let kek = key::derive_key(password, &salt)?;
         Ok(Keys { master: self.master, region: self.region, gen: self.gen + 1, salt, kek })
     }
 
@@ -109,7 +107,7 @@ pub fn open_with(kek: &Key, lock: &[u8]) -> io::Result<(Key, u64, u64)> {
 
 /// The password's key for a lock's salt (the slow step).
 pub fn kek_for(password: &str, salt: &Salt) -> io::Result<Key> {
-    key::derive_key(password, salt, &KDF)
+    key::derive_key(password, salt)
 }
 
 /// Keys from one lock (bytes) and its password.
@@ -264,8 +262,15 @@ fn unlock_inner(dir: &Path, password: &str, claim: bool) -> io::Result<Keys> {
         Ok(open_with(&kek, l).ok().map(|(master, gen, region)| Keys { master, region, gen, salt, kek }))
     };
 
-    // The top folder first: a drive's top list is there.
-    let top: Vec<[u8; LEN]> = files_in(dir).filter_map(|p| lock_of_file(&p)).filter(plausible).collect();
+    // The top folder first: a drive's top list is there. Its most common
+    // salt first: a drive's own files usually outnumber any one other
+    // drive's there, and only MAX_TRIES salts are tried.
+    let mut top: Vec<[u8; LEN]> = files_in(dir).filter_map(|p| lock_of_file(&p)).filter(plausible).collect();
+    let mut counts: std::collections::HashMap<Salt, usize> = std::collections::HashMap::new();
+    for l in &top {
+        *counts.entry(peek(l).expect("LEN bytes").0).or_default() += 1;
+    }
+    top.sort_by_key(|l| std::cmp::Reverse(counts[&peek(l).expect("LEN bytes").0]));
     for l in &top {
         let (salt, _) = peek(l).expect("LEN bytes");
         if !seen_salts.contains(&salt) {
@@ -353,6 +358,14 @@ fn subfolders(dir: &Path) -> impl Iterator<Item = std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app recognises this error by its start (`UNSURE` in
+    /// pyapp/cloak_app.py) to offer "Open as this drive": the two must match.
+    #[test]
+    fn the_app_knows_the_unsure_message() {
+        let app = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/pyapp/cloak_app.py")).unwrap();
+        assert!(app.contains(&format!("UNSURE = \"{UNSURE}\"")), "pyapp/cloak_app.py's UNSURE differs from lock::UNSURE");
+    }
 
     #[test]
     fn a_lock_opens_with_its_password_only() {

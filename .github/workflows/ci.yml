@@ -79,6 +79,12 @@ jobs:
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
       - name: Build Windows binaries (release)
         run: cargo build --release --features winfsp --bin cloak --bin cloak-winmount --verbose
+      # A real mount: a move out of a folder tells that folder, and many moves
+      # at once never hang (v0.6.3 deadlocked WinFsp 2.1 here).
+      - name: Mount and stress-test the drive
+        timeout-minutes: 5
+        shell: powershell
+        run: ./tests/winmount_stress.ps1 -Bin target/release -Seconds 20
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
         with:

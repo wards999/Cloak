@@ -19,7 +19,7 @@
 
 use crate::crypto::Key;
 use crate::durable;
-use crate::key::{derive_key, random_salt, KdfParams, SALT_LEN};
+use crate::key::{derive_key, random_salt, SALT_LEN};
 use crate::lock::{self, Keys};
 use crate::manifest::{is_list_file, Manifest};
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -154,7 +154,7 @@ pub fn read(file: &Path, password: &str) -> io::Result<Backup> {
 /// Version-1 backups always use the original Argon2id settings; a backup with
 /// other settings would record them under a new version byte.
 fn cipher(password: &str, salt: &[u8; SALT_LEN]) -> io::Result<XChaCha20Poly1305> {
-    let key: Key = derive_key(password, salt, &KdfParams::ORIGINAL)?;
+    let key: Key = derive_key(password, salt)?;
     Ok(XChaCha20Poly1305::new(&key.into()))
 }
 

@@ -293,6 +293,10 @@ const MAX_HANDLES: usize = 128;
 /// contain `_`).
 const JOURNAL: &str = "journal.idx";
 
+/// Added to the missing-items record's name for the marker of a password
+/// change under way (see `relock_marker`).
+pub(crate) const RELOCK_SUFFIX: &str = ".relock";
+
 /// A multi-step change, written (encrypted) before it starts and deleted once
 /// it is done, so a crash part-way is finished or undone on the next open.
 /// Paths are relative to the backing root, `/`-separated.
@@ -414,7 +418,7 @@ impl Store {
         }
         let keys = unlock(&backing_dir, passphrase)?;
         let mut store = Self::open_with_keys(backing_dir, keys)?;
-        if store.relock_marker().exists() {
+        if store.relock_pending() {
             store.relock(&mut |_, _| {})?;
         }
         Ok(store)
@@ -434,7 +438,7 @@ impl Store {
         }
         let keys = crate::lock::claim_drive(&backing_dir, passphrase)?;
         let mut store = Self::open_with_keys(backing_dir, keys)?;
-        if store.relock_marker().exists() {
+        if store.relock_pending() {
             store.relock(&mut |_, _| {})?;
         }
         store.sweep()?;
@@ -445,7 +449,20 @@ impl Store {
     /// Where a password change under way is marked (a name the drive works
     /// out from its key, like its lists).
     fn relock_marker(&self) -> PathBuf {
-        self.backing_dir.join(format!("{}.new", lock::names(&self.key).missing))
+        self.backing_dir.join(format!("{}{RELOCK_SUFFIX}", lock::names(&self.key).missing))
+    }
+
+    /// Where versions up to 0.6.6 marked it: the same name as the side file
+    /// a save of the missing-items record goes through (see
+    /// `durable::write_atomic`). The marker is empty and a save's side file
+    /// isn't (once written), which tells them apart.
+    fn old_relock_marker(&self) -> PathBuf {
+        self.backing_dir.join(format!("{}{}", lock::names(&self.key).missing, durable::SIDE_SUFFIX))
+    }
+
+    /// Was a password change stopped part-way?
+    fn relock_pending(&self) -> bool {
+        self.relock_marker().exists() || std::fs::metadata(self.old_relock_marker()).is_ok_and(|m| m.len() == 0)
     }
 
     /// Put this store's lock (its keys, after a password change) on every
@@ -498,6 +515,9 @@ impl Store {
         }
         self.envelopes.clear();
         std::fs::remove_file(self.relock_marker())?;
+        if std::fs::metadata(self.old_relock_marker()).is_ok_and(|m| m.len() == 0) {
+            std::fs::remove_file(self.old_relock_marker())?;
+        }
         durable::sync_dir(&self.backing_dir)
     }
 
@@ -1388,6 +1408,7 @@ impl Store {
     // ---- boring files ----------------------------------------------------
 
     fn write_blob(&mut self, blob: PathBuf, crypt: Crypt, offset: u64, data: &[u8]) -> io::Result<()> {
+        crypto::check_len(offset.saturating_add(data.len() as u64))?;
         let f = self.take_handle(&blob)?;
         let result = (|| {
             let old = data_len(&f)?;
@@ -1406,6 +1427,7 @@ impl Store {
     }
 
     fn truncate_blob(&mut self, blob: PathBuf, crypt: Crypt, new_size: u64) -> io::Result<()> {
+        crypto::check_len(new_size)?;
         let f = self.take_handle(&blob)?;
         let result = (|| {
             let old = data_len(&f)?;
@@ -1747,6 +1769,12 @@ impl Store {
     }
 
     fn rename_inner(&mut self, old: &str, new: &str, replace: bool) -> io::Result<()> {
+        // A folder can't go inside itself. The disk would refuse the move
+        // after it was journaled, and every later open would replay it.
+        let (from, to) = (components(old), components(new));
+        if to.len() > from.len() && from.iter().zip(&to).all(|(a, b)| names::same(a, b)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a folder can't be moved into itself"));
+        }
         let (old_parent, old_name) = parent_and_name(old)?;
         let (new_parent, new_name) = parent_and_name(new)?;
         names::validate(&new_name)?;
@@ -2477,6 +2505,65 @@ mod tests {
         s.rename_path("src/inner", "dst/inner").unwrap();
         assert!(s.read_all("src/inner/file.bin").is_err());
         assert_eq!(s.read_all("dst/inner/file.bin").unwrap(), payload);
+    }
+
+    #[test]
+    fn many_other_drives_files_at_the_top_dont_hide_the_right_password() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "mine", 128).unwrap();
+            for i in 0..2 {
+                let p = format!("f{i}.txt");
+                s.create(&p).unwrap();
+                s.write_at(&p, 0, b"x").unwrap();
+            }
+        }
+        // Files from 7 other drives, more than unlocking tries.
+        for k in 0..7 {
+            let other = tempdir().unwrap();
+            let mut o = Store::create_with_passphrase(other.path(), &format!("other{k}"), 128).unwrap();
+            o.create("o.txt").unwrap();
+            o.write_at("o.txt", 0, b"o").unwrap();
+            let list = o.keys.list_name().to_string();
+            drop(o);
+            for e in std::fs::read_dir(other.path()).unwrap().flatten() {
+                if e.file_name().to_string_lossy() != list {
+                    // Named to come first in a listing (NTFS, APFS: by name).
+                    std::fs::copy(e.path(), d.path().join(format!("0{k}_{}", e.file_name().to_string_lossy()))).unwrap();
+                }
+            }
+        }
+        let s = Store::open_with_passphrase(d.path(), "mine").expect("its own password still opens it");
+        assert_eq!(s.list_dir("").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_file_past_256_gib_is_refused_not_a_crash() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("big.bin").unwrap();
+        s.write_at("big.bin", 0, b"start").unwrap();
+        let max = crate::crypto::MAX_ADDRESSABLE;
+        assert_eq!(s.write_at("big.bin", max, b"x").unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(s.truncate("big.bin", max + 1).unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(s.read_all("big.bin").unwrap(), b"start", "left as it was");
+    }
+
+    #[test]
+    fn a_folder_moved_into_itself_is_refused_and_the_drive_still_opens() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("A").unwrap();
+        s.mkdir("A/B").unwrap();
+        for into in ["A/B/A", "a/b/x", "A/x"] {
+            let err = s.rename_path("A", into).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{into}");
+        }
+        s.rename_path("A/B", "B").unwrap(); // out of it is fine
+        drop(s);
+        let s = store(d.path());
+        assert!(!d.path().join(JOURNAL).exists());
+        assert_eq!(s.list_dir("").unwrap().len(), 2);
     }
 
     #[test]
@@ -3338,6 +3425,32 @@ mod tests {
         assert!(!s.relock_marker().exists(), "finished");
         assert!(lock::unlock_one(&lock::lock_of_file(&file).unwrap(), "new").is_ok());
         assert_eq!(s.read_all("a.txt").unwrap(), b"A");
+    }
+
+    #[test]
+    fn a_save_cut_short_isnt_taken_for_a_password_change() {
+        let d = tempdir().unwrap();
+        let file;
+        {
+            let mut s = Store::create_with_passphrase(d.path(), "pw", 128).unwrap();
+            s.create("a.txt").unwrap();
+            s.write_at("a.txt", 0, b"A").unwrap();
+            s.sync().unwrap();
+            file = d.path().join(entry(&s, d.path(), "a.txt").boring);
+            // A crash while saving the missing-items record leaves its side
+            // file, which versions up to 0.6.6 read as a relock marker.
+            std::fs::write(s.old_relock_marker(), b"sealed record").unwrap();
+        }
+        let before = std::fs::read(&file).unwrap();
+        let s = Store::open_with_passphrase(d.path(), "pw").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before, "no relock: the file is untouched");
+        assert!(!s.relock_pending());
+        // An old version's real (empty) marker still finishes its change.
+        std::fs::write(s.old_relock_marker(), b"").unwrap();
+        assert!(s.relock_pending());
+        drop(s);
+        let s = Store::open_with_passphrase(d.path(), "pw").unwrap();
+        assert!(!s.relock_pending(), "finished, and its marker is gone");
     }
 
     #[test]
