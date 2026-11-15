@@ -1279,7 +1279,11 @@ impl Store {
             self.handles.clear();
         }
         self.handles.insert(blob.clone(), f);
-        self.envelopes.insert(blob, env);
+        self.envelopes.insert(blob.clone(), env);
+        // Its nonce is new, as `renonce` would make it: this editing session
+        // has its own already. A copy sets the full size before writing, and
+        // the write would otherwise renonce, syncing to the disk several times.
+        self.renonced.insert(blob);
         self.dirs.edit(&parent_disk, &self.keys, |d| d.push(child))?;
         self.tick()?;
         Ok(boring)
@@ -2547,6 +2551,26 @@ mod tests {
         assert_eq!(s.write_at("big.bin", max, b"x").unwrap_err().kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(s.truncate("big.bin", max + 1).unwrap_err().kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(s.read_all("big.bin").unwrap(), b"start", "left as it was");
+    }
+
+    /// A copy sets a new file's full size, then writes it: a new file's nonce
+    /// is already fresh, so the write mustn't pay for a renonce (which syncs
+    /// to the disk several times).
+    #[test]
+    fn a_new_file_sized_then_written_keeps_its_nonce() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.create("copy.bin").unwrap();
+        let nonce = entry(&s, d.path(), "copy.bin").nonce;
+        let data: Vec<u8> = (0..16384u32).map(|i| i as u8).collect();
+        s.truncate("copy.bin", data.len() as u64).unwrap();
+        s.write_at("copy.bin", 0, &data).unwrap();
+        assert_eq!(entry(&s, d.path(), "copy.bin").nonce, nonce, "no renonce");
+        assert!(!d.path().join(JOURNAL).exists());
+        s.close("copy.bin");
+        drop(s);
+        let s = store(d.path());
+        assert_eq!(s.read_all("copy.bin").unwrap(), data);
     }
 
     #[test]
